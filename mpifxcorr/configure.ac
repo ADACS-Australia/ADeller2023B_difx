@@ -140,12 +140,40 @@ dnl **** Find mark5access library                         ****
 dnl **********************************************************
 PKG_CHECK_MODULES(M5ACCESS, mark5access >= 1.6)
 
+dnl **********************************************************
+dnl **** Check for CUDA                                   ****
+dnl **********************************************************
+
+NVCC=nvcc
+NVCCFLAGS=
+AC_CHECK_PROG([with_cuda],[$NVCC],[yes],[no])
+
+AC_ARG_ENABLE(cuda,
+	[AS_HELP_STRING([--enable-cuda],[compile with GPU acceleration using CUDA])],
+	[AS_IF([test "x$enableval" == "xyes"],[with_cuda=yes],[with_cuda=no])],
+	[])
+
+
+CUDA_LIBS=
+AM_CONDITIONAL(WITH_CUDA, [test "x$with_cuda" == "xyes"])
+
+AS_IF([test "x$with_cuda" == "xyes"],[
+	AC_SUBST(NVCC)
+	AC_SUBST(NVCCFLAGS)
+	dnl This needs to go into the linker command, because in the end mpicc
+	dnl (rather than nvcc) will be called to link everything together
+	CUDA_LIBS="-lcudart -lcufft"
+	AC_DEFINE([USE_CUDA], [1], [Compile CUDA-based GPU acceleration.])
+	AC_MSG_NOTICE([GPU support through CUDA will be **enabled** on this build])
+],[
+	AC_MSG_NOTICE([GPU support through CUDA will be **disabled** on this build])
+])
 
 dnl for Mutex lock in datastream.cpp
 AC_CHECK_LIB(rt, clock_gettime)
 
 CXXFLAGS="${CXXFLAGS} ${M5ACCESS_CFLAGS} ${VDIFIO_CFLAGS} ${MARK6SG_CFLAGS} ${MATH_CFLAGS} ${FFTW3_CFLAGS} ${DIFXMESSAGE_CFLAGS} ${MARK5IPC_CFLAGS} ${CFLAG_QUIET} ${OPENMP_CXXFLAGS} ${DIRLIST_CFLAGS} ${MARK6SG_CFLAGS}"
-LIBS="${M5ACCESS_LIBS} ${VDIFIO_LIBS} ${MARK6SG_LIBS} ${SS_LIBS} ${MATH_LIBS} ${DIFXMESSAGE_LIBS} ${MARK5IPC_LIBS} ${DIRLIST_LIBS} $LIBS"
+LIBS="${M5ACCESS_LIBS} ${VDIFIO_LIBS} ${MARK6SG_LIBS} ${SS_LIBS} ${MATH_LIBS} ${DIFXMESSAGE_LIBS} ${MARK5IPC_LIBS} ${DIRLIST_LIBS} ${CUDA_LIBS} $LIBS"
 
 
 dnl **********************************************************

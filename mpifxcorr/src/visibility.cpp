@@ -42,6 +42,7 @@
 #include <arpa/inet.h>
 #include <difxmessage.h>
 #include "alert.h"
+#include "mode.h"
 
 Visibility::Visibility(Configuration * conf, int id, int numvis, char * dbuffer, int dbufferlen, int eseconds, int scan, int scanstartsec, int startns, const string * pnames)
   : config(conf), visID(id), currentscan(scan), currentstartseconds(scanstartsec), currentstartns(startns), numvisibilities(numvis), executeseconds(eseconds), todiskbufferlength(dbufferlen), polnames(pnames), todiskbuffer(dbuffer)
@@ -1142,6 +1143,7 @@ void Visibility::multicastweights()
 void Visibility::writeDiFXHeader(ofstream * output, int baselinenum, int dumpmjd, double dumpseconds, int configindex, int sourceindex, int freqindex, const char polproduct[3], int pulsarbin, int flag, float weight, double buvw[3], int filecount)
 {
   double dweight = weight;
+  //dweight = 1.0;     // TODO: TESTING VALUE
   /* *output << setprecision(15);
   *output << "BASELINE NUM:       " << baselinenum << endl;
   *output << "MJD:                " << dumpmjd << endl;

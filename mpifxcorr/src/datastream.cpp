@@ -39,6 +39,7 @@
 #include <sys/time.h>
 #include "config.h"
 #include "alert.h"
+#include "mode.h"
 
 // Raw socket support is OS dependent.  For now only Linux is supported
 #ifdef __linux__
@@ -138,6 +139,10 @@ void DataStream::initialise()
   estimatedbytes = config->getEstimatedBytes();
   consumedbytes = 0;
   lastconsumedbytes = 0;
+
+  std::cout << "maxbytes " << maxbytes << std::endl;
+  std::cout << "bufferfactor " << databufferfactor << std::endl;
+  std::cout << "bufferbytes " << bufferbytes << std::endl;
 
   //cinfo << startl << "******DATASTREAM " << mpiid << ": Initialise. bufferbytes=" << bufferbytes << "  numdatasegments=" << numdatasegments << "  readbytes=" << readbytes << endl;
 

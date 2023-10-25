@@ -18,6 +18,15 @@ else
 mark6_files =
 endif
 
+if WITH_CUDA
+cuda_files = \
+	gpumode.cu \
+	gpucore.cu \
+	gpudecode.cu
+else
+cuda_files =
+endif
+
 bin_PROGRAMS = mpifxcorr neuteredmpifxcorr
 
 mpifxcorr_SOURCES = \
@@ -30,9 +39,11 @@ mpifxcorr_SOURCES = \
 	mathutil.cpp \
 	sysutil.cpp \
 	mode.cpp \
+	cpumode.cpp \
 	model.cpp \
 	mk5.cpp \
 	mk5mode.cpp \
+	mk5mode_gpu.cpp \
 	datamuxer.cpp \
 	mark5bfile.cpp \
 	vdiffile.cpp \
@@ -42,6 +53,7 @@ mpifxcorr_SOURCES = \
 	alert.cpp \
 	pcal.cpp \
 	switchedpower.cpp \
+	$(cuda_files) \
 	$(mark5_files) \
 	$(mark6_files)
 
@@ -60,6 +72,10 @@ library_include_HEADERS = \
 	mk5mode.h \
 	model.h \
 	mode.h \
+	cpumode.h \
+	gpumode.cuh \
+	gpucore.cuh \
+	gpudecode.cuh \
 	polyco.h \
 	nativemk5.h \
 	watchdog.h \
@@ -81,11 +97,13 @@ libmpifxcorr_a_SOURCES = \
 	pcal.cpp \
 	configuration.cpp \
 	mode.cpp \
+	cpumode.cpp \
 	core.cpp \
 	datastream.cpp \
 	polyco.cpp \
 	mk5.cpp \
 	mk5mode.cpp \
+	mk5mode_gpu.cpp \
 	fxmanager.cpp \
 	mathutil.cpp \
 	sysutil.cpp \
@@ -98,6 +116,7 @@ libmpifxcorr_a_SOURCES = \
 	vdiffake.cpp \
 	vdifnetwork.cpp \
 	datamuxer.cpp \
+	$(cuda_files) \
 	$(mark5_files) \
 	$(mark6_files)
 
@@ -107,7 +126,9 @@ libfxcorr_a_SOURCES = \
 	mathutil.cpp \
 	sysutil.cpp \
 	mode.cpp \
+	cpumode.cpp \
 	mk5mode.cpp \
+	mk5mode_gpu.cpp \
 	polyco.cpp \
 	visibility.cpp \
 	model.cpp \
@@ -128,6 +149,7 @@ neuteredmpifxcorr_SOURCES = \
 	vdiffake.cpp \
 	vdifnetwork.cpp \
 	datamuxer.cpp \
+	$(cuda_files) \
 	$(mark5_files) \
 	$(mark6_files)
 
@@ -148,3 +170,5 @@ sysutil_test_SOURCES = \
 
 sysutil_test_CXXFLAGS = -g -I$(top_srcdir)/src/ -I $(AM_CXXFLAGS)
 
+.cu.o:
+	nvcc -I.. $(CXXFLAGS) -c -o $@ $<

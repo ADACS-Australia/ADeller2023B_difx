@@ -1,43 +1,17 @@
-/***************************************************************************
- *   Copyright (C) 2006-2016 by Adam Deller                                *
- *                                                                         *
- *   This program is free software: you can redistribute it and/or modify  *
- *   it under the terms of the GNU General Public License as published by  *
- *   the Free Software Foundation, either version 3 of the License, or     *
- *   (at your option) any later version.                                   *
- *                                                                         *
- *   This program is distributed in the hope that it will be useful,       *
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of        *
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         *
- *   GNU General Public License for more details.                          *
- *                                                                         *
- *   You should have received a copy of the GNU General Public License     *
- *   along with this program.  If not, see <http://www.gnu.org/licenses/>. *
- ***************************************************************************/
-//===========================================================================
-// SVN properties (DO NOT CHANGE)
-//
-// $Id$
-// $HeadURL: $
-// $LastChangedRevision$
-// $Author$
-// $LastChangedDate$
-//
-//============================================================================
-#ifndef MK5MODE_H
-#define MK5MODE_H
+#ifndef MK5MODE_GPU_H
+#define MK5MODE_GPU_H
 
 #include <mark5access.h>
-#include "cpumode.h"
+#include "gpumode.cuh"
 
 /** 
- @class Mk5_CPUMode
+ @class Mk5_GPUMode
  @brief A mode for Mk4 formatted or VLBA formatted Mk5 data
 
  A mode for MkIV, VLBA, or Mark5B formatted Mk5 data.  All types of band setup should be supported.
  @author Adam Deller
  */
-class Mk5_CPUMode : public CPUMode
+class Mk5_GPUMode : public GPUMode
 {
   public:
  /**
@@ -68,9 +42,9 @@ class Mk5_CPUMode : public CPUMode
    * @param format The data format type e.g. MARK5B, VDIF, VLBA etc
   */
 
-  Mk5_CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta,double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, int framebytes, int framesamples, Configuration::dataformat format);
+  Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta,double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, int framebytes, int framesamples, Configuration::dataformat format);
 
-  virtual ~Mk5_CPUMode();
+  virtual ~Mk5_GPUMode();
 
   protected:
  /** 
@@ -80,6 +54,7 @@ class Mk5_CPUMode : public CPUMode
    * @param subloopindex The "subloop" index that is currently being unpacked for (need to know to save weights in the right place)
   */
     virtual float unpack(int sampleoffset, int subloopindex);
+    virtual void unpack_all();
 
     int framesamples, framebytes, samplestounpack, fanout;
     struct mark5_stream *mark5stream;

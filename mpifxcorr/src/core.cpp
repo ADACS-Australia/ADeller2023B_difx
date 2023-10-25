@@ -29,6 +29,7 @@
 #include "fxmanager.h"
 #include "alert.h"
 #include "config.h"
+#include "cpumode.h"
 
 Core::Core(int id, Configuration * conf, int * dids, MPI_Comm rcomm)
   : mpiid(id), config(conf), return_comm(rcomm)
@@ -397,6 +398,7 @@ long long Core::getEstimatedBytes()
 
 void Core::loopprocess(int threadid)
 {
+    cout << threadid << endl;
   int perr, numprocessed, startblock, numblocks, lastconfigindex, numpolycos, maxchan, maxpolycos, stadumpchannels, strideplussteplen, maxrotatestrideplussteplength, maxxmaclength, slen;
   double sec;
   bool pulsarbin, somepulsarbin, somescrunch, dumpingsta, nowdumpingsta;
@@ -488,7 +490,7 @@ void Core::loopprocess(int threadid)
   //grab the lock we really want, unlock the end section and signal the main thread we're ready to go
   perr = pthread_mutex_lock(&(procslots[0].slotlocks[threadid]));
   if(perr != 0)
-    csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying lock mutex 0" << endl; 
+    csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying lock mutex 0" << endl;
   perr = pthread_mutex_unlock(&(procslots[RECEIVE_RING_LENGTH-1].slotlocks[threadid]));
   if(perr != 0)
     csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex " << RECEIVE_RING_LENGTH-1 << endl;
@@ -712,19 +714,19 @@ void Core::processdata(int index, int threadid, int startblock, int numblocks, M
     modes[j]->setDumpKurtosis(scratchspace->dumpkurtosis);
     if(scratchspace->dumpkurtosis)
       modes[j]->zeroKurtosis();
-    
+
     //reset pcal
     if(config->getDPhaseCalIntervalMHz(procslots[index].configindex, j) > 0)
     {
       // Calculate the sample time. Every band has the same bandwidth.
       sampletimens = 1.0/(2.0*config->getDRecordedBandwidth(procslots[index].configindex, j, 0))*1e+3;
-      
+
       // Get the ns start time of the whole block.
       starttimens = procslots[index].offsets[2];
-      
+
       // Calculate the FFT size in number of samples.
       fftsize = 2*config->getFNumChannels(config->getDRecordedFreqIndex(procslots[index].configindex, j, 0));
-      
+
       modes[j]->resetpcal();
     }
   }
@@ -805,7 +807,7 @@ void Core::processdata(int index, int threadid, int startblock, int numblocks, M
         i = fftloop*numBufferedFFTs + fftsubloop + startblock;
 	if(i >= startblock+numblocks)
 	  break; //may not have to fully complete last fftloop
-        modes[j]->process(i, fftsubloop);
+        ((CPUMode*)modes[j])->process(i, fftsubloop);
         numfftsprocessed++;
       }
     }
@@ -1228,7 +1230,7 @@ void Core::averageAndSendAutocorrs(int index, int threadid, double nsoffset, dou
         // the number of channels (since we use an un-normalised FFT) and the number of integrations (i.e. time)
         // which is the weight
         renormvalue = 1.0/(2*freqchannels*modes[i]->getWeight(false, j));
-        
+
         if(datastreamsaveraged) {
           // if the data has been averaged above, then we need to adjust normalisation factor
           // because channels are summed below, not averaged
@@ -2185,7 +2187,7 @@ void Core::updateconfig(int oldconfigindex, int configindex, int threadid, int &
   //cdebug << startl << "About to create some new modes..." << endl;
   //get the config to create the appropriate Modes for us
   for(int i=0;i<numdatastreams;i++) {
-    modes[i] = config->getMode(configindex, i);
+    modes[i] = this->getMode(configindex, i);
     if(modes[i] == NULL || !modes[i]->initialisedOK()) {
       cfatal << startl << "Problem initialising a mode during a config change - aborting!" << endl;
       MPI_Abort(MPI_COMM_WORLD, 1);

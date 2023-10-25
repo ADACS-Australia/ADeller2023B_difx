@@ -33,6 +33,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstdlib>
+#include <cuComplex.h>
 
 using namespace std;
 
@@ -49,37 +50,8 @@ the provided data and control (delay) arrays
 */
 class Mode{
 public:
- /**
-  * Constructor: allocates memory, extracts stream information and calculates number of lookups etc
-  * @param conf The configuration object, containing all information about the duration and setup of this correlation
-  * @param confindex The index of the configuration this Mode is for
-  * @param dsindex The index of the datastream this Mode is for
-  * @param recordedbandchan The number of channels for each recorded subband
-  * @param chanstoavg The number of channels to average for each subband
-  * @param bpersend The number of FFT blocks to be processed in a message
-  * @param gsamples The number of additional guard samples at the end of a message
-  * @param nrecordedfreqs The number of recorded frequencies for this Mode
-  * @param recordedbw The bandwidth of each of these IFs
-  * @param recordedfreqclkoffs The time offsets in microseconds to be applied post-F for each of the frequencies
-  * @param recordedfreqclkoffsdelta The delay offsets in microseconds between Rcp and Lcp
-  * @param recordedfreqphaseoffs The phase offsets in degrees between Rcp and Lcp
-  * @param recordedfreqlooffs The LO offsets in Hz for each recorded frequency
-  * @param nrecordedbands The total number of subbands recorded
-  * @param nzoombands The number of subbands to be taken from within the recorded bands - can be zero
-  * @param nbits The number of bits per sample
-  * @param sampling The bit sampling type (real/complex)
-  * @param tcomplex Type of complex sampling (single or double sideband)
-  * @param unpacksamp The number of samples to unpack in one hit
-  * @param fbank Whether to use a polyphase filterbank to channelise (instead of FFT)
-  * @param linear2circular Whether to do a linear to circular conversion after the FFT
-  * @param fringerotorder The interpolation order across an FFT (Oth, 1st or 2nd order; 0th = post-F)
-  * @param arraystridelen The number of samples to stride when doing complex multiplies to implement sin/cos operations efficiently
-  * @param cacorrs Whether cross-polarisation autocorrelations are to be calculated
-  * @param bclock The recorder clock-out frequency in MHz ("block clock")
-  */
-
-Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock);
-
+  f32 **  unpackedarrays;
+  cf32 **  unpackedcomplexarrays;
  /**
   * Stores the FFT valid flags for this block of data
   * @param v The array of valid flags for each FFT
@@ -102,12 +74,14 @@ Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int
   void resetpcal();
   void finalisepcal();
 
- /**
+  /**
   * Calculates fringe rotation and fractional sample correction arrays and FFTs, and autocorrelates
   * @param index The index of the FFT chunk to process
   * @param subloopindex The "subloop" index to put the output in
   */
-  void process(int index, int subloopindex);
+  virtual void process(int index, int subloopindex);
+
+  virtual int process_gpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks) { return 0; };
 
  /**
   * Sets the autocorrelation arrays to contain 0's
@@ -197,6 +171,8 @@ Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int
   * @return Pointer to the FFT'd data (complex 32 bit float)
   */
   inline const cf32* getFreqs(int outputband, int subloopindex) const { return fftoutputs[outputband][subloopindex]; };
+  virtual const cuFloatComplex* getGpuFreqs() const { return nullptr; };
+  virtual const cf32* getGpuFreqsHost(int outputband, int subloopindex) const { return nullptr; };
 
  /**
   * Returns a pointer to the FFT'd and conjugated data of the specified product
@@ -205,6 +181,8 @@ Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int
   * @return Pointer to the conjugate of the FFT'd data (complex 32 bit float)
   */
   inline const cf32* getConjugatedFreqs(int outputband, int subloopindex) const { return conjfftoutputs[outputband][subloopindex]; }
+  virtual const cuFloatComplex* getGpuConjugatedFreqs() const { return nullptr; };
+  virtual const cf32* getGpuConjugatedFreqsHost(int outputband, int subloopindex) const { return nullptr; };
 
  /**
   * Returns the estimated number of bytes used by the Mode
@@ -232,6 +210,39 @@ Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int
   static const int INVALID_SUBINT = -99999999;
 
 protected:
+ /**
+  * Constructor: allocates memory, extracts stream information and calculates number of lookups etc
+  * Note this is protected because you must instantiate either a CPUMode or a
+  * GPUMode class -- you can't instantiate a bare Mode
+  * @param conf The configuration object, containing all information about the duration and setup of this correlation
+  * @param confindex The index of the configuration this Mode is for
+  * @param dsindex The index of the datastream this Mode is for
+  * @param recordedbandchan The number of channels for each recorded subband
+  * @param chanstoavg The number of channels to average for each subband
+  * @param bpersend The number of FFT blocks to be processed in a message
+  * @param gsamples The number of additional guard samples at the end of a message
+  * @param nrecordedfreqs The number of recorded frequencies for this Mode
+  * @param recordedbw The bandwidth of each of these IFs
+  * @param recordedfreqclkoffs The time offsets in microseconds to be applied post-F for each of the frequencies
+  * @param recordedfreqclkoffsdelta The delay offsets in microseconds between Rcp and Lcp
+  * @param recordedfreqphaseoffs The phase offsets in degrees between Rcp and Lcp
+  * @param recordedfreqlooffs The LO offsets in Hz for each recorded frequency
+  * @param nrecordedbands The total number of subbands recorded
+  * @param nzoombands The number of subbands to be taken from within the recorded bands - can be zero
+  * @param nbits The number of bits per sample
+  * @param sampling The bit sampling type (real/complex)
+  * @param tcomplex Type of complex sampling (single or double sideband)
+  * @param unpacksamp The number of samples to unpack in one hit
+  * @param fbank Whether to use a polyphase filterbank to channelise (instead of FFT)
+  * @param linear2circular Whether to do a linear to circular conversion after the FFT
+  * @param fringerotorder The interpolation order across an FFT (Oth, 1st or 2nd order; 0th = post-F)
+  * @param arraystridelen The number of samples to stride when doing complex multiplies to implement sin/cos operations efficiently
+  * @param cacorrs Whether cross-polarisation autocorrelations are to be calculated
+  * @param bclock The recorder clock-out frequency in MHz ("block clock")
+  */
+
+  Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock);
+
  /** 
   * Unpacks quantised data to float arrays.  The floating point values filled should
   * be in the range 0.0->1.0, and set appropriately to the expected input levels such that
@@ -263,17 +274,13 @@ protected:
   u8  *   data;
   s16 *   lookup;
   s16 *   linearunpacked;
-  f32 **  unpackedarrays;
-  cf32 **  unpackedcomplexarrays;
   cf32*** fftoutputs;
   cf32*** conjfftoutputs;
   f32 **  weights;
   s32 *   validflags;
   cf32*** autocorrelations;
   vecFFTSpecR_f32 * pFFTSpecR;
-  vecFFTSpecC_cf32 * pFFTSpecC;
   vecDFTSpecR_f32 * pDFTSpecR;
-  vecDFTSpecC_cf32 * pDFTSpecC;
   u8 * fftbuffer;
   vecHintAlg hint;
   Model * model;
@@ -354,77 +361,6 @@ private:
   static const float decorrelationpercentage[];
 };
 
-/** 
- @class LBAMode 
- @brief A mode for 'standard' LBA 2 bit data
-
- Assumes data has been compressed if running at 128 Mbps or lower ie no redundancy.  Assumes running on a LITTLE-ENDIAN MACHINE!!!
- @author Adam Deller
- */
-class LBAMode : public Mode{
-public:
- /**
-  * Constructor: calls Mode constructor then creates lookup table
-  * @param conf The configuration object, containing all information about the duration and setup of this correlation
-  * @param confindex The index of the configuration this Mode is for
-  * @param dsindex The index of the datastream this Mode is for
-  * @param nchan The number of channels per subband
-  * @param chanstoavg The number of channels to average for each subband
-  * @param bpersend The number of FFT blocks to be processed in a message
-  * @param gblocks The number of additional guard blocks at the end of a message
-  * @param nfreqs The number of frequencies for this Mode
-  * @param bw The bandwidth of each of these IFs
-  * @param recordedfreqclkoffs The time offsets in microseconds to be applied post-F for each of the frequencies
-  * @param recordedfreqclkoffsdelta The offsets in microseconds between Rcp and Lcp
-  * @param recordedfreqphaseoffs The phase offsets in degrees between Rcp and Lcp
-  * @param recordedfreqlooffs The LO offsets in Hz for each recorded frequency
-  * @param ninputbands The total number of subbands recorded
-  * @param noutputbands The total number of subbands after prefiltering - not currently used (must be = numinputbands)
-  * @param nbits The number of bits per sample
-  * @param fbank Whether to use a polyphase filterbank to channelise (instead of FFT)
-  * @param linear2circular Whether to do a linear to circular conversion after the FFT
-  * @param fringerotorder The interpolation order across an FFT (Oth, 1st or 2nd order; 0th = post-F)
-  * @param arraystridelen The number of samples to stride when doing complex multiplies to implement sin/cos operations efficiently
-  * @param cacorrs Whether cross-polarisation autocorrelations are to be calculated
-  * @param unpackvalues 4 element array containing floating point unpack values for the four possible two bit values
-  */
-  LBAMode(Configuration * conf, int confindex, int dsindex, int nchan, int chanstoavg, int bpersend, int gblocks, int nfreqs, double bw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta,double * recordedfreqphaseoffs, double * recordedfreqlooffs, int ninputbands, int noutputbands, int nbits, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, const s16* unpackvalues);
-
-    ///unpack mapping for "standard" recording modes
-    static const s16 stdunpackvalues[];
-    ///unpack mapping for "vsop-style" recording modes
-    static const s16 vsopunpackvalues[];
-};
-
-/**
- @class LBA8BitMode
- @brief A mode for 'Bruce' style LBA 8 bit data
-
- Assumes running on a LITTLE-ENDIAN MACHINE!!!
- Also assumes Nyquist sampled clock
- @author Adam Deller
- */
-class LBA8BitMode : public Mode{
-public:
-  LBA8BitMode(Configuration * conf, int confindex, int dsindex, int nchan, int chanstoavg, int bpersend, int gblocks, int nfreqs, double bw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int ninputbands, int noutputbands, int nbits, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs);
-
-  virtual float unpack(int sampleoffset);
-};
-
-/**
- @class LBA16BitMode
- @brief A mode for 'Bruce' style LBA 16 bit data
-
- Assumes running on a LITTLE-ENDIAN MACHINE and the byte order of the 16 bit samples is little endian!!!
- Also assumes Nyquist sampled clock
- @author Adam Deller
- */
-class LBA16BitMode : public Mode{
-public:
-  LBA16BitMode(Configuration * conf, int confindex, int dsindex, int nchan, int chanstoavg, int bpersend, int gblocks, int nfreqs, double bw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int ninputbands, int noutputbands, int nbits, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs);
-
-  virtual float unpack(int sampleoffset);
-};
 
 #endif
 // vim: shiftwidth=2:softtabstop=2:expandtab

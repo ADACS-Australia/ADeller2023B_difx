@@ -94,7 +94,7 @@ public:
   * @param comm The MPI_Comm of the process group
   * @param restartsec The restart time into the job in seconds (to restart a job which died halfway)
   */
-  Configuration(const char * configfile, int id, MPI_Comm& comm, double restartsec=0.0);
+  Configuration(const char * configfile, int id, MPI_Comm& comm, double restartsec=0.0, bool use_gpu=false);
 
  /**
   * Constructor: Reads information from an input file and stores it internally
@@ -102,7 +102,7 @@ public:
   * @param id The MPI id of the process (0 = manager, then 1 - N datastreams, N+1 onwards cores
   * @param restartsec The restart time into the job in seconds (to restart a job which died halfway)
   */
-  Configuration(const char * configfile, int id, double restartsec=0.0);
+  Configuration(const char * configfile, int id, double restartsec=0.0, bool use_gpu=false);
 
   ~Configuration();
 
@@ -570,9 +570,10 @@ public:
   * Creates and returns the appropriate mode object
   * @param configindex The index of the configuration being used (from the table in the input file)
   * @param datastreamindex The index of the datastream (from the table in the input file)
+  * @param usegpu      If true, return GPUMode children (otherwise return CPUMode children)
   * @return A new Mode object for that datastream, in that configuration
   */
-  Mode * getMode(int configindex, int datastreamindex);
+  Mode * getMode(int configindex, int datastreamindex, const bool usegpu);
 
  /**
   * @param scan The scan index
@@ -1124,6 +1125,7 @@ private:
   datastreamdata * datastreamtable;
   Model * model;
   outputformat outformat;
+  bool use_gpu;
 };
 
 inline bool operator>(const struct Configuration::freqdata_t& f1, const struct Configuration::freqdata_t& f2)

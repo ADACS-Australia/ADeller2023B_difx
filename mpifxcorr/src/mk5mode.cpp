@@ -29,8 +29,8 @@
 #include "mk5.h"
 #include "alert.h"
 
-Mk5Mode::Mk5Mode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, int framebytes, int framesamples, Configuration::dataformat format)
-  : Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, recordedbandchan*2+4, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, recordedbw*2)
+Mk5_CPUMode::Mk5_CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, int framebytes, int framesamples, Configuration::dataformat format)
+  : CPUMode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, recordedbandchan*2+4, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, recordedbw*2)
 {
   char formatname[64];
 
@@ -55,7 +55,7 @@ Mk5Mode::Mk5Mode(Configuration * conf, int confindex, int dsindex, int recordedb
     mark5stream = new_mark5_stream( new_mark5_stream_unpacker(0), new_mark5_format_generic_from_string(formatname) );
     if(mark5stream == 0)
     {
-      cfatal << startl << "Mk5Mode::Mk5Mode : mark5stream is null" << endl;
+      cfatal << startl << "Mk5_CPUMode::Mk5_CPUMode : mark5stream is null" << endl;
       initok = false;
     }
     else
@@ -68,7 +68,7 @@ Mk5Mode::Mk5Mode(Configuration * conf, int confindex, int dsindex, int recordedb
       sprintf(mark5stream->streamname, "DS%d <%s>", dsindex, orig_streamname.c_str());
       if(framesamples != mark5stream->framesamples)
       {
-        cfatal << startl << "Mk5Mode::Mk5Mode : framesamples inconsistent (told " << framesamples << "/ stream says " << mark5stream->framesamples << ") - for stream index " << dsindex << endl;
+        cfatal << startl << "Mk5_CPUMode::Mk5_CPUMode : framesamples inconsistent (told " << framesamples << "/ stream says " << mark5stream->framesamples << ") - for stream index " << dsindex << endl;
         initok = false;
       }
       else
@@ -92,7 +92,7 @@ Mk5Mode::Mk5Mode(Configuration * conf, int confindex, int dsindex, int recordedb
   }
 }
 
-Mk5Mode::~Mk5Mode()
+Mk5_CPUMode::~Mk5_CPUMode()
 {
   delete_mark5_stream(mark5stream);
   if(invalid)
@@ -101,7 +101,7 @@ Mk5Mode::~Mk5Mode()
   }
 }
 
-float Mk5Mode::unpack(int sampleoffset, int subloopindex)
+float Mk5_CPUMode::unpack(int sampleoffset, int subloopindex)
 {
   float goodsamples;
   int mungedoffset = 0;
