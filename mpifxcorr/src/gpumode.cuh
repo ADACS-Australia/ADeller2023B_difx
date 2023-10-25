@@ -27,8 +27,8 @@ public:
                     int numblocks) override;  //frac sample error is in microseconds
 
     void process_unpack(int index, int subloopindex);
-    void set_weights(int subloopindex);
-    virtual void unpack_all() {}
+    void set_weights(int subloopindex, int nframes);
+    virtual void unpack_all(int) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
@@ -53,6 +53,7 @@ protected:
     GpuMemHelper<cuFloatComplex> *complexunpacked_gpu;
     GpuMemHelper<cuFloatComplex> *temp_autocorrelations_gpu;
     GpuMemHelper<char> *packeddata_gpu;
+    GpuMemHelper<bool> *valid_frames;
 
     size_t estimatedbytes_gpu;
 

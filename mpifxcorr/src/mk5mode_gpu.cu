@@ -151,33 +151,24 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   return goodsamples/(float)unpacksamples;
 }
 
-void Mk5_GPUMode::unpack_all() {
-    // Hacky little workaround to get this number and the stream struct back
-    int *gs;
-    cudaMallocManaged(&gs, sizeof(int));	
+void Mk5_GPUMode::unpack_all(int framestounpack) {
+    // Hacky little workaround to get the stream struct back !! May not be needed !!
     mark5_stream *tmp_mk5stream;
     cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
     *tmp_mk5stream = *mark5stream;
 
-    // Figure out how many frames in the packed data
-    int framestounpack = datalengthbytes / mark5stream->framebytes;
-    if (datalengthbytes % mark5stream->framebytes != 0) {
-      std::cout << "Buffer contains fraction of a frame :(. This shouldn't happen!" << std::endl;
-    }
+    std::cout << "frames to unpack: " << framestounpack << std::endl;
 
     int unpack_threads = 64;
     int unpack_blocks = (framestounpack + unpack_threads - 1) / unpack_threads;
 
-    // unpack_threads = 1;
-    // unpack_blocks = 1;
-    gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(tmp_mk5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, gs);
+    gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(tmp_mk5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
 
+    // Unfortunately we have to block here since we need the valid frames to find the correct dataweights
+    valid_frames->sync();
+    valid_frames->copyToHost();
+    valid_frames->sync();
 
-    cudaDeviceSynchronize();
-    
-	  int goodsamples = *gs;
-    *mark5stream = *tmp_mk5stream;
-	  cudaFree(gs);
     cudaFree(tmp_mk5stream);
 
 }

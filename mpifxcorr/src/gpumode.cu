@@ -272,6 +272,12 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // Copy packed data to device
     packeddata_gpu->copyToDevice();
 
+    // Figure out how many frames in the packed data
+    int framestounpack = datalengthbytes / config->getFrameBytes(configindex, datastreamindex);
+    assert(datalengthbytes % config->getFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
+
+    valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
+
     // Reset the autocorrelations
     checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
                               sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
@@ -288,43 +294,17 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
 
     packeddata_gpu->sync();
-    unpack_all();
-    //checkCuda(cudaStreamSynchronize(cuStream));
-    //check_unpack<<<1,1>>>(unpackedarrays_gpu->gpuPtr(), 2, 10);
+    unpack_all(framestounpack);
 
-    // Set up the FFT window indices
-    for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
-        set_weights(fftwin);
-        // TODO: posssibly some issues here if sample granularity is weirder than 2
-        //gSampleIndexes->ptr()[fftwin] = nearestSamples[fftwin];
-        //std::cout << "sampleInds:\t" << gSampleIndexes->ptr()[fftwin] << "\t" << nearestSamples[fftwin] << std::endl;
-
-        // Check which data is valid
-        //gValidSamples->ptr()[fftwin] = is_data_valid(fftwin, fftwin);   // I think index = subloopindex now since the sublooping should be gone in the GPU version
-    }
-
-    // for (int i = 0; i < numrecordedfreqs; i++) {
-    //     int count = 0;
-    //     // PWCR numrecordedbands = 2 for the test; but e.g. 8 is very realistical
-    //     // Loop over all recorded bands looking for the matching frequency we should be dealing with
-    //     for (int j = 0; j < numrecordedbands; j++) {
-    //         // For upper sideband bands, normally just need to copy the fftd channels.
-    //         // However for complex double upper sideband, the two halves of the frequency space are swapped, so they need to be swapped back
-
-    //         if (config->matchingRecordedBand(configindex, datastreamindex, i, j)) {
-    //             indices->ptr()[(i * MAX_INDICIES) + count++] = j;
-    //             weights[0][j] = 1;
-    //         }
-    //     }
-
-    //     weights[1][indices->ptr()[(i * MAX_INDICIES)]] = 1;
-    //     weights[1][indices->ptr()[(i * MAX_INDICIES) + 1]] = 1;
-    // }
-
-    
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
     avg_unpack += duration.count();
+
+    // Set up the FFT window indices and weights
+    // Ideally this will move to the GPU but it's a bit tricky. Isn't *too* time intensive anyway I think
+    for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
+        set_weights(fftwin, framestounpack);
+    }
 
     start = high_resolution_clock::now();
 
@@ -364,8 +344,6 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // todo: remove
     checkCuda(cudaStreamSynchronize(cuStream));
     std::cout << "Data FFTed with code: " << cudaGetLastError() << std::endl;
-    //print_fft_window<<<1,1>>>(fftd_gpu->gpuPtr(), 2, fftchannels, 1);
-    checkCuda(cudaStreamSynchronize(cuStream));
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -445,17 +423,16 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 //        }
 //    }
 
-    delete packeddata_gpu;
-
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
     avg_postprocess += duration.count();
 
     processing_time += duration_cast<microseconds>(stop - begin_time).count();
 
+    delete packeddata_gpu;
+
     // TODO: the return value might need to change? Not sure how its used
     //return numfftsprocessed;
-    //exit(EXIT_SUCCESS);
     return numBufferedFFTs;
 }
 
@@ -606,7 +583,7 @@ void GPUMode::process_unpack(int index, int subloopindex) {
     }
 }
 
-void GPUMode::set_weights(int subloopindex) {
+void GPUMode::set_weights(int subloopindex, int nframes) {
     // Not sure if this is still needed. Set to zero for now.
     unpackstartsamples = 0;
 
@@ -631,10 +608,34 @@ void GPUMode::set_weights(int subloopindex) {
 
     if (nearestSamples[subloopindex] == -1) {
         nearestSamples[subloopindex] = 0;
-        dataweight[subloopindex] = 0.99;
-    } else if (nearestSamples[subloopindex] < unpackstartsamples || nearestSamples[subloopindex] > unpackstartsamples + unpacksamples - fftchannels)
-        //need to unpack more data
-        dataweight[subloopindex] = 0.99;
+        dataweight[subloopindex] = 1.0;
+        cerr << "Why is this happening?" << std::endl;      // I'm not sure what case this branch is for
+        abort();
+    } else if (subloopindex + 1 == config->getNumBufferedFFTs(configindex)) {
+        // We are in the last loop
+        if (nearestSamples[subloopindex] + fftchannels > nframes * config->getFrameSamples(configindex, datastreamindex)) {
+            cerr << "This FFT window is trying to cross into unloaded data" << std::endl;
+            abort();
+        } else {
+            int start_frame = nearestSamples[subloopindex] / config->getFrameSamples(configindex, datastreamindex);
+            dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
+        }
+    } else if (nearestSamples[subloopindex] < unpackstartsamples || nearestSamples[subloopindex] > unpackstartsamples + unpacksamples - fftchannels) {
+        // Standard path. TODO: above condition can be simplified I think
+        int start_frame = nearestSamples[subloopindex] / config->getFrameSamples(configindex, datastreamindex);
+        int end_frame = (nearestSamples[subloopindex + 1] - 1) / config->getFrameSamples(configindex, datastreamindex);
+        if (start_frame == end_frame) {
+            // This FFT window does not cross a frame boundary
+            dataweight[subloopindex] = valid_frames->ptr()[start_frame] * 1.0;
+        } else if (start_frame + 1 == end_frame) {
+            // Crosses frame boundary: set weight proportional to occupancy in each frame
+            float frac_first_frame = (float)(end_frame * config->getFrameSamples(configindex, datastreamindex) - nearestSamples[subloopindex]) / (float)fftchannels;
+            dataweight[subloopindex] = (frac_first_frame) * valid_frames->ptr()[start_frame] + (1 - frac_first_frame) * valid_frames->ptr()[end_frame];
+        } else {
+            cerr << "FFT window somehow spans more than two frames. This is suspicious to me but maybe allowed?" << std::endl;
+            abort();
+        };
+    }
 
     gSampleIndexes->ptr()[subloopindex] = nearestSamples[subloopindex] - unpackstartsamples;
 

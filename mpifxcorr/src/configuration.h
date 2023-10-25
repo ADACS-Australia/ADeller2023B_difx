@@ -475,6 +475,9 @@ public:
   }
   inline int getFrameBytes(int configindex, int configdatastreamindex) const
     { return datastreamtable[configs[configindex].datastreamindices[configdatastreamindex]].framebytes; }
+  inline int getFrameSamples(int configindex, int configdatastreamindex) const
+    { int streamdecimationfactor = freqtable[datastreamtable[configs[configindex].datastreamindices[configdatastreamindex]].recordedfreqtableindices[0]].decimationfactor;
+      return getFramePayloadBytes(configindex, configdatastreamindex)*8/(getDNumBits(configindex, configdatastreamindex)*getDNumRecordedBands(configindex, configdatastreamindex)*streamdecimationfactor); }
   inline dataformat getDataFormat(int configindex, int configdatastreamindex) const
     { return datastreamtable[configs[configindex].datastreamindices[configdatastreamindex]].format; }
   inline datasource getDataSource(int configindex, int configdatastreamindex) const

@@ -54,7 +54,7 @@ class Mk5_GPUMode : public GPUMode
    * @param subloopindex The "subloop" index that is currently being unpacked for (need to know to save weights in the right place)
   */
     virtual float unpack(int sampleoffset, int subloopindex);
-    virtual void unpack_all();
+    virtual void unpack_all(int framestounpack);
 
     int framesamples, framebytes, samplestounpack, fanout;
     struct mark5_stream *mark5stream;
