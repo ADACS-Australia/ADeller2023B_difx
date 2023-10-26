@@ -54,7 +54,7 @@ The troubleshooting area on http://www.atnf.csiro.au/vlbi/dokuwiki/doku.php/difx
 
 #### TESTING ####################
 
-See http://www.atnf.csiro.au/dokuwiki/doku.php/difx/benchmarks
+See https://www.atnf.csiro.au/vlbi/dokuwiki/doku.php/difx/benchmarking
 
 ## Usage
 
