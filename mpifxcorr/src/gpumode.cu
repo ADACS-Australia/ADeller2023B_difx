@@ -130,6 +130,16 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     );
     checkCufft(cufftSetStream(fft_plan, cuStream));
 
+    // indices for fringe rotation: bandindex to frequency index
+    this->band2freq = new GpuMemHelper<size_t>(numrecordedbands, cuStream);
+    for(size_t bandidx = 0; bandidx < numrecordedbands; ++bandidx) {
+        for(size_t freqidx = 0; freqidx < numrecordedfreqs; ++freqidx) {
+            this->band2freq->ptr()[bandidx] = config->matchingRecordedBand(configindex, datastreamindex, freqidx, bandidx);
+			std::cout << "%% band2freq[bandidx=" << bandidx << "] = c->mRB(configindex=" << configindex << ", datastreamindex=" << datastreamindex << ", frqidx=" << freqidx << ", bandidx=" << bandidx << "] = " << config->matchingRecordedBand(configindex, datastreamindex, freqidx, bandidx) << std::endl;
+        }
+    }
+    this->band2freq->copyToDevice();
+
 
     // precalc
     nearestSamples = new int[cfg_numBufferedFFTs];
@@ -165,6 +175,7 @@ GPUMode::~GPUMode() {
     delete gValidSamples;
     delete gInterpolator;
     delete gFracSampleError;
+    delete this->band2freq;
 
     delete[] nearestSamples;
 
@@ -266,6 +277,13 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     }
 
     auto start = high_resolution_clock::now();
+
+	if(datalengthbytes <= 1) {
+		std::cout << "Skipping block as datalengthbytes <= 1" << std::endl;
+		// normally this is 'return numBufferedFFTs', but since we haven't actually processed any, we'll return 0
+		// TODO: The other 'return' for this function has a comment about it not being used
+		return 0;
+	}
 
     std::cout << "Copied bytes to GPU " << datalengthbytes << std::endl;
     packeddata_gpu = new GpuMemHelper<char>((char*)data, datalengthbytes, cuStream);
@@ -618,7 +636,12 @@ void GPUMode::set_weights(int subloopindex, int nframes) {
             abort();
         } else {
             int start_frame = nearestSamples[subloopindex] / config->getFrameSamples(configindex, datastreamindex);
-            dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
+			if(perbandweights) {
+				// TODO TODO TODO
+				//perbandweights[subloopindex][ ... ] = (float)valid_frames->ptr()[start_frame];
+			} else {
+				dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
+			}
         }
     } else if (nearestSamples[subloopindex] < unpackstartsamples || nearestSamples[subloopindex] > unpackstartsamples + unpacksamples - fftchannels) {
         // Standard path. TODO: above condition can be simplified I think
@@ -730,7 +753,8 @@ __global__ void gpu_fringeRotation(
         int fftloop,
         int startblock,
         int numblocks,
-        size_t fftchannels
+        size_t fftchannels,
+        size_t *band2freq
     ) {
     // numBufferedFFTs(blockIdx.x) * (numrecordedbands(threadIdx.x) * fftchannels(threadIdx.y))
 
@@ -798,9 +822,12 @@ __global__ void gpu_fringeRotation(
     // Calculate BigA/B
 //    double bigAval = a * lofreqs[numrecordedfreq] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[numrecordedfreq];
 //    double bigBval = b * lofreqs[numrecordedfreq];
+    const size_t loFreqIndex = 1; // band2freq[bandindex];
 
-    double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
-    double bigBval = b * lofreqs[0];
+    double bigAval = a * lofreqs[loFreqIndex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
+    double bigBval = b * lofreqs[loFreqIndex];
+    //double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
+    //double bigBval = b * lofreqs[0];
 
     // Calculate
     double bigB_reduced = bigBval - int(bigBval);
@@ -855,7 +882,8 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
                     fftloop,
                     startblock,
                     numblocks,
-                    fftchannels
+                    fftchannels,
+                    this->band2freq->gpuPtr()
             );
 }
 

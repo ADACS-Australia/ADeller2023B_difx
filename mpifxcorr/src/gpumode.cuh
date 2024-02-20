@@ -70,6 +70,9 @@ protected:
     GpuMemHelper<double>* grecordedfreqclockoffsets;
     GpuMemHelper<double>* grecordedfreqclockoffsetsdelta;
     GpuMemHelper<double>* grecordedfreqlooffsets;
+    // Maps a band index to a frequency index
+    // Set and transferred to the GPU during construction
+    GpuMemHelper<size_t> *band2freq;
 
     cudaStream_t cuStream;
 
