@@ -213,7 +213,32 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 	return 1;	// The data is perfect and no one can tell it otherwise
 }
 
-__global__ void gpu_unpack(struct mark5_stream *ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
+__global__ void gpu_unpack(const char *packed, float **unpacked, bool *goodframes, const size_t len) {
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	static const float HiMag = 3.3359;  // Optimal value
+	const float levels_2bit[4] = {-HiMag, -1.0, 1.0, HiMag};
+
+	if(idx >= len) {
+		return;
+	}
+
+	const unsigned char byte = packed[idx];
+
+	// for now, assume two bit, two channel data, i.e. we have four samples in
+	// this byte
+	const int output_idx = idx * 2; // * 2, not * 4, because only two samples
+	                                // per channel per byte
+	//float *const unpacked_chan0 = unpacked[0] + output_idx;
+	//float *const unpacked_chan1 = unpacked[1] + output_idx;
+
+	unpacked[0][output_idx + 0] = levels_2bit[ (byte >> 0) & 0x3 ];
+	unpacked[1][output_idx + 0] = levels_2bit[ (byte >> 2) & 0x3 ];
+	unpacked[0][output_idx + 1] = levels_2bit[ (byte >> 4) & 0x3 ];
+	unpacked[1][output_idx + 1] = levels_2bit[ (byte >> 6) & 0x3 ];
+}
+
+__global__ void gpu_unpack_old(struct mark5_stream *ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
 	// Set up the required function pointers
 	ms->decode = *mk5_decode_general_gpu;
     ms->validate = *validate_gpudata;

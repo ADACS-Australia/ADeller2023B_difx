@@ -312,7 +312,7 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
 
     packeddata_gpu->sync();
-    unpack_all(framestounpack);
+    unpack_all(framestounpack, config->getFrameBytes(configindex, datastreamindex));
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);

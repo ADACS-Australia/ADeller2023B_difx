@@ -28,7 +28,7 @@ public:
 
     void process_unpack(int index, int subloopindex);
     void set_weights(int subloopindex, int nframes);
-    virtual void unpack_all(int) {}
+    virtual void unpack_all(int framestounpack, int frame_size) {};
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);

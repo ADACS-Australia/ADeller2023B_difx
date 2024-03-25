@@ -151,25 +151,51 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   return goodsamples/(float)unpacksamples;
 }
 
-void Mk5_GPUMode::unpack_all(int framestounpack) {
+void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
     // Hacky little workaround to get the stream struct back !! May not be needed !!
+  /*
     mark5_stream *tmp_mk5stream;
     cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
     *tmp_mk5stream = *mark5stream;
+    */
 
     std::cout << "frames to unpack: " << framestounpack << std::endl;
 
-    int unpack_threads = 64;
+    const int unpack_threads = 256;
+    const int total_bytes = framestounpack * frame_size;
+    const int blocks = (total_bytes + unpack_threads - 1) / unpack_threads;
+
+    for(size_t i = 0; i < (size_t)total_bytes; ++i) {
+      printf(" || % 8lu  %x\n", i, (unsigned int)((unsigned char*)packeddata_gpu->ptr())[i]);
+    }
+
+    std::cout << " cuda blocks: " << blocks << " ; total_bytes: " <<
+      total_bytes << std::endl;
+    gpu_unpack<<<blocks, unpack_threads, 0, cuStream>>>(
+        (char*)packeddata_gpu->gpuPtr(),
+        unpackedarrays_gpu->gpuPtr(),
+        valid_frames->gpuPtr(),
+        total_bytes
+      );
+
+    /*
     int unpack_blocks = (framestounpack + unpack_threads - 1) / unpack_threads;
 
+    cudaStreamSynchronize(cuStream);
+    std::cout << "call gpu_unpack - unpack_blocks = " << unpack_blocks << "; unpack_threads = " << unpack_threads << std::endl;
     gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(tmp_mk5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    */
+
+    /*
+    cudaMemset(valid_frames->gpuPtr(), 1, framestounpack);
 
     // Unfortunately we have to block here since we need the valid frames to find the correct dataweights
     valid_frames->sync();
     valid_frames->copyToHost();
     valid_frames->sync();
+    */
 
-    cudaFree(tmp_mk5stream);
+    //cudaFree(tmp_mk5stream);
 
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab
