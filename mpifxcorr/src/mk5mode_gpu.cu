@@ -165,10 +165,6 @@ void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
     const int total_bytes = framestounpack * frame_size;
     const int blocks = (total_bytes + unpack_threads - 1) / unpack_threads;
 
-    for(size_t i = 0; i < (size_t)total_bytes; ++i) {
-      printf(" || % 8lu  %x\n", i, (unsigned int)((unsigned char*)packeddata_gpu->ptr())[i]);
-    }
-
     std::cout << " cuda blocks: " << blocks << " ; total_bytes: " <<
       total_bytes << std::endl;
     gpu_unpack<<<blocks, unpack_threads, 0, cuStream>>>(
