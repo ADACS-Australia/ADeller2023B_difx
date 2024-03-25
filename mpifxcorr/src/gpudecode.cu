@@ -213,8 +213,13 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 	return 1;	// The data is perfect and no one can tell it otherwise
 }
 
+// Kernel for word-by-word unpacking
+//
+// Note that at the momet we only support 2bit 2channel data, but that will
+// soon change
 __global__ void gpu_unpack(const char *packed, float **unpacked, bool *goodframes, const size_t len) {
 	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	const int BYTES_PER_WORD = 4;
 
 	static const float HiMag = 3.3359;  // Optimal value
 	const float levels_2bit[4] = {-HiMag, -1.0, 1.0, HiMag};
@@ -223,19 +228,30 @@ __global__ void gpu_unpack(const char *packed, float **unpacked, bool *goodframe
 		return;
 	}
 
-	const unsigned char byte = packed[idx];
-
 	// for now, assume two bit, two channel data, i.e. we have four samples in
 	// this byte
-	const int output_idx = idx * 2; // * 2, not * 4, because only two samples
-	                                // per channel per byte
-	//float *const unpacked_chan0 = unpacked[0] + output_idx;
-	//float *const unpacked_chan1 = unpacked[1] + output_idx;
+	const int output_idx = idx * 2 * BYTES_PER_WORD; // * 2, not * 4, because only two samples per channel per byte
 
-	unpacked[0][output_idx + 0] = levels_2bit[ (byte >> 0) & 0x3 ];
-	unpacked[1][output_idx + 0] = levels_2bit[ (byte >> 2) & 0x3 ];
-	unpacked[0][output_idx + 1] = levels_2bit[ (byte >> 4) & 0x3 ];
-	unpacked[1][output_idx + 1] = levels_2bit[ (byte >> 6) & 0x3 ];
+	unpacked[0][output_idx + 0] = levels_2bit[ (packed[idx*BYTES_PER_WORD+0] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 0] = levels_2bit[ (packed[idx*BYTES_PER_WORD+0] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 1] = levels_2bit[ (packed[idx*BYTES_PER_WORD+0] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 1] = levels_2bit[ (packed[idx*BYTES_PER_WORD+0] >> 6) & 0x3 ];
+
+	unpacked[0][output_idx + 2] = levels_2bit[ (packed[idx*BYTES_PER_WORD+1] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 2] = levels_2bit[ (packed[idx*BYTES_PER_WORD+1] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 3] = levels_2bit[ (packed[idx*BYTES_PER_WORD+1] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 3] = levels_2bit[ (packed[idx*BYTES_PER_WORD+1] >> 6) & 0x3 ];
+
+	unpacked[0][output_idx + 4] = levels_2bit[ (packed[idx*BYTES_PER_WORD+2] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 4] = levels_2bit[ (packed[idx*BYTES_PER_WORD+2] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 5] = levels_2bit[ (packed[idx*BYTES_PER_WORD+2] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 5] = levels_2bit[ (packed[idx*BYTES_PER_WORD+2] >> 6) & 0x3 ];
+
+	unpacked[0][output_idx + 6] = levels_2bit[ (packed[idx*BYTES_PER_WORD+3] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 6] = levels_2bit[ (packed[idx*BYTES_PER_WORD+3] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 7] = levels_2bit[ (packed[idx*BYTES_PER_WORD+3] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 7] = levels_2bit[ (packed[idx*BYTES_PER_WORD+3] >> 6) & 0x3 ];
+
 }
 
 __global__ void gpu_unpack_old(struct mark5_stream *ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {

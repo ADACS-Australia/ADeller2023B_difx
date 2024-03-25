@@ -161,17 +161,19 @@ void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
 
     std::cout << "frames to unpack: " << framestounpack << std::endl;
 
+    const int WORD_SIZE_BYTES = 4;
     const int unpack_threads = 256;
     const int total_bytes = framestounpack * frame_size;
+    assert(total_bytes % WORD_SIZE_BYTES == 0); // VDIF must always be an integer number of words
+    const int total_words = total_bytes / WORD_SIZE_BYTES;
     const int blocks = (total_bytes + unpack_threads - 1) / unpack_threads;
 
-    std::cout << " cuda blocks: " << blocks << " ; total_bytes: " <<
-      total_bytes << std::endl;
+    std::cout << " cuda blocks: " << blocks << " ; total_bytes: " << total_bytes << "; total_words: " << total_words << std::endl;
     gpu_unpack<<<blocks, unpack_threads, 0, cuStream>>>(
         (char*)packeddata_gpu->gpuPtr(),
         unpackedarrays_gpu->gpuPtr(),
         valid_frames->gpuPtr(),
-        total_bytes
+        total_words
       );
 
     /*
