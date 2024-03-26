@@ -217,7 +217,7 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 //
 // Note that at the moment we only support 2bit 2channel data, but that will
 // soon change
-__global__ void gpu_unpack(const char *packed_base, float **unpacked, bool *goodframes, const int payloadlength_words, const size_t len) {
+__global__ void gpu_unpack(const char *packed_base, float **unpacked, bool *goodframes, const int payloadlength_words, const int frame_size, const size_t len) {
 	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	const int BYTES_PER_WORD = 4;
 	const int HEADERLENGTH_BYTES = 4 * 8;
@@ -231,30 +231,33 @@ __global__ void gpu_unpack(const char *packed_base, float **unpacked, bool *good
 
 	const int headers_to_skip = 1 + (int)( idx / payloadlength_words );
 	const char *const packed = packed_base + (HEADERLENGTH_BYTES * headers_to_skip) + idx * BYTES_PER_WORD;
+	// The byte containing the 'valid/invalid' flag
+	const char *const header_byte = packed_base + 3 + (headers_to_skip - 1) * frame_size;
+	const int multiplier = !(*header_byte & 0x80);
 
 	// for now, assume two bit, two channel data, i.e. we have four samples in
 	// this byte
 	const int output_idx = idx * 2 * BYTES_PER_WORD; // * 2, not * 4, because only two samples per channel per byte
 
-	unpacked[0][output_idx + 0] = levels_2bit[ (packed[0] >> 0) & 0x3 ];
-	unpacked[1][output_idx + 0] = levels_2bit[ (packed[0] >> 2) & 0x3 ];
-	unpacked[0][output_idx + 1] = levels_2bit[ (packed[0] >> 4) & 0x3 ];
-	unpacked[1][output_idx + 1] = levels_2bit[ (packed[0] >> 6) & 0x3 ];
+	unpacked[0][output_idx + 0] = multiplier*levels_2bit[ (packed[0] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 0] = multiplier*levels_2bit[ (packed[0] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 1] = multiplier*levels_2bit[ (packed[0] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 1] = multiplier*levels_2bit[ (packed[0] >> 6) & 0x3 ];
 
-	unpacked[0][output_idx + 2] = levels_2bit[ (packed[1] >> 0) & 0x3 ];
-	unpacked[1][output_idx + 2] = levels_2bit[ (packed[1] >> 2) & 0x3 ];
-	unpacked[0][output_idx + 3] = levels_2bit[ (packed[1] >> 4) & 0x3 ];
-	unpacked[1][output_idx + 3] = levels_2bit[ (packed[1] >> 6) & 0x3 ];
+	unpacked[0][output_idx + 2] = multiplier*levels_2bit[ (packed[1] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 2] = multiplier*levels_2bit[ (packed[1] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 3] = multiplier*levels_2bit[ (packed[1] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 3] = multiplier*levels_2bit[ (packed[1] >> 6) & 0x3 ];
 
-	unpacked[0][output_idx + 4] = levels_2bit[ (packed[2] >> 0) & 0x3 ];
-	unpacked[1][output_idx + 4] = levels_2bit[ (packed[2] >> 2) & 0x3 ];
-	unpacked[0][output_idx + 5] = levels_2bit[ (packed[2] >> 4) & 0x3 ];
-	unpacked[1][output_idx + 5] = levels_2bit[ (packed[2] >> 6) & 0x3 ];
+	unpacked[0][output_idx + 4] = multiplier*levels_2bit[ (packed[2] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 4] = multiplier*levels_2bit[ (packed[2] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 5] = multiplier*levels_2bit[ (packed[2] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 5] = multiplier*levels_2bit[ (packed[2] >> 6) & 0x3 ];
 
-	unpacked[0][output_idx + 6] = levels_2bit[ (packed[3] >> 0) & 0x3 ];
-	unpacked[1][output_idx + 6] = levels_2bit[ (packed[3] >> 2) & 0x3 ];
-	unpacked[0][output_idx + 7] = levels_2bit[ (packed[3] >> 4) & 0x3 ];
-	unpacked[1][output_idx + 7] = levels_2bit[ (packed[3] >> 6) & 0x3 ];
+	unpacked[0][output_idx + 6] = multiplier*levels_2bit[ (packed[3] >> 0) & 0x3 ];
+	unpacked[1][output_idx + 6] = multiplier*levels_2bit[ (packed[3] >> 2) & 0x3 ];
+	unpacked[0][output_idx + 7] = multiplier*levels_2bit[ (packed[3] >> 4) & 0x3 ];
+	unpacked[1][output_idx + 7] = multiplier*levels_2bit[ (packed[3] >> 6) & 0x3 ];
 
 }
 

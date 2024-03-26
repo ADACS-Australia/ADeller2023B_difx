@@ -183,6 +183,7 @@ void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
         unpackedarrays_gpu->gpuPtr(),
         valid_frames->gpuPtr(),
         payloadlength_words,
+        frame_size,
         total_words
       );
 
