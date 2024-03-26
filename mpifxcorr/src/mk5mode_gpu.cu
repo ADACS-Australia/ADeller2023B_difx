@@ -151,6 +151,11 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   return goodsamples/(float)unpacksamples;
 }
 
+// This unpack_all call (like all GPUMode unpack_alls) unpacks everything
+// (except the header of course), including the unnecessary period between the
+// start of the frame and the first sample in the observation. (We do this to
+// avoid a corner-case where unpacking has to begin inside a word, or worse,
+// inside a byte)
 void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
     // Hacky little workaround to get the stream struct back !! May not be needed !!
   /*
@@ -161,18 +166,23 @@ void Mk5_GPUMode::unpack_all(int framestounpack, int frame_size) {
 
     std::cout << "frames to unpack: " << framestounpack << std::endl;
 
-    const int WORD_SIZE_BYTES = 4;
+    const int BYTES_PER_WORD = 4;
     const int unpack_threads = 256;
     const int total_bytes = framestounpack * frame_size;
-    assert(total_bytes % WORD_SIZE_BYTES == 0); // VDIF must always be an integer number of words
-    const int total_words = total_bytes / WORD_SIZE_BYTES;
+    assert(total_bytes % BYTES_PER_WORD == 0); // VDIF must always be an integer number of words
+    const int total_words = total_bytes / BYTES_PER_WORD;
     const int blocks = (total_bytes + unpack_threads - 1) / unpack_threads;
+
+    const int HEADERLENGTH_BYTES = 4 * 8;
+    const int payloadlength_bytes = frame_size - HEADERLENGTH_BYTES;
+    const int payloadlength_words = payloadlength_bytes / BYTES_PER_WORD;
 
     std::cout << " cuda blocks: " << blocks << " ; total_bytes: " << total_bytes << "; total_words: " << total_words << std::endl;
     gpu_unpack<<<blocks, unpack_threads, 0, cuStream>>>(
         (char*)packeddata_gpu->gpuPtr(),
         unpackedarrays_gpu->gpuPtr(),
         valid_frames->gpuPtr(),
+        payloadlength_words,
         total_words
       );
 
