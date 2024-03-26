@@ -215,7 +215,7 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 
 // Kernel for word-by-word unpacking
 //
-// Note that at the momet we only support 2bit 2channel data, but that will
+// Note that at the moment we only support 2bit 2channel data, but that will
 // soon change
 __global__ void gpu_unpack(const char *packed, float **unpacked, bool *goodframes, const size_t len) {
 	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
