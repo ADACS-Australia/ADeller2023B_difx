@@ -133,6 +133,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     // indices for fringe rotation: bandindex to frequency index
     this->band2freq = new GpuMemHelper<size_t>(numrecordedbands, cuStream);
     for(size_t bandidx = 0; bandidx < numrecordedbands; ++bandidx) {
+		std::cout << "%%%% numreqcordedfreqs = " << numrecordedfreqs << std::endl;
         for(size_t freqidx = 0; freqidx < numrecordedfreqs; ++freqidx) {
             this->band2freq->ptr()[bandidx] = config->matchingRecordedBand(configindex, datastreamindex, freqidx, bandidx);
 			std::cout << "%% band2freq[bandidx=" << bandidx << "] = c->mRB(configindex=" << configindex << ", datastreamindex=" << datastreamindex << ", frqidx=" << freqidx << ", bandidx=" << bandidx << "] = " << config->matchingRecordedBand(configindex, datastreamindex, freqidx, bandidx) << std::endl;
@@ -228,6 +229,7 @@ __global__ void print_fft_window(cuFloatComplex* fftd_data, int nchan, int fftch
 int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
                          int numblocks)  //frac sample error is in microseconds
 {
+	//assert(false && "process_gpu");
     auto begin_time = high_resolution_clock::now();
     calls += 1;
     std::cout << "Doing the thing. fftloop: " << fftloop << ", numBufferedFFTs: " << numBufferedFFTs << ", numblocks: " << numblocks << ", startblock: " << startblock << std::endl;
@@ -294,6 +296,7 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     int framestounpack = datalengthbytes / config->getFrameBytes(configindex, datastreamindex);
     assert(datalengthbytes % config->getFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
 
+	std::cout << "getFrameBytes = " << config->getFrameBytes(configindex, datastreamindex) << std::endl;
     valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
 
     // Reset the autocorrelations
@@ -323,6 +326,10 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
         set_weights(fftwin, framestounpack);
     }
+	for (int i = 0; i < numBufferedFFTs; ++i) {
+		//printf("validSamples[% 8d] = %d ; dataweight[% 8d] = %f\n", i, gValidSamples->ptr()[i], i, dataweight[i]);
+		//std::cout << "validSamples[" << i << "] = " << gValidSamples->ptr()[i] << std::endl;
+	}
 
     start = high_resolution_clock::now();
 
@@ -344,7 +351,8 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     start = high_resolution_clock::now();
 
     // Run the fringe rotation
-    std::cout << "Starting processing" << std::endl;
+    std::cout << "Starting processing; numblocks = " << numblocks << std::endl;
+    checkCuda(cudaStreamSynchronize(cuStream)); // TODO - debugging only
     fringeRotation(fftloop, numBufferedFFTs, startblock, numblocks);
 
     // todo: remove
@@ -559,6 +567,7 @@ void GPUMode::set_weights(int subloopindex, int nframes) {
 				//perbandweights[subloopindex][ ... ] = (float)valid_frames->ptr()[start_frame];
 			} else {
 				dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
+				std::cout << "(in the place, set to = " << dataweight[subloopindex] << ", startframe = " << start_frame << ")" << std::endl;
 			}
         }
     } else if (nearestSamples[subloopindex] < unpackstartsamples || nearestSamples[subloopindex] > unpackstartsamples + unpacksamples - fftchannels) {
@@ -568,10 +577,14 @@ void GPUMode::set_weights(int subloopindex, int nframes) {
         if (start_frame == end_frame) {
             // This FFT window does not cross a frame boundary
             dataweight[subloopindex] = valid_frames->ptr()[start_frame] * 1.0;
+			//dataweight[subloopindex] = 0.5;
+			//std::cout << "(in the other place)" << std::endl;
         } else if (start_frame + 1 == end_frame) {
             // Crosses frame boundary: set weight proportional to occupancy in each frame
             float frac_first_frame = (float)(end_frame * config->getFrameSamples(configindex, datastreamindex) - nearestSamples[subloopindex]) / (float)fftchannels;
             dataweight[subloopindex] = (frac_first_frame) * valid_frames->ptr()[start_frame] + (1 - frac_first_frame) * valid_frames->ptr()[end_frame];
+			//dataweight[subloopindex] = 0.5;
+			//std::cout << "(in the third place)" << std::endl;
         } else {
             cerr << "FFT window somehow spans more than two frames. This is suspicious to me but maybe allowed?" << std::endl;
             abort();
@@ -650,6 +663,7 @@ void GPUMode::calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock,
                 (double) (static_cast<long long>(offsetns) - static_cast<long long>(datans)) / 1000.0 + fftstartmicrosec -
                            averagedelay;
         nearestSamples[subloopindex] = int(starttime / sampletime + 0.5);
+		//std::cout << " $$ nearestSamples[" << subloopindex << "] = " << nearestSamples[subloopindex] << std::endl;
 
         double nearestsampletime = nearestSamples[subloopindex] * sampletime;
         gFracSampleError->ptr()[subloopindex] = float(starttime - nearestsampletime);
@@ -966,5 +980,6 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
 }
 
 void GPUMode::runFFT() {
+	// TODO: here we need an offset into complexunpacked_gpu
     checkCufft(cufftExecC2C(fft_plan, complexunpacked_gpu->gpuPtr(), fftd_gpu->gpuPtr(), CUFFT_FORWARD));
 }

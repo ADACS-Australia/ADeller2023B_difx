@@ -93,8 +93,12 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
 
   fftcentre = index+0.5;
   averagedelay = interpolator[0]*fftcentre*fftcentre + interpolator[1]*fftcentre + interpolator[2];
+  printf(" (((((((((((( averagedelay = %f\n", averagedelay);
   fftstartmicrosec = index*fftchannels*sampletime; //CHRIS CHECK
   starttime = (offsetseconds-datasec)*1000000.0 + (static_cast<long long>(offsetns) - static_cast<long long>(datans))/1000.0 + fftstartmicrosec - averagedelay;
+  if(starttime < 0) {
+  printf("starttime = (ofs - ds) * 1e9 + (ofsns - datans) / 1e3 + fftsms - avgd = (%d - %d)*1e9 + (%d - %d)/1e3 + %f - %f = %f\n", offsetseconds, datasec, offsetns, datans, fftstartmicrosec, averagedelay, starttime);
+  }
   nearestsample = int(starttime/sampletime + 0.5);
   walltimesecs = model->getScanStartSec(currentscan, config->getStartMJD(), config->getStartSeconds()) + offsetseconds + offsetns/1.0e9 + fftstartmicrosec/1.0e6;
   intwalltime = static_cast<int>(walltimesecs);

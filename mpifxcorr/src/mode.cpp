@@ -766,6 +766,7 @@ void Mode::zeroKurtosis()
 
 void Mode::setOffsets(int scan, int seconds, int ns)
 {
+  printf(" !!!!!!!!! setOffsets -> %d, %d, %d\n", scan, seconds, ns);
   bool foundok;
   int srcindex;
   currentscan = scan;
@@ -805,6 +806,7 @@ void Mode::setValidFlags(s32 * v)
 
 void Mode::setData(u8 * d, int dbytes, int dscan, int dsec, int dns)
 {
+  printf(" !!!!!!@@@ setData -> %d, %d, %d\n", dscan, dsec, dns);
   data = d;
   datalengthbytes = dbytes;
   std::cout << "Setting data length as " << dbytes << std::endl;
@@ -812,6 +814,8 @@ void Mode::setData(u8 * d, int dbytes, int dscan, int dsec, int dns)
   datasec = dsec;
   datans = dns;
   unpackstartsamples = -999999999;
+  // TODO PWC - I don't understand this calculation for datassamples, doesn't
+  // it ignore datasec? Is datans the length and datasec the... start?
   datasamples = static_cast<int>(datans/(sampletime*1e3) + 0.5);
 }
 

@@ -148,14 +148,21 @@ int blanker_mark5(struct mark5_stream *ms)
 
 	data = (unsigned long long *)ms->payload;
 
+	// zone == 0 at the start of this loop, then we zone++ at the end of it
 	for(b = 0; b < nword; b += zonesize)
 	{
+		// e -- end of the data zone being considered; measured in words
 		e = b + zonesize;
 		if(e > nword)
 		{
+			// handle the case where the zonesize is bigger than the data
+			// actually available
 			e = nword;
 		}
 
+		// the start is OK iff we are not the special fill word
+		// QUESTION - why is this WORD64, not WORD32? Note that in practice it
+		// is repeated after 32 bits anyway
 		startOK = data[b] != MARK5_FILL_WORD64;
 		endOK   = data[e-1] != MARK5_FILL_WORD64;
 

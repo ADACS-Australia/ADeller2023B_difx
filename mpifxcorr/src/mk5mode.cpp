@@ -109,6 +109,11 @@ float Mk5_CPUMode::unpack(int sampleoffset, int subloopindex)
   //work out where to start from
   unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
 
+  // PWC -- this below comment is a bit confusing - in the normal case we're
+  // just unpacking one FFT worth of samples; there is also a corner case where
+  // samplegranularity != 1, meaning sometimes a single byte has samples with
+  // different times in it, in which case we unpack one more byte to make sure
+  // we've got the whole time stamp
   //unpack one frame plus one FFT size worth of samples
   if(usecomplex) 
   {
