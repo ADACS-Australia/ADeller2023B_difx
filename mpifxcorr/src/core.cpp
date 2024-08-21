@@ -538,7 +538,7 @@ void Core::loopprocess(int threadid)
     }
 
     //process our section of responsibility for this time range
-    processdata(numprocessed++ % RECEIVE_RING_LENGTH, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+    this->processdata(numprocessed++ % RECEIVE_RING_LENGTH, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
 
     if(threadid == 0)
       numcomplete++;
@@ -1360,13 +1360,13 @@ void Core::averageAndSendAutocorrs(int index, int threadid, double nsoffset, dou
             {
               if(config->getDLocalRecordedFreqIndex(procslots[index].configindex, j, l) == parentfreqindex && config->getDZoomBandPol(procslots[index].configindex, j, k-numrecordedbands) == config->getDRecordedBandPol(procslots[index].configindex, j, l))
               {
-                procslots[index].floatresults[resultindex] += modes[j]->getWeight(true, l);
+                procslots[index].floatresults[resultindex] += modes[j]->getWeight(false, l);
               }
             }
           }
           else
           {
-            procslots[index].floatresults[resultindex] += modes[j]->getWeight(true, k);
+            procslots[index].floatresults[resultindex] += modes[j]->getWeight(false, k);
           }
           resultindex++;
         }

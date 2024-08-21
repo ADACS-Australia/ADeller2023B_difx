@@ -4,6 +4,7 @@
 #include <iostream>
 #include <bitset>
 #include <stdio.h>
+#include <assert.h>
 
 #define MARK5_FILL_WORD64 0x1122334411223344ULL
 
@@ -58,6 +59,7 @@ __device__ int blanker_vdif_gpu(struct mark5_stream *ms)
 	{
 		ms->blankzoneendvalid[0] = 0;
 
+		assert(false);
 		return 0;
 	}
 
@@ -76,6 +78,7 @@ __device__ int blanker_vdif_gpu(struct mark5_stream *ms)
 	if(data[0] == MARK5_FILL_WORD64 || data[nword-1] == MARK5_FILL_WORD64)
 	{
 		ms->blankzoneendvalid[0] = 0;
+		assert(false);
 		return 0;
 	}
 	else
@@ -169,8 +172,13 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 	bool bitreadflag = (nbit == 1) || (nbit == 2);
 
 	int start = decomp_factor * ms->databytes * ms->framenum;
+	assert(2 == nchan);
+	//data[0][o] = 1.0;
+	//data[1][o] = 1.0;
+	//assert(2 == nsamp);
 	for(o = start; o < start + nsamp; o++) {
-
+		data[0][o] = 1.0;
+		data[1][o] = 1.0;
 		if (bit_counter / 8 >= ms->blankzoneendvalid[0])
 		{
 			// This entire sample is zero. Store in data and skip ahead

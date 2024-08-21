@@ -9,6 +9,34 @@
 #include <omp.h>
 #include <thread>
 
+__global__ void gpu_sampleBookkeeping(
+		// (1) input/output arrays
+		// The original packed data (needed for the frame validity bits)
+		const char *packed_base,
+		// The offset indices of samples (used to handle FFTs that overlap)
+		int *sampleIndexes,
+		// Which samples are valid (not their weight)
+		// TODO: work out what 'valid' means here, if we're calculating it
+		// correctly, and what the difference is between an 'invalid' FFT and
+		// an FFT with weight zero
+		bool *validSamples,
+		// The per-FFT weights
+		float *dataweight_gpu,
+
+		// (2) constants used in the calculation
+		double sampletime,
+		size_t fftchannels,
+		double *interpolator,
+		int offsetseconds,
+		int offsetns,
+		int dataseconds,
+		int datans,
+		int samplesPerFrame,
+		int samplesPerFft,
+		// Length of a frame in bytes
+		size_t frameLength
+	);
+
 using namespace std::chrono;
 
 const int MAX_INDICIES = 10;
@@ -32,6 +60,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
              nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen,
              cacorrs, bclock), estimatedbytes_gpu(0) {
 
+	this->offsetns = 42424242;
     auto start = high_resolution_clock::now();
 
     size_t buffer_payload_bytes = (config->getMaxDataBytes() / config->getFrameBytes(confindex, dsindex)) * config->getFramePayloadBytes(confindex, dsindex);
@@ -63,16 +92,21 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     estimatedbytes_gpu += temp_autocorrelations_gpu->size();
 
 
-    // Unpacked data only allocated on GPU
-    unpackedarrays_gpu = new GpuMemHelper<float*>(numrecordedbands, cuStream, true);
+	// note this actually gets allocated in the future on unpack
+    unpackedarrays_gpu = new GpuMemHelper<float*>(numrecordedbands, cuStream, false);
+	std::cout << "Unpacked arrays - created this many arrays: " << numrecordedbands << std::endl;
     unpackeddata_gpu = new GpuMemHelper<float>(numrecordedbands * unpacked_size, cuStream, true);
     std::cout << "Unpacked data size: " << numrecordedbands * unpacked_size << std::endl;
 
+      for(size_t band = 0; band < numrecordedbands; ++band) {
+		  unpackedarrays_gpu->ptr()[band] = nullptr;
+      }
     // Make sure these are allocated
     unpackeddata_gpu->sync();
 
     // Now launch a kernel to set up the arrays on the GPU
-    gpu_allocate_unpacked<<<1, 1, 0, cuStream>>>(unpackedarrays_gpu->gpuPtr(), unpackeddata_gpu->gpuPtr(), numrecordedbands, unpacked_size);
+	// TODO: I think this is entirely redundant as all it does is copy the data in...
+    //gpu_allocate_unpacked<<<1, 1, 0, cuStream>>>(unpackedarrays_gpu->gpuPtr(), unpackeddata_gpu->gpuPtr(), numrecordedbands, unpacked_size);
 
     estimatedbytes_gpu += unpackedarrays_gpu->size();
     estimatedbytes_gpu += unpackeddata_gpu->size();
@@ -81,6 +115,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     gValidSamples = new GpuMemHelper<bool>(cfg_numBufferedFFTs, cuStream);
     gInterpolator = new GpuMemHelper<double>(interpolator, 3, cuStream);
     gFracSampleError = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
+	this->gWeight = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
 
     gLoFreqs = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
 
@@ -141,6 +176,10 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     }
     this->band2freq->copyToDevice();
 
+	// data weight: the mode.cpp constructor allocates this, but we want to do it on the GPU, so, free the allocated version:
+	vectorFree(this->dataweight);
+	this->dataweight = this->gWeight->ptr();
+	// TODO: move the 'dataweight' allocation out of 'Mode' and into 'CPUMode' to avoid this dance
 
     // precalc
     nearestSamples = new int[cfg_numBufferedFFTs];
@@ -165,6 +204,8 @@ int calls = 0;
 GPUMode::~GPUMode() {
     auto start = high_resolution_clock::now();
 
+	this->dataweight = nullptr;
+
     delete complexunpacked_gpu;
     delete fftd_gpu;
     delete conj_fftd_gpu;
@@ -176,6 +217,7 @@ GPUMode::~GPUMode() {
     delete gValidSamples;
     delete gInterpolator;
     delete gFracSampleError;
+	delete this->gWeight;
     delete this->band2freq;
 
     delete[] nearestSamples;
@@ -293,7 +335,7 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     packeddata_gpu->copyToDevice();
 
     // Figure out how many frames in the packed data
-    int framestounpack = datalengthbytes / config->getFrameBytes(configindex, datastreamindex);
+    int framestounpack = datalengthbytes / config->getFrameBytes(configindex, datastreamindex); // TODO -- this is wrong where there is interlaced VDIF
     assert(datalengthbytes % config->getFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
 
 	std::cout << "getFrameBytes = " << config->getFrameBytes(configindex, datastreamindex) << std::endl;
@@ -315,11 +357,22 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
 
     packeddata_gpu->sync();
+
+	const double datatime = this->datasec + this->datans/1e9;
+	const double subinttime = this->offsetseconds + this->offsetns/1e9;
+
+	printf(" ^^ Prepare to unpack: data time = %d.%09d, offset = %d.%09d, sampletime = %e sec ===> samples to skip = %f (should be integer)\n", this->datasec, this->datans, this->offsetseconds, this->offsetns, this->sampletime / 1e6, (subinttime - datatime) / (this->sampletime / 1e6));
+	printf(" ^^ datalengthbytes = %d, datasamples = %d, my calc = %d\n", this->datalengthbytes, this->datasamples, this->datalengthbytes * (8 / 2 / 2));
+
     unpack_all(framestounpack, config->getFrameBytes(configindex, datastreamindex));
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
     avg_unpack += duration.count();
+
+	// Set up the FFT window indices, the weights and the 'gValidSamples'
+	// We do this on the GPU to avoid needing a CPU -> GPU copy in a hot loop
+	this->doSampleBookkeeping(numBufferedFFTs);
 
     // Set up the FFT window indices and weights
     // Ideally this will move to the GPU but it's a bit tricky. Isn't *too* time intensive anyway I think
@@ -526,6 +579,35 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
     return true;
 }
 
+// This function calls a kernel to calculate three things:
+//   * gSampleIndexes -- where each FFT should start and end
+//   * gValidSamples -- ***
+//   * gDataWeight -- the weighting to apply to each FFT
+//   * gFracSampleError -- the fractional correction between the expected and
+//   actual start of the sample
+void GPUMode::doSampleBookkeeping(const int numBufferedFFTs) {
+	//assert(false && "bookeing");
+	printf("call gpu_sB, offsetsec = %d, offsetns = %d, datasec = %d, datans = %d\n", this->offsetseconds, this->offsetns, this->datasec, this->datans);
+	gpu_sampleBookkeeping<<<numBufferedFFTs,1>>>(
+		this->packeddata_gpu->gpuPtr(),
+		this->gSampleIndexes->gpuPtr(),
+		this->gValidSamples->gpuPtr(),
+		this->gWeight->gpuPtr(),
+		this->sampletime,
+		this->fftchannels,
+		this->gInterpolator->gpuPtr(),
+		this->offsetseconds,
+		this->offsetns,
+		this->datasec,
+		this->datans,
+		this->config->getFrameSamples(configindex, datastreamindex),
+		this->fftchannels,
+		this->config->getFrameBytes(configindex, datastreamindex)
+	);
+	// copy the weights back
+	this->gWeight->copyToHost();
+	cudaStreamSynchronize(this->cuStream);
+}
 
 void GPUMode::set_weights(int subloopindex, int nframes) {
     // Not sure if this is still needed. Set to zero for now.
@@ -754,7 +836,10 @@ __global__ void gpu_fringeRotation(
     // Calculate BigA/B
 //    double bigAval = a * lofreqs[numrecordedfreq] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[numrecordedfreq];
 //    double bigBval = b * lofreqs[numrecordedfreq];
-    const size_t loFreqIndex = 1; // band2freq[bandindex];
+    //const size_t loFreqIndex = bandindex ? 1 : 0; // band2freq[bandindex];
+	//const size_t loFreqIndex = 0;
+    const size_t loFreqIndex = band2freq[bandindex];
+	//const size_t loFreqIndex = 1;
 
     double bigAval = a * lofreqs[loFreqIndex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
     double bigBval = b * lofreqs[loFreqIndex];
@@ -827,6 +912,85 @@ __device__ void atomicAddFloatComplex(cuFloatComplex* a, cuFloatComplex b){
     //use atomicAdd for float variables
     atomicAdd(x, cuCrealf(b));
     atomicAdd(y, cuCimagf(b));
+}
+
+__global__ void gpu_sampleBookkeeping(
+		const char *packed_base,
+		int *sampleIndexes,
+		bool *validSamples,
+		float *dataweight_gpu,
+		double sampletime,
+		size_t fftchannels,
+		double *interpolator,
+		int offsetseconds,
+		int offsetns,
+		int dataseconds,
+		int datans,
+		int samplesPerFrame,
+		int samplesPerFft,
+		size_t frameLength
+	) {
+	// blockIdx.x -- subloopindex i.e. FFT number
+	const size_t subloopindex = blockIdx.x;
+
+	// (1) Calculate `nearestSample` and friends -- what was once in // calculatePre_CPU
+	const double fftcentre = subloopindex + 0.5;
+	const double averagedelay = interpolator[0] * fftcentre * fftcentre + interpolator[1] * fftcentre + interpolator[2];
+	//printf("fftcentre = %f (from %lu) --> averagedelay = %f\n", fftcentre, subloopindex, averagedelay);
+	const double fftstartmicrosec = subloopindex * fftchannels * sampletime; //CHRIS CHECK
+	const double starttime = (offsetseconds - dataseconds) * 1000000.0 +
+			(double) (static_cast<long long>(offsetns) - static_cast<long long>(datans)) / 1000.0 + fftstartmicrosec -
+					   averagedelay;
+	const int nearestSample = int(starttime / sampletime + 0.5);
+	const int nearestNextSample = 0.1; // TODO - not right
+	double nearestsampletime = nearestSample * sampletime;
+
+	// (2) Calculate sampleIndexes and friends
+	// This was once in the set_weights function
+
+	// TODO: is_data_valid check here
+	validSamples[subloopindex] = true; // This FFT is valid
+	if(nearestSample < 0) {
+		printf("starttime = (ofs - ds) * 1e9 + (ofsns - datans) / 1e3 + fftsms - avgd = (%d - %d)*1e9 + (%d - %d)/1e3 + %f - %f = %f\n", offsetseconds, dataseconds, offsetns, datans, fftstartmicrosec, averagedelay, starttime);
+		printf("nearestSample = int(starttime / sampletime + 0.5) = int(%f / %f + 0.5) = %d\n", starttime, sampletime, nearestSample);
+	}
+	if(nearestSample < 0) {
+		// TODO -- this is for debugging only!!
+		return;
+	}
+	assert(nearestSample >= 0);
+	// TODO: used to have an assertion here that we didn't cross out of the
+	// frame
+
+	// PWC - 'Standard path'
+	// The start frame is the nearest sample to the sample time, divided by
+	// samples per frame, then rounded down
+	const int start_frame = nearestSample / samplesPerFrame;
+	// The end frame is the same calculation, but we move forward by the number
+	// of samples in an FFT, less one (so we are at the last sample in this
+	// Fft, not the first sample in the next one
+	const int end_frame = (nearestSample + samplesPerFft - 1) / samplesPerFrame;
+	// TODO: here we should check end frame is still inside etc
+
+	// The resulting weights depend on (a) the 'data valid' bit on the relevant
+	// frame(s), and (b) the fraction of the FFT that was in that frame
+	// The 'validity' bit is the most significant bit of the fourth byte of the
+	// header
+	// TODO: there's probably a sneaky way to combine these three cases
+	if(start_frame == end_frame) {
+		dataweight_gpu[subloopindex] = (float)(! (packed_base[ (start_frame * frameLength) + 3 ] >> 7) );
+	} else if(start_frame + 1 == end_frame) {
+		// TODO
+		const float second_frame_weight = 0.5;
+		const float first_frame_weight = 0.5;
+		dataweight_gpu[subloopindex] =
+			first_frame_weight * (float)(! (packed_base[ (start_frame * frameLength) + 3 ] >> 7) )
+			+ second_frame_weight * (float)(! (packed_base[ (end_frame * frameLength) + 3 ] >> 7) );
+	} else {
+		// TODO: ask Adam if this ever happens
+		printf("sf = %d, ef = (nS + sPF - 1) / sPF = (%d + %d - 1)/%d = %d, fftc = %lu\n", start_frame, nearestSample, samplesPerFft, samplesPerFrame, end_frame, fftchannels);
+		assert(false);
+	}
 }
 
 __global__ void gpu_resultsrotatorMultiply(

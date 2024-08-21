@@ -24,7 +24,8 @@ GPUCore::~GPUCore() {
     cout << "Average core post: " << avg_postprocess / core_calls << endl;
 }
 
-void GPUCore::loopprocess(int threadid) {
+/*
+void GPUCore__loopprocess(int threadid) {
     int perr, numprocessed, startblock, numblocks, lastconfigindex, numpolycos, maxchan, maxpolycos, stadumpchannels, strideplussteplen, maxrotatestrideplussteplength, maxxmaclength, slen;
     double sec;
     bool pulsarbin, somepulsarbin, somescrunch, dumpingsta, nowdumpingsta;
@@ -233,6 +234,7 @@ void GPUCore::loopprocess(int threadid) {
     extern int calls;
     cout << "process calls: " << calls << endl;
 }
+*/
 
 // Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
 // todo: deduplicate this function
@@ -358,7 +360,7 @@ void GPUCore::processBaselineBased(
 }
 
 void
-GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
+GPUCore::processdata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
                         threadscratchspace *scratchspace) {
     ++core_calls;
 
@@ -392,10 +394,15 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         //zero the autocorrelations and set delays
         modes[j]->zeroAutocorrelations();
         modes[j]->setValidFlags(&(procslots[index].controlbuffer[j][3]));
+        /*
         modes[j]->setData(procslots[index].databuffer[j], procslots[index].datalengthbytes[j],
                           procslots[index].controlbuffer[j][0], procslots[index].controlbuffer[j][1],
                           procslots[index].controlbuffer[j][2]);
         modes[j]->setOffsets(procslots[index].offsets[0], procslots[index].offsets[1], procslots[index].offsets[2]);
+        */
+        printf("GC::pd: modes[j]->setData(%d, %d) -- %d\n", procslots[index].datalengthbytes[j], procslots[index].controlbuffer[j][1], procslots[index].controlbuffer[j][2]);
+    modes[j]->setData(procslots[index].databuffer[j], procslots[index].datalengthbytes[j], procslots[index].controlbuffer[j][0], procslots[index].controlbuffer[j][1], procslots[index].controlbuffer[j][2]);
+    modes[j]->setOffsets(procslots[index].offsets[0], procslots[index].offsets[1], procslots[index].offsets[2]);
         modes[j]->setDumpKurtosis(scratchspace->dumpkurtosis);
         if (scratchspace->dumpkurtosis)
             modes[j]->zeroKurtosis();

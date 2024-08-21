@@ -10,10 +10,10 @@ public:
   GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm);
   ~GPUCore();
 
-  virtual void loopprocess(int threadid);
+  //virtual void loopprocess(int threadid);
 
-  void processgpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
-                      threadscratchspace *scratchspace);
+  void dont_call_processgpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco, threadscratchspace *scratchspace);
+  void processdata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco, threadscratchspace *scratchspace) override;
 
 protected:
   virtual Mode *getMode(const int configindex, const int datastreamindex) {

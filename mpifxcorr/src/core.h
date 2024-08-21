@@ -109,7 +109,7 @@ protected:
   * @param currentpolyco The correct Polyco object for this time slice - null if not pulsar binning
   * @param scratchspace Space for all of the intermediate results for this thread
   */
-  void processdata(int index, int threadid, int startblock, int numblocks, Mode ** modes, Polyco * currentpolyco, threadscratchspace * scratchspace);
+  virtual void processdata(int index, int threadid, int startblock, int numblocks, Mode ** modes, Polyco * currentpolyco, threadscratchspace * scratchspace);
 
   /**
    * Forward a call onwards to config->getMode. This is virtual to allow

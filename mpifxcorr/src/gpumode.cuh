@@ -33,6 +33,7 @@ public:
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
+    void doSampleBookkeeping(int numBufferedFFTs);
 
     [[nodiscard]] const cuFloatComplex* getGpuFreqs() const override { return fftd_gpu->gpuPtr(); }
     [[nodiscard]] const cuFloatComplex* getGpuConjugatedFreqs() const override { return conj_fftd_gpu->gpuPtr(); }
@@ -73,6 +74,9 @@ protected:
     // Maps a band index to a frequency index
     // Set and transferred to the GPU during construction
     GpuMemHelper<size_t> *band2freq;
+
+    // TODO: Here, do we need to handle multiple channels?
+    GpuMemHelper<float> *gWeight;
 
     cudaStream_t cuStream;
 
