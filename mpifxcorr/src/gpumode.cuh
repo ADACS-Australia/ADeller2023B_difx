@@ -26,13 +26,16 @@ public:
     int process_gpu(int fftloop, int numBufferedFFTs, int startblock,
                     int numblocks) override;  //frac sample error is in microseconds
 
+//    int GPUMode::set_invalid_data(int fftloop, int numBufferedFFTs, int startblock,
+//                         int numblocks);
+
     void process_unpack(int index, int subloopindex);
-    void set_weights(int subloopindex, int nframes);
+    void set_weights(int subloopindex, int nframes, int *counts);
     virtual void unpack_all(int) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
-    void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
+    void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int *counts);
 
     [[nodiscard]] const cuFloatComplex* getGpuFreqs() const override { return fftd_gpu->gpuPtr(); }
     [[nodiscard]] const cuFloatComplex* getGpuConjugatedFreqs() const override { return conj_fftd_gpu->gpuPtr(); }

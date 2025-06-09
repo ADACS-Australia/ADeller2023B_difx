@@ -457,6 +457,8 @@ Mode::Mode(Configuration * conf, int confindex, int dsindex, int recordedbandcha
 
 Mode::~Mode()
 {
+  
+
   if(perbandweights)
   {
     for(int i=0;i<config->getNumBufferedFFTs(configindex);++i)
@@ -482,7 +484,7 @@ Mode::~Mode()
   delete [] fftoutputs;
   delete [] conjfftoutputs;
   delete [] interpolator;
-
+  
   switch(fringerotationorder) {
     case 2: // Quadratic
       vectorFree(piecewiserotator);
@@ -530,11 +532,14 @@ Mode::~Mode()
       break;
   }
 
+
   vectorFree(lookup);
   vectorFree(linearunpacked);
-  vectorFree(fftbuffer);
 
-  vectorFree(subfracsamparg);
+  if (fftbuffer != nullptr) {
+     vectorFree(fftbuffer);
+  }
+  vectorFree(subfracsamparg);  
   vectorFree(subfracsampsin);
   vectorFree(subfracsampcos);
   vectorFree(subchannelfreqs);
@@ -548,7 +553,6 @@ Mode::~Mode()
   vectorFree(lsbstepchannelfreqs);
   vectorFree(dsbstepchannelfreqs);
   vectorFree(ldsbstepchannelfreqs);
-
   vectorFree(fracsamprotatorA);
   if (deltapoloffsets) vectorFree(fracsamprotatorB);
   //vectorFree(fracmult);
@@ -556,7 +560,6 @@ Mode::~Mode()
   //vectorFree(fracmultsin);
   //vectorFree(complexfracmult);
   //vectorFree(channelfreqs);
-
   for(int i=0;i<autocorrwidth;i++)
   {
     for(int j=0;j<numrecordedbands;j++)
@@ -566,7 +569,6 @@ Mode::~Mode()
   }
   delete [] weights;
   delete [] autocorrelations;
-
   if(config->getDPhaseCalIntervalMHz(configindex, datastreamindex))
   {
     for(int i=0;i<numrecordedbands;i++) {
@@ -577,7 +579,6 @@ Mode::~Mode()
     delete[] extractor;
     delete[] pcalnbins;
   }
-
   if(sk != 0) //also need to delete kurtosis stuff
   {
     for(int i=0;i<numrecordedbands;i++)
@@ -806,7 +807,7 @@ void Mode::setData(u8 * d, int dbytes, int dscan, int dsec, int dns)
 {
   data = d;
   datalengthbytes = dbytes;
-  std::cout << "Setting data length as " << dbytes << std::endl;
+  //std::cout << "Setting data length as " << dbytes << std::endl;
   datascan = dscan;
   datasec = dsec;
   datans = dns;

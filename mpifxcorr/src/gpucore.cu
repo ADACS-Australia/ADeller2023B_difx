@@ -201,6 +201,8 @@ void GPUCore::loopprocess(int threadid) {
                 << (numprocessed) % RECEIVE_RING_LENGTH << endl;
 
     //free resources
+
+    //exit(0);
     for (int j = 0; j < numdatastreams; j++)
         delete modes[j];
     delete[] modes;
@@ -223,6 +225,7 @@ void GPUCore::loopprocess(int threadid) {
     vectorFree(scratchspace->rotated);
     vectorFree(scratchspace->channelsums);
     vectorFree(scratchspace->argument);
+    std::cout << "scratchspace" << std::endl;
     if (scratchspace->starecordbuffer != 0) {
         free(scratchspace->starecordbuffer);
     }
@@ -364,8 +367,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 
     auto start = high_resolution_clock::now();
 
-    std::cout << "called GPUCore::processgpudata for the " << core_calls << " time, index: " << index << ", startblock: "
-              << startblock << ", numblocks: " << numblocks << std::endl;
+    //std::cout << "called GPUCore::processgpudata for the " << core_calls << " time, index: " << index << ", startblock: "
+    //          << startblock << ", numblocks: " << numblocks << std::endl;
 
 #ifndef NEUTERED_DIFX
     int status, numfftloops, numfftsprocessed;
@@ -508,6 +511,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     avg_preprocess += duration.count();
 
     // process each chunk of FFTs in turn
+    //std::cout << "numfftloops = " << numfftloops << std::endl;
     for (int fftloop = 0; fftloop < numfftloops; fftloop++) {
         start = high_resolution_clock::now();
 
@@ -517,9 +521,11 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         vector<std::thread> streamThreads;
 
         for (int j = 0; j < numdatastreams; j++) {
-            streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
-                numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
+          //  if (procslots[index].datalengthbytes[j] > 1) {
+    	    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
+            numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
             });
+        //    }
         }
 
         for (auto &t: streamThreads) {
@@ -528,7 +534,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 
         stop = high_resolution_clock::now();
         duration = duration_cast<microseconds>(stop - start);
-        cout << "total processing: " << duration.count() << endl;
+        //cout << "total processing: " << duration.count() << endl;
         start = high_resolution_clock::now();
 //
 //        //All baseline freq indices into the freq table are determined by the *first* datastream
@@ -700,7 +706,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 
         stop = high_resolution_clock::now();
         duration = duration_cast<microseconds>(stop - start);
-        cout << "baseline based processing: " << duration.count() << endl;
+        //cout << "baseline based processing: " << duration.count() << endl;
 
         start = high_resolution_clock::now();
 
@@ -774,9 +780,11 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 
         stop = high_resolution_clock::now();
         duration = duration_cast<microseconds>(stop - start);
-        cout << "baseline weight: " << duration.count() << endl;
+        //cout << "baseline weight: " << duration.count() << endl;
     }
+   
 
+    //std::cout << "Ended fft loop" << std::endl; 
     start = high_resolution_clock::now();
 
 //    checkCuda(cudaHostUnregister(stream1BandIndexes));
@@ -871,5 +879,6 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     duration = duration_cast<microseconds>(stop - start);
 
     avg_postprocess += duration.count();
+    //std::cout << "At the bottom of Core" << std::endl;
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

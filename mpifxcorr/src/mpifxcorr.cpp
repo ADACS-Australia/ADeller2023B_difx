@@ -539,12 +539,11 @@ int main(int argc, char *argv[])
   }
 
   //  /* See comment about MPI bindings above */
-  //catch (MPI::Exception e)
-  //{
-  //  cerror << startl << "Caught an exception!!! " << e.Get_error_string() << endl;
-  //  return EXIT_FAILURE;
-  //}
-
+//  catch (MPI::Exception e)
+//  {
+//    cerror << startl << "Caught an exception!!! " << e.Get_error_string() << endl;
+//    return EXIT_FAILURE;
+//  }
   MPI_Finalize();
 
   if (isDifxMessageInUse() && !nocommandthread) {
@@ -558,6 +557,7 @@ int main(int argc, char *argv[])
     else if (perc == ESRCH) cverbose << startl << "Command thread died by cancellation" << endl;
     else cverbose << startl << "Command thread return value " << prv << endl;
   }
+
 
   delete [] coreids;
   delete [] datastreamids;

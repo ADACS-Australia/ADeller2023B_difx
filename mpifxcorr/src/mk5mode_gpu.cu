@@ -157,7 +157,7 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
     cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
     *tmp_mk5stream = *mark5stream;
 
-    std::cout << "frames to unpack: " << framestounpack << std::endl;
+    //std::cout << "frames to unpack: " << framestounpack << std::endl;
 
     int unpack_threads = 64;
     int unpack_blocks = (framestounpack + unpack_threads - 1) / unpack_threads;

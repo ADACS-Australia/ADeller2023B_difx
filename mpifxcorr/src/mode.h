@@ -281,7 +281,7 @@ protected:
   cf32*** autocorrelations;
   vecFFTSpecR_f32 * pFFTSpecR;
   vecDFTSpecR_f32 * pDFTSpecR;
-  u8 * fftbuffer;
+  u8 * fftbuffer = nullptr;
   vecHintAlg hint;
   Model * model;
   f64 * interpolator;

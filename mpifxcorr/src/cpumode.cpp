@@ -201,6 +201,7 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       integerdelay = static_cast<int>(averagedelay);
       break;
     case 1: //linear
+      //std::cout << "linear" << std::endl; 
       d0 = interpolator[0]*index*index + interpolator[1]*index + interpolator[2];
       d1 = interpolator[0]*(index+0.5)*(index+0.5) + interpolator[1]*(index+0.5) + interpolator[2];
       d2 = interpolator[0]*(index+1)*(index+1) + interpolator[1]*(index+1) + interpolator[2];
@@ -218,6 +219,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       status = vectorAddC_f64_I(b, subxval, arraystridelength);
       if(status != vecNoErr)
         csevere << startl << "Error in linearinterpolate, subval addition!!!" << endl;
+//      for(int kk=0;kk<numfrstrides;kk++) {
+//          std::cout << "stepxval["<< kk << "] = " << stepxval[kk] << std::endl;
+//          std::cout << "subxval[" << kk << "] = " << stepxval[kk] << std::endl;
+//      }	  
       break;
     case 2: //quadratic
       a = interpolator[0];
@@ -310,6 +315,8 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
         lofreq = -lofreq;
       }
     }
+    //std::cout << "lofreq = " << lofreq << std::endl;
+
 
     switch(fringerotationorder) {
       case 1: // linear
@@ -586,8 +593,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
               if(status != vecNoErr)
                 csevere << startl << "Error in conjugate!!!" << status << endl;
             }
+	    std::cout << "unpacked data: " << unpackedarrays[j][nearestsample - unpackstartsamples] << std::endl;
             break;
           case 1: // Linear
+            //std::cout << "unpackedarrays[" << j << "][" << nearestsample - unpackstartsamples << "] = " << unpackedarrays[j][nearestsample - unpackstartsamples] << std::endl;
           case 2: // Quadratic
             if (usecomplex) {
               status = vectorMul_cf32(complexrotator, &unpackedcomplexarrays[j][nearestsample - unpackstartsamples], complexunpacked, fftchannels);
@@ -761,7 +770,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       }
 
       //if we need to, do the cross-polar autocorrelations
+      printf("calccrosspolautocorrs = %d \n",calccrosspolautocorrs);
       if(calccrosspolautocorrs) {
+	printf("calccrosspolautocorrs is true!\n");
+        exit(0);	
 	status = vectorAddProduct_cf32(fftoutputs[indices[0]][subloopindex], conjfftoutputs[indices[1]][subloopindex], autocorrelations[1][indices[0]], recordedbandchannels);
 	if(status != vecNoErr)
 	  csevere << startl << "Error in cross-polar autocorrelation!!!" << status << endl;

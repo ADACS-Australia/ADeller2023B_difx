@@ -38,8 +38,9 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     size_t unpacked_size = buffer_payload_bytes * 8 / (config->getDNumBits(confindex, dsindex) * config->getDNumRecordedBands(confindex, dsindex));
     // What's the largest number of FFTs we can fit?
     cfg_numBufferedFFTs = (unpacked_size + fftchannels - 1) / fftchannels;
-    std::cout << "Working on " << cfg_numBufferedFFTs << " FFTs" << std::endl;
+    //std::cout << "Working on " << cfg_numBufferedFFTs << " FFTs" << std::endl;
     // cfg_numBufferedFFTs = config->getNumBufferedFFTs(confindex);
+
 
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties( &prop, 0));
@@ -48,7 +49,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
 
-    std::cout << "fftchannels " << fftchannels << std::endl;
+    //std::cout << "fftchannels " << fftchannels << std::endl;
 
     complexunpacked_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, true);
     estimatedbytes_gpu += complexunpacked_gpu->size();
@@ -84,14 +85,20 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     gLoFreqs = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
 
-    indices = new GpuMemHelper<unsigned int>(MAX_INDICIES * numrecordedfreqs, cuStream);
-    for (auto i = 0; i < MAX_INDICIES * numrecordedfreqs; i++) {
+
+    //printf("MAX_INDICIES = %d \n", MAX_INDICIES);
+    //printf("numrecordedfreqs %d \n",numrecordedfreqs);
+    //exit(0);    
+    indices = new GpuMemHelper<unsigned int>((MAX_INDICIES * numrecordedfreqs), cuStream);
+    for (auto i = 0; i < (MAX_INDICIES * numrecordedfreqs); i++) {
         indices->ptr()[i] = 0xffffffff;
     }
     grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
     grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
     grecordedfreqlooffsets = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
     // Copy the lofreq and freq clock offset values to the GPU
+//    std::cout << "numrecordedfreqs = " << numrecordedfreqs << std::endl;
+//    exit(0);
     for (auto i = 0; i < numrecordedfreqs; i++) {
         gLoFreqs->ptr()[i] = config->getDRecordedFreq(configindex, datastreamindex, i);
         grecordedfreqclockoffsets->ptr()[i] = recordedfreqclockoffsets[i];
@@ -136,7 +143,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
-    cout << "GPUMode(): " << duration.count() << endl;
+    //cout << "GPUMode(): " << duration.count() << endl;
 
     constructor_time = high_resolution_clock::now();
 }
@@ -217,10 +224,11 @@ __global__ void print_fft_window(cuFloatComplex* fftd_data, int nchan, int fftch
 int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
                          int numblocks)  //frac sample error is in microseconds
 {
+    //printf("calccrosspolautocorrs = %d \n",calccrosspolautocorrs);
     auto begin_time = high_resolution_clock::now();
     calls += 1;
-    std::cout << "Doing the thing. fftloop: " << fftloop << ", numBufferedFFTs: " << numBufferedFFTs << ", numblocks: " << numblocks << ", startblock: " << startblock << std::endl;
-
+    //std::cout << "Doing the thing. fftloop: " << fftloop << ", numBufferedFFTs: " << numBufferedFFTs << ", numblocks: " << numblocks << ", startblock: " << startblock << std::endl;
+    
     // Sanity checks
     assert(numblocks == config->getNumBufferedFFTs(configindex));     // If this fails then check the input file and change "NUM BUFFERED FFTS"
     if (config->getDPhaseCalIntervalMHz(configindex, datastreamindex) != 0) {
@@ -267,14 +275,43 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     auto start = high_resolution_clock::now();
 
-    std::cout << "Copied bytes to GPU " << datalengthbytes << std::endl;
+    //std::cout << "Copied bytes to GPU " << datalengthbytes << std::endl;
     packeddata_gpu = new GpuMemHelper<char>((char*)data, datalengthbytes, cuStream);
     // Copy packed data to device
     packeddata_gpu->copyToDevice();
 
     // Figure out how many frames in the packed data
     int framestounpack = datalengthbytes / config->getFrameBytes(configindex, datastreamindex);
-    assert(datalengthbytes % config->getFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
+    //if (datalengthbytes % config->getFrameBytes(configindex, datastreamindex) != 0) {
+     // std::cout << "**************************************************" << std::endl;
+     // std::cout << "datalengthbytes = " << datalengthbytes << std::endl;
+     // std::cout << "frame bytes = " << config->getFrameBytes(configindex, datastreamindex) << std::endl;
+     // std::cout << "modulo = " << datalengthbytes % config->getFrameBytes(configindex, datastreamindex) << std::endl; 
+     // std::cout << "**************************************************" << std::endl;
+    //}
+
+    if (datalengthbytes > 1) {  // datalengthbytes <= 1 means an invalid sub int which should be handled....
+        assert(datalengthbytes % config->getFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
+    } else { 
+      //fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
+      //conj_fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
+
+      // set everything to zero and return
+
+      //std::cout << "fftchannels * cfg_numBufferedFFTs * numrecordedbands = " << fftchannels * cfg_numBufferedFFTs * numrecordedbands << std::endl;    
+      //std::cout << "setting fftd_gpu and conj_fftd_gpu to 0." << std::endl;
+      //cudaMemset(fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex));
+      //cudaMemset(conj_fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex));
+      //std::cout << "done setting fftd_gpu and conj_fftd_gpu didn't segfault huzzah!" << std::endl;
+        checkCuda(cudaMemsetAsync(fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
+	checkCuda(cudaMemsetAsync(conj_fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
+        checkCuda(cudaStreamSynchronize(cuStream));
+	fftd_gpu->copyToHost();
+        conj_fftd_gpu->copyToHost();
+	delete packeddata_gpu;
+	return numBufferedFFTs;
+    }
+
 
     valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
 
@@ -300,11 +337,43 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     duration = duration_cast<microseconds>(stop - start);
     avg_unpack += duration.count();
 
+
+   // unpackedarrays_gpu = new GpuMemHelper<float*>(numrecordedbands, cuStream, true);
+   // unpackeddata_gpu = new GpuMemHelper<float>(numrecordedbands * unpacked_size, cuStream, true);
+    //unpackedarrays_gpu->sync();
+    //unpackedarrays_gpu->copyToHost();
+    //std::cout << "unpackedarrays_gpu->ptr()[0][0]" << unpackedarrays_gpu->ptr()[0][0] << std::endl;
+    //delete packeddata_gpu;
+    //exit(0);
+
+    //unpackedarrays_gpu->sync();
+    //std::cout << "numrecordedbands = " << numrecordedbands << std::endl;
+    // unpackedarrays_gpu->ptr();
+    
+    //std::cout << "size = " << size << std::endl;
+    //std::cout << "********************" << std::endl;
+    //for (int xx=0;xx<1;xx++) {
+    //    for (int yy=0;yy<1;yy++) {
+    //	    std::cout << first_band[0][0] << std::endl;
+    //	}
+    //}
+    //std::cout << "********************" << std::endl;
+    //delete packeddata_gpu;
+    //exit(0);
+
+
+
+    int counts[numrecordedfreqs] = {0};
     // Set up the FFT window indices and weights
     // Ideally this will move to the GPU but it's a bit tricky. Isn't *too* time intensive anyway I think
     for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
-        set_weights(fftwin, framestounpack);
+        set_weights(fftwin, framestounpack, counts);
     }
+    //for (int ii=0; ii<numrecordedfreqs; ii++) {
+    //    printf("counts[%d] = %d\n",ii,counts[ii]);
+    //}
+  
+
 
     start = high_resolution_clock::now();
 
@@ -316,8 +385,8 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     gValidSamples->copyToDevice();
 
     // todo: remove
+    //std::cout << "Data copied and unpacked with code: " << cudaGetLastError() << std::endl;
     checkCuda(cudaStreamSynchronize(cuStream));
-    std::cout << "Data copied and unpacked with code: " << cudaGetLastError() << std::endl;
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -326,12 +395,12 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     start = high_resolution_clock::now();
 
     // Run the fringe rotation
-    std::cout << "Starting processing" << std::endl;
+    //std::cout << "Starting processing" << std::endl;
     fringeRotation(fftloop, numBufferedFFTs, startblock, numblocks);
 
     // todo: remove
+    //std::cout << "Fringe rotation ended with code: " << cudaGetLastError() << std::endl;
     checkCuda(cudaStreamSynchronize(cuStream));
-    std::cout << "Fringe rotation ended with code: " << cudaGetLastError() << std::endl;
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -342,8 +411,8 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     runFFT();
 
     // todo: remove
+    //std::cout << "Data FFTed with code: " << cudaGetLastError() << std::endl;
     checkCuda(cudaStreamSynchronize(cuStream));
-    std::cout << "Data FFTed with code: " << cudaGetLastError() << std::endl;
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -351,13 +420,13 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     start = high_resolution_clock::now();
 
-    // do the frac sample correct (+ phase shifting if applicable, + fringe rotate if its post-f)
-    fractionalRotation(fftloop, numBufferedFFTs, startblock, numblocks);
+    // do the frac sample correct (+ phase shifting if applicable, + fringe rotate if its post-f) 
+    fractionalRotation(fftloop, numBufferedFFTs, startblock, numblocks, calccrosspolautocorrs, counts);
 
     // todo: remove
+    //std::cout << "Fractional rotate complete with code: " << cudaGetLastError() << std::endl;
     checkCuda(cudaStreamSynchronize(cuStream));
-    std::cout << "Fractional rotate complete with code: " << cudaGetLastError() << std::endl;
-
+    
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
     avg_fracrotate += duration.count();
@@ -436,6 +505,19 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     return numBufferedFFTs;
 }
 
+
+//int GPUMode::set_invalid_data(int fftloop, int numBufferedFFTs, int startblock,
+//                         int numblocks) {
+//
+//    size_t unpacked_size = buffer_payload_bytes * 8 / (config->getDNumBits(confindex, dsindex) * config->getDNumRecordedBands(confindex, dsindex));
+//    // What's the largest number of FFTs we can fit?
+//    cfg_numBufferedFFTs = (unpacked_size + fftchannels - 1) / fftchannels;	
+//    fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
+//    conj_fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
+//    return numBufferedFFTs;
+//}	
+
+
 bool GPUMode::is_dataweight_valid(int subloopindex) {
     int status;
 
@@ -501,6 +583,8 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
 }
 
 void GPUMode::process_unpack(int index, int subloopindex) {
+
+    //std::cout << "In process_unpack" << std::endl;
     // Clear the perbandweights for this subloopindex
     if(perbandweights)
     {
@@ -542,6 +626,8 @@ void GPUMode::process_unpack(int index, int subloopindex) {
                 // However for complex double upper sideband, the two halves of the frequency space are swapped, so they need to be swapped back
 
                 if (config->matchingRecordedBand(configindex, datastreamindex, i, j)) {
+		    //printf("setting indices! \n");
+		    //exit(0);	    
                     indices->ptr()[(i * MAX_INDICIES) + count++] = j;
 
                     // At this point in the code the array fftoutputs[j] contains complex-valued voltage spectra with the following properties:
@@ -583,7 +669,7 @@ void GPUMode::process_unpack(int index, int subloopindex) {
     }
 }
 
-void GPUMode::set_weights(int subloopindex, int nframes) {
+void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
     // Not sure if this is still needed. Set to zero for now.
     unpackstartsamples = 0;
 
@@ -642,18 +728,32 @@ void GPUMode::set_weights(int subloopindex, int nframes) {
     if (!is_dataweight_valid(subloopindex)) {
         gValidSamples->ptr()[subloopindex] = false;
     } else {
+	//printf("numrecordedfreqs = %d \n",numrecordedfreqs);
+        //printf("numrecordedbands  = %d \n",numrecordedbands);
+        //exit(0);	
         // Todo: This can definitely be cleaned up and improved
         for (int i = 0; i < numrecordedfreqs; i++) {
-            int count = 0;
             // PWCR numrecordedbands = 2 for the test; but e.g. 8 is very realistical
             // Loop over all recorded bands looking for the matching frequency we should be dealing with
+            int count = 0;
             for (int j = 0; j < numrecordedbands; j++) {
                 // For upper sideband bands, normally just need to copy the fftd channels.
                 // However for complex double upper sideband, the two halves of the frequency space are swapped, so they need to be swapped back
 
                 if (config->matchingRecordedBand(configindex, datastreamindex, i, j)) {
+		    //if (count > 0) {	
+		    //    printf("count > 1\n");
+		    //    exit(0);
+		   // }	
                     indices->ptr()[(i * MAX_INDICIES) + count++] = j;
-
+                    int idx = (i * MAX_INDICIES) + count-1;
+	            //printf("idx = %d\n",idx); 
+		    //printf("i, j = %d,%d \n",i,j);
+		    counts[i] = count;
+		    //if (i == 3) {
+		    //   counts[i] = 100;
+		    //}    
+		    //exit(0);
                     // At this point in the code the array fftoutputs[j] contains complex-valued voltage spectra with the following properties:
                     //
                     // 1. The zero element corresponds to the lowest sky frequency.  That is:
@@ -799,8 +899,12 @@ __global__ void gpu_fringeRotation(
 //    double bigAval = a * lofreqs[numrecordedfreq] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[numrecordedfreq];
 //    double bigBval = b * lofreqs[numrecordedfreq];
 
-    double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
-    double bigBval = b * lofreqs[0];
+//    double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
+//    double bigBval = b * lofreqs[0];
+
+    double bigAval = a * lofreqs[bandindex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[bandindex];
+    double bigBval = b * lofreqs[bandindex];
+
 
     // Calculate
     double bigB_reduced = bigBval - int(bigBval);
@@ -810,9 +914,15 @@ __global__ void gpu_fringeRotation(
     sincosf(-TWO_PI * exponent, &cr.y, &cr.x);
     cuFloatComplex c = make_cuFloatComplex(srcVal, 0.f);
     dest[destIndex] = cuCmulf(c, cr);
-    if (subloopindex == 5000) {
-        //printf("Using src[%lu][%lu] = %f to get dest[%lu] = %f + %fi\n", srcIndex, sampleIndexes[subloopindex] + channelindex, srcVal, destIndex, dest[destIndex].x, dest[destIndex].y);
+  
+
+    if (srcVal != 0) {
+       //printf("lofreqs = %lf \n",lofreqs[0]);
+       //printf("Using src[%lu][%lu] = %f to get dest[%lu] = %f + %fi  and lofreq = %lf\n", srcIndex, sampleIndexes[subloopindex] + channelindex, srcVal, destIndex, dest[destIndex].x, dest[destIndex].y, lofreqs[bandindex]);
+       //printf("src[%lu][%lu] = %f\n", srcIndex, sampleIndexes[subloopindex] + channelindex, srcVal);
+
     }
+
 }
 
 void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks) {
@@ -885,8 +995,15 @@ __global__ void gpu_resultsrotatorMultiply(
         size_t fftchannels,
         size_t recordedbandchannels,
         size_t numrecordedbands,
-        size_t numrecordedfreqs
+        size_t numrecordedfreqs,
+	bool calccrosspolautocorrs,
+	int* counts_gpu
     ) {
+
+    //for (int ii=0; ii<numrecordedfreqs; ii++){
+    //    printf("counts_gpu[%d] = %d\n",ii,counts_gpu[ii]);
+    //}
+
     // numBufferedFFTs(blockIdx.x) * fftchannels(threadIdx.x)
 
     // blockIdx.x in this case is the subloopindex index [0 .. numBufferedFFTs]
@@ -960,13 +1077,69 @@ __global__ void gpu_resultsrotatorMultiply(
     }
 
     for (size_t recordedfreq = 0; recordedfreq < numrecordedfreqs; recordedfreq++) {
-        if (numrecordedbands > 1) {
+        if (calccrosspolautocorrs && counts_gpu[recordedfreq] > 1) {
+            printf("calccrosspolautocorrs = %d\n",calccrosspolautocorrs);		
             // if we need to, do the cross-polar autocorrelations
             size_t fftIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 0] * fftchannels) + channelindex;
-            size_t conjIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 1] * fftchannels) + channelindex;
+            long indices_index = (recordedfreq * MAX_INDICIES) + 1;
+            //printf("indices_index = %lu \n", indices_index); 
+	    int index_conj = indices[(recordedfreq * MAX_INDICIES) + 1];
+            //printf("index1 = %d\n", indices[0]);
+	    //printf("index2 = %d\n", indices[1]);    
+	    //printf("index_conj = %d \n", index_conj);
+	    //printf("recordedfreq = %lu \n",recordedfreq);
+	    //printf("MAX_INDICIES = %lu \n",MAX_INDICIES);  
+	    size_t conjIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 1] * fftchannels) + channelindex;
+            //printf("fftIndex = %lu \n",fftIndex);
+	  
+	    //printf("conjIndex = %lu \n ",conjIndex);
+            long autocorr_index = (numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex; 
+			     
+	    //printf("autocorr_index = %lu \n ",autocorr_index);
 
-            atomicAddFloatComplex(&autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex], cuCmulf(fftoutputs[fftIndex], conjfftoutputs[conjIndex]));
+            //long long size_autocorrs = sizeof(&autocorrelations)/sizeof(&autocorrelations[0]);
+            //long long size_fftoutputs = sizeof(fftoutputs) /sizeof(fftoutputs[0]);
+	    //long long size_conjfftoutputs = sizeof(conjfftoutputs) /sizeof(conjfftoutputs[0]);
 
+	    long long size_autocorrs = sizeof(&autocorrelations);
+            long long size_fftoutputs = sizeof(fftoutputs);
+            long long size_conjfftoutputs = sizeof(conjfftoutputs);
+
+
+
+      
+            //printf("size_autocorrs = %lld \n",size_autocorrs);
+            //printf("size_fftoutputs = %lld \n",size_fftoutputs);
+            //printf("size_conjfftoutputs = %lld \n",size_conjfftoutputs); 
+            //cuFloatComplex * blah1 = &autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex];
+	    cuFloatComplex blah2 = fftoutputs[fftIndex];    
+            ////cuFloatComplex blah3 = conjfftoutputs[conjIndex];
+
+
+            int size1 = sizeof(&autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex]);
+            int size2 = sizeof(cuCmulf(fftoutputs[fftIndex], conjfftoutputs[conjIndex]));
+            int input_size1 = sizeof(cuFloatComplex*);
+            int input_size2 = sizeof(cuFloatComplex);
+
+
+
+
+	    
+            //printf("autocorr_index = %ld \n",autocorr_index);
+            cuFloatComplex * xx = &autocorrelations[autocorr_index];
+	    cuFloatComplex ffto = fftoutputs[fftIndex];
+	    //printf("fftIndex = %lu \n",fftIndex);
+	    //printf("conjIndex = %lu \n",conjIndex);
+	    cuFloatComplex cffto = conjfftoutputs[conjIndex];
+	    cuFloatComplex yy = cuCmulf(ffto, cffto);
+            printf("yy = %f  %f \n",yy.x,yy.y);
+	    //printf("&autocorrelations[autocorr_index][0] = %f	    
+		//}
+	    //}	
+            
+
+	    atomicAddFloatComplex(&autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex], cuCmulf(fftoutputs[fftIndex], conjfftoutputs[conjIndex]));
+	    
             fftIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 1] * fftchannels) + channelindex;
             conjIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 0] * fftchannels) + channelindex;
 
@@ -975,7 +1148,7 @@ __global__ void gpu_resultsrotatorMultiply(
     }
 }
 
-void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks) {
+void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int* counts) {
     // At this point we have
     // * FFT results on GPU
     // * subchannelfreqs
@@ -994,9 +1167,18 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
             fftchannels_grid++;
         }
     }
-
-    gpu_resultsrotatorMultiply<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(fftchannels_block), 0, cuStream>>>
-            (
+        //printf("fracRot indices[0] = %u \n",indices->ptr()[0]);
+	//printf("fracRot indices[1] = %u \n",indices->ptr()[1]);
+	//exit(0);
+        //gpu_resultsrotatorMultiply<<<1, 1, 0, cuStream>>>
+        GpuMemHelper<int> *counts_gpu;
+        counts_gpu = new GpuMemHelper<int>(numrecordedfreqs, cuStream); 
+        for (int ii=0; ii < numrecordedfreqs; ii++) {
+       	    counts_gpu->ptr()[ii] = counts[ii];
+	}
+	counts_gpu->copyToDevice();
+	gpu_resultsrotatorMultiply<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(fftchannels_block), 0, cuStream>>>
+           (
                     fftd_gpu->gpuPtr(),
                     conj_fftd_gpu->gpuPtr(),
                     temp_autocorrelations_gpu->gpuPtr(),
@@ -1012,7 +1194,9 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
                     fftchannels,
                     recordedbandchannels,
                     numrecordedbands,
-                    numrecordedfreqs
+                    numrecordedfreqs,
+		    calccrosspolautocorrs,
+		    counts_gpu->gpuPtr()
             );
 
     // Start copying the autocorrelations back to the host
