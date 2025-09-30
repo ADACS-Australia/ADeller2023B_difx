@@ -457,10 +457,12 @@ Mode::Mode(Configuration * conf, int confindex, int dsindex, int recordedbandcha
 
 Mode::~Mode()
 {
+  std::cout << "In Mode destructor" << std::endl;	  
   
 
   if(perbandweights)
   {
+    std::cout << "loop 1" << std::endl; 
     for(int i=0;i<config->getNumBufferedFFTs(configindex);++i)
     {
       delete [] perbandweights[i];
@@ -469,6 +471,7 @@ Mode::~Mode()
   }
   vectorFree(dataweight);
   vectorFree(validflags);
+  std::cout << "loop2" << std::endl;
   for(int j=0;j<numrecordedbands+numzoombands;j++)
   {
     for(int k=0;k<config->getNumBufferedFFTs(configindex);k++)
@@ -481,10 +484,12 @@ Mode::~Mode()
     delete [] fftoutputs[j];
     delete [] conjfftoutputs[j];
   }
+  std::cout << "post loop 2" << std::endl;
   delete [] fftoutputs;
   delete [] conjfftoutputs;
   delete [] interpolator;
   
+  std::cout << "fringe rotation block" << std::endl;
   switch(fringerotationorder) {
     case 2: // Quadratic
       vectorFree(piecewiserotator);
@@ -531,35 +536,56 @@ Mode::~Mode()
       }
       break;
   }
+  std::cout << "post fringe rotation block" << std::endl;
 
 
+//  std::cout << "lookup" << std::endl;
   vectorFree(lookup);
+//  std::cout << "linearunpacked" << std::endl;
   vectorFree(linearunpacked);
+  std::cout << "fftbuffer DO I WORK NOW? " << std::endl;
 
   if (fftbuffer != nullptr) {
-     vectorFree(fftbuffer);
+      std::cout << "Why am I doing this?" << std::endl;
+      vectorFree(fftbuffer);
   }
+  std::cout << "subfracsamparg" << std::endl;
   vectorFree(subfracsamparg);  
+//  std::cout << "subfracsampsin" << std::endl;
   vectorFree(subfracsampsin);
+//  std::cout << "subfracsampcos" << std::endl;
   vectorFree(subfracsampcos);
+//  std::cout << "subchannelfreqs" << std::endl;
   vectorFree(subchannelfreqs);
+//  std::cout << "ldsbsubchannelfreqs " << std::endl;
   vectorFree(ldsbsubchannelfreqs);
+//    std::cout << "stepfracsamparg" << std::endl;
 
   vectorFree(stepfracsamparg);
+//    std::cout << "stepfracsampsin" << std::endl;
   vectorFree(stepfracsampsin);
+//    std::cout << "stepfracsampcos" << std::endl;
   vectorFree(stepfracsampcos);
+//    std::cout << "stepfracsampcplx" << std::endl;
   vectorFree(stepfracsampcplx);
+//    std::cout << "stepchannelfreqs" << std::endl;
   vectorFree(stepchannelfreqs);
+//    std::cout << "lsbstepchannelfreqs" << std::endl;
   vectorFree(lsbstepchannelfreqs);
+//    std::cout << "dsbstepchannelfreqs" << std::endl;
   vectorFree(dsbstepchannelfreqs);
+//    std::cout << "ldsbstepchannelfreqs" << std::endl;
   vectorFree(ldsbstepchannelfreqs);
+//  std::cout << "fracsamprotatorA" << std::endl;
   vectorFree(fracsamprotatorA);
+//  std::cout << "fracsamprotatorB" << std::endl;
   if (deltapoloffsets) vectorFree(fracsamprotatorB);
   //vectorFree(fracmult);
   //vectorFree(fracmultcos);
   //vectorFree(fracmultsin);
   //vectorFree(complexfracmult);
   //vectorFree(channelfreqs);
+//  std::cout << "autcorr loop" << std::endl;
   for(int i=0;i<autocorrwidth;i++)
   {
     for(int j=0;j<numrecordedbands;j++)
@@ -569,6 +595,7 @@ Mode::~Mode()
   }
   delete [] weights;
   delete [] autocorrelations;
+//  std::cout << "Pcal stuff" << std::endl;
   if(config->getDPhaseCalIntervalMHz(configindex, datastreamindex))
   {
     for(int i=0;i<numrecordedbands;i++) {
@@ -579,6 +606,7 @@ Mode::~Mode()
     delete[] extractor;
     delete[] pcalnbins;
   }
+//  std::cout << "Kurtosis" << std::endl;
   if(sk != 0) //also need to delete kurtosis stuff
   {
     for(int i=0;i<numrecordedbands;i++)
@@ -596,6 +624,7 @@ Mode::~Mode()
   if (linear2circular) {
     delete [] tmpvec;
   }
+  std::cout << "At the end of mode destructor" << std::endl;
 }
 
 float Mode::unpack(int sampleoffset, int subloopindex)

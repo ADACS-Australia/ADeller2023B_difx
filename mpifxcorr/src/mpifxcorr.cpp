@@ -524,7 +524,9 @@ int main(int argc, char *argv[])
     {
 #ifdef USE_CUDA
       if(use_gpu) {
+	std::cout << "starting GPUCore" << std::endl;      
         core = new GPUCore(myID, config, datastreamids, return_comm);
+        //std::cout << "ending GPUCore" << std::endl;
       } else {
         core = new Core(myID, config, datastreamids, return_comm);
       }
@@ -544,7 +546,9 @@ int main(int argc, char *argv[])
 //    cerror << startl << "Caught an exception!!! " << e.Get_error_string() << endl;
 //    return EXIT_FAILURE;
 //  }
+  std::cout << "starting MPI_Finalize" << std::endl;
   MPI_Finalize();
+  std::cout << "ending MPI_Finalize" << std::endl;
 
   if (isDifxMessageInUse() && !nocommandthread) {
     if(myID == 0) difxMessageSendDifxParameter("keepacting", "false", DIFX_MESSAGE_ALLMPIFXCORR);
@@ -559,12 +563,14 @@ int main(int argc, char *argv[])
   }
 
 
+  std::cout << "Starting cleanup" << std::endl;
   delete [] coreids;
   delete [] datastreamids;
 
   if(manager) delete manager;
   if(stream) delete stream;
   if(core) delete core;
+  std::cout << "Ending cleanup" << std::endl;
 
   //delete config;  	// FIXME!!! Revisit this commented out destructor sometime.
   			// It is currently commented out to prevent hang on exit

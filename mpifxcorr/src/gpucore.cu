@@ -202,10 +202,14 @@ void GPUCore::loopprocess(int threadid) {
 
     //free resources
 
+    std::cout << "Deleting modes for each datastream." << std::endl;
+    std::cout << "Just quit now!" << std::endl;
     //exit(0);
     for (int j = 0; j < numdatastreams; j++)
         delete modes[j];
+    std::cout << "deleting again????" << std::endl;
     delete[] modes;
+    std::cout << "done deleting agian" << std::endl;
     if (somepulsarbin) {
         if (threadid > 0 && pulsarbin) {
             for (int i = 0; i < numpolycos; i++)
@@ -219,6 +223,7 @@ void GPUCore::loopprocess(int threadid) {
             delete[] scratchspace->pulsaraccumspace;
         }
     }
+    std::cout << "Begin vectorFree calls" << std::endl;
     vectorFree(scratchspace->threadcrosscorrs);
     vectorFree(scratchspace->chanfreqs);
     vectorFree(scratchspace->rotator);

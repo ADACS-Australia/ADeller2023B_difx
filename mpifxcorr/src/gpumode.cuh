@@ -34,6 +34,7 @@ public:
     virtual void unpack_all(int) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
+    void pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int *counts);
 
@@ -73,11 +74,13 @@ protected:
     GpuMemHelper<double>* grecordedfreqclockoffsets;
     GpuMemHelper<double>* grecordedfreqclockoffsetsdelta;
     GpuMemHelper<double>* grecordedfreqlooffsets;
-
+    GpuMemHelper<int>* pcal_offsets_hz;
+    GpuMemHelper<float> *pcal_output_real;  // temporary unassembled output for the pcaloffsethz==0.0f case
+    GpuMemHelper<int>* N_pcal_bins;
     cudaStream_t cuStream;
 
     // precalc
-    int* nearestSamples;
+    GpuMemHelper<int> *nearestSamples;
 private:
 
     cufftHandle fft_plan;
