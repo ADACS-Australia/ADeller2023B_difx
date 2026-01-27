@@ -38,6 +38,7 @@ CPUMode::~CPUMode() {
     vectorFree(unpackedarrays[i]);
   delete [] unpackedarrays;
 
+
   switch(fringerotationorder) {
     case 2:
       /* fall through */
@@ -185,6 +186,8 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       {
         extractor[i]->adjustSampleOffset(datasamples+nearestsample);
         if (!usecomplex)
+          printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", i, subloopindex, nearestsample, unpackstartsamples);
+
 	        status = extractor[i]->extractAndIntegrate (&(unpackedarrays[i][nearestsample
 	                 - unpackstartsamples]), fftchannels);
         else

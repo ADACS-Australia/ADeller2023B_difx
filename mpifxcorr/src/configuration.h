@@ -154,8 +154,13 @@ public:
   inline int getNumPulsarBins(int configindex) const { return configs[configindex].numbins; }
   inline int getNumPolycos(int configindex) const { return configs[configindex].numpolycos; }
   inline Polyco ** getPolycos(int configindex) { return configs[configindex].polycos; }
+  inline bool get_use_gpu() const { return use_gpu; }
   inline bool matchingRecordedBand(int configindex, int configdatastreamindex, int datastreamfreqindex, int datastreamrecordedbandindex) const
-    { return datastreamfreqindex == datastreamtable[configs[configindex].datastreamindices[configdatastreamindex]].recordedbandlocalfreqindices[datastreamrecordedbandindex]; }
+  { 
+       //printf("configs[configindex].datastreamindices[configdatastreamindex] = %d \n",configs[configindex].datastreamindices[configdatastreamindex]); 
+       //printf("datastreamrecordedbandindex = %d \n",datastreamrecordedbandindex);
+       //printf("datastreamfreqindex = %d \n",datastreamfreqindex);
+       return datastreamfreqindex == datastreamtable[configs[configindex].datastreamindices[configdatastreamindex]].recordedbandlocalfreqindices[datastreamrecordedbandindex]; }
   inline int getDDataBufferFactor() const { return databufferfactor; }
   inline int getDNumDataSegments() const { return numdatasegments; }
   inline int isDMuxed(int configindex, int configdatastreamindex) const

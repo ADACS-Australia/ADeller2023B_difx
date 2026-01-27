@@ -222,6 +222,17 @@ int PCal::calcNumTones(double bw, double offset, double step)
     return n;
 }
 
+/**
+/**
+/**
+* Sets pcal accumulation buffer for GPU implementation. 
+* @param pcal_real Pointer to real valued pcal accumulation buffer
+*/
+void PCal::setPcalReal(f32* pcal_real)
+{
+    _cfg->pcal_real = pcal_real;
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BASE CLASS: c'stor
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1026,6 +1037,9 @@ void PCalExtractorImplicitShift::adjustSampleOffset(const size_t sampleoffset)
  */
 bool PCalExtractorImplicitShift::extractAndIntegrate(f32 const* samples, const size_t len)
 {
+
+
+    
     if (_finalized) {
         cerror << startl << "PCalExtractorImplicitShift::extractAndIntegrate on finalized class!" << endl;
         return false;
@@ -1035,6 +1049,12 @@ bool PCalExtractorImplicitShift::extractAndIntegrate(f32 const* samples, const s
     f32* dst = &(_cfg->pcal_real[_cfg->pcal_index]);
     size_t tail = (len % _N_bins);
     size_t end  = len - tail;
+
+
+    //printf("size src = %ld\n", sizeof(&src)/sizeof(f32));
+    //printf("size dst = %ld\n", sizeof(&dst)/sizeof(f32));
+
+    //printf("len, _N_bins, tail, end = %ld, %ld, %d, %d \n", len, _N_bins, tail, end);
 
     /* This method is from Walter Brisken, it works perfectly for smallish 'len'
      * and when offset and tone spacing have suitable properties.
@@ -1046,13 +1066,18 @@ bool PCalExtractorImplicitShift::extractAndIntegrate(f32 const* samples, const s
 
     /* Process the first part that fits perfectly */
     for (size_t n = 0; n < end; n+=_N_bins, src+=_N_bins) {
+        //printf("in loop one\n"); 
         vectorAdd_f32_I(src, /*srcdst*/dst, _N_bins);
     }
 
     /* Handle any samples that didn't fit */
     if (tail != 0) {
+        //printf("in loop 2\n");
+
+        //printf("src[511] = %lf \n",src[511]);
         vectorAdd_f32_I(src, /*srcdst*/dst, tail);
         _cfg->pcal_index = (_cfg->pcal_index + tail) % _N_bins;
+        //printf("src[0], src[1], src[3] = %f, %f, %f \ndst[0], dst[1], dst[3] = %f, %f, %f \n",src[0],src[1],src[2],dst[0],dst[1],dst[2]);
     }
 
     /* Done! */
@@ -1071,6 +1096,12 @@ uint64_t PCalExtractorImplicitShift::getFinalPCal(cf32* out)
 {
    vecStatus s;
    invariant();
+
+    //for (int xx=800; xx<805; xx++) {
+    //  std:cout << "_cfg->pcal_real[" << xx << "]=" << _cfg->pcal_real[xx] << "   ";
+    //  if (xx % 5 == 0) std::cout << std::endl;
+    //}
+
 
    if (!_finalized)
    {

@@ -856,6 +856,27 @@ void Mode::finalisepcal()
 {
   for(int i=0;i<numrecordedbands;i++)
   {
+
+    // you are here Mike 
+    
+
+    
+    
+    if (config->get_use_gpu()) { 
+        if (pcal_bin_stride_length <= 0) {
+            csevere << startl << "invalid pcal_bin_stride_length=" << pcal_bin_stride_length << endl;
+            continue;
+        }
+        if (pcal_output_real_gpu_mode == nullptr) {
+            csevere << startl << "pcal_output_real_gpu_mode is NULL" << endl;
+            continue;
+        }
+//        for (int ii = 0; ii < pcal_bin_stride_length; ii++){
+//            printf("idx, band, ii , val  = %d, %d, %d, %f \n",ii+(i*(pcal_bin_stride_length)), i, ii, (pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)))[ii] );
+//        }
+
+        extractor[i]->setPcalReal(pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)));     
+    }
     uint64_t samples = extractor[i]->getFinalPCal(pcalresults[i]);
     if ((samples == 0) && (datasec != INVALID_SUBINT) && (datalengthbytes > 1)) {
         //cdebug << startl << "finalisepcal band " << i << " samples==0 over valid subint " << datasec << "s+" << datans << "ns" << endl;

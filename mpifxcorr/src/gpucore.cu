@@ -517,6 +517,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 
     // process each chunk of FFTs in turn
     //std::cout << "numfftloops = " << numfftloops << std::endl;
+    //std::cout << "numsdatastreams = " << numdatastreams << std::endl;
     for (int fftloop = 0; fftloop < numfftloops; fftloop++) {
         start = high_resolution_clock::now();
 
@@ -526,6 +527,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         vector<std::thread> streamThreads;
 
         for (int j = 0; j < numdatastreams; j++) {
+          //  std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
           //  if (procslots[index].datalengthbytes[j] > 1) {
     	    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
             numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
@@ -861,6 +863,10 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     if (perr != 0)
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock copy mutex!!!"
                 << endl;
+
+
+
+    
 
     //copy the PCal results
     copyPCalTones(index, threadid, modes);

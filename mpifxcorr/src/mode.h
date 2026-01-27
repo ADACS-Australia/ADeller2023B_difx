@@ -50,8 +50,12 @@ the provided data and control (delay) arrays
 */
 class Mode{
 public:
+  
   f32 **  unpackedarrays;
   cf32 **  unpackedcomplexarrays;
+  f32 * pcal_output_real_gpu_mode = nullptr;
+  int pcal_bin_stride_length = 0;
+  
  /**
   * Stores the FFT valid flags for this block of data
   * @param v The array of valid flags for each FFT
@@ -296,6 +300,7 @@ protected:
   int * pcalnbins;
   cf32 ** pcalresults;
   PCal ** extractor;
+
   
   f64 * subtoff;
   f64 * subtval;

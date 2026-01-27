@@ -1135,6 +1135,8 @@ void Core::processdata(int index, int threadid, int startblock, int numblocks, M
 
 void Core::copyPCalTones(int index, int threadid, Mode ** modes)
 {
+
+  //std::cout << "index = %d, threadid = %d" << index << threadid << std::endl << std::endl << std::endl;
   int resultindex, localfreqindex, perr;
 
   //lock the pcal copylock, so we're the only one adding to the result array (pcal section)

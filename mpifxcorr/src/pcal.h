@@ -124,6 +124,13 @@ class PCal {
       */
       static int calcNumTones(double bw, double offset, double step);
 
+
+      /**
+       * Sets pcal accumulation buffer for GPU implementation. 
+       * @param pcal_real Pointer to real valued pcal accumulation buffer
+       */
+      void setPcalReal(f32* pcal_real);
+
    public:
       /**
        * Clear the extracted and accumulated PCal data by setting it to zero.
@@ -201,6 +208,9 @@ class PCal {
        * @param spectral resolution in hertz
        */
       static void setMinFrequencyResolution(double hz) { PCal::_min_freq_resolution_hz = hz; }
+
+      
+
 
       /**
        * Processes samples and accumulates the detected phase calibration tone vector.
