@@ -1075,8 +1075,8 @@ __global__ void gpu_pcalextraction(
             atomicAdd(&dst[cc], src[end+cc]);
         }
     }
-
-    printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", i, subloopindex, nearestsample, unpackstartsamples);
+    
+    printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", bandindex, subloopindex, nearestSamples[subloopindex], unpackstartsamples);
 
 //    if (src[end+0] != 0.0) {
 //       printf("src[end+0], src[end+1], src[end+3] = %f, %f, %f \ndst[0], dst[1], dst[3] = %f, %f, %f \n",src[end+0],src[end+1],src[end+2],dst[0],dst[1],dst[2]);

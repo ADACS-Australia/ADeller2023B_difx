@@ -185,12 +185,11 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       for(int i=0;i<numrecordedbands;i++)
       {
         extractor[i]->adjustSampleOffset(datasamples+nearestsample);
-        if (!usecomplex)
+        if (!usecomplex) {
           printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", i, subloopindex, nearestsample, unpackstartsamples);
-
 	        status = extractor[i]->extractAndIntegrate (&(unpackedarrays[i][nearestsample
 	                 - unpackstartsamples]), fftchannels);
-        else
+        } else
 	        status = extractor[i]->extractAndIntegrate ((f32 *) (&(unpackedcomplexarrays[i][nearestsample
 	                 - unpackstartsamples])), fftchannels);
         if(status != true)
