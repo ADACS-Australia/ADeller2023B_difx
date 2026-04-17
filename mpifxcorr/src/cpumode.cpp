@@ -2,6 +2,10 @@
 #include "cpumode.h"
 #include "alert.h"
 
+static int debug_dataweight_cpu_prints = 0;
+static int debug_dataweight_cpu_prints_invalid = 0;
+static int debug_dataweight_cpu_calls = 0;
+
 CPUMode::CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock):
     Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, bclock)
 {
@@ -57,6 +61,7 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
   //static int nth_call = 0;
   //++nth_call;
   //std::cout << "call " << nth_call << "to Mode::process" << std::endl;
+  ++debug_dataweight_cpu_calls;
   double phaserotation, averagedelay, nearestsampletime, starttime, lofreq, walltimesecs, fracwalltime, fftcentre, d0, d1, d2, fraclooffset;
   f32 phaserotationfloat, fracsampleerror;
   int status, count, nearestsample, integerdelay, RcpIndex, LcpIndex, intwalltime;
@@ -77,8 +82,39 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
     }
   }
   
-  if((datalengthbytes <= 1) || (offsetseconds == INVALID_SUBINT) || (((validflags[index/FLAGS_PER_INT] >> (index%FLAGS_PER_INT)) & 0x01) == 0))
+  const int validflagwordindex = index / FLAGS_PER_INT;
+  const int validflagbitindex = index % FLAGS_PER_INT;
+  const unsigned int validflagword = static_cast<unsigned int>(validflags[validflagwordindex]);
+  const int validflag = ((validflagword >> validflagbitindex) & 0x01);
+
+  const int reason_datalen = (datalengthbytes <= 1);
+  const int reason_subint = (offsetseconds == INVALID_SUBINT);
+  const int reason_validflag = (validflag == 0);
+
+  if(reason_datalen || reason_subint || reason_validflag)
   {
+    //if (debug_dataweight_cpu_prints_invalid < 256 && datastreamindex == 4) {
+    //  if (datans == 36500000) {
+    //      printf("DEBUG_DATAWEIGHT_CPU_INVALID call=%d ds=%d idx=%d sub=%d datalen=%d offsetsec=%d invalid_subint=%d datasec=%d datans=%d validflag=%d flagword_idx=%d flagbit_idx=%d flagword=0x%08x reason_len=%d reason_subint=%d reason_flag=%d\n",
+    //         debug_dataweight_cpu_calls,
+    //         datastreamindex,
+    //         index,
+    //         subloopindex,
+    //         datalengthbytes,
+    //         offsetseconds,
+    //         (int)(offsetseconds == INVALID_SUBINT),
+    //         datasec,
+    //         datans,
+    //         validflag,
+    //         validflagwordindex,
+    //         validflagbitindex,
+    //         validflagword,
+    //         reason_datalen,
+    //         reason_subint,
+    //         reason_validflag
+    //        );
+    //    debug_dataweight_cpu_prints_invalid++;
+    //  }
     for(int i=0;i<numrecordedbands;i++)
     {
       status = vectorZero_cf32(fftoutputs[i][subloopindex], recordedbandchannels);
@@ -165,6 +201,22 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
   */
 
   if(!(dataweight[subloopindex] > 0.0)) {
+  //  if (datans == 36500000) {
+  //    printf("DEBUG_DATAWEIGHT_CPU call=%d ds=%d idx=%d sub=%d nearest=%d sampleIndex=%d weight=%.9f valid=%d offsetsec=%d datasec=%d datans=%d\n",
+  //           debug_dataweight_cpu_calls,
+  //           datastreamindex,
+  //           index,
+  //           subloopindex,
+  //           nearestsample,
+  //           nearestsample - unpackstartsamples,
+  //           dataweight[subloopindex],
+  //           0,
+  //           offsetseconds,
+  //           datasec,
+  //           datans);
+  //    debug_dataweight_cpu_prints++;
+  //  }
+
     for(int i=0;i<numrecordedbands;i++)
     {
       status = vectorZero_cf32(fftoutputs[i][subloopindex], recordedbandchannels);
@@ -177,6 +229,23 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
     return;
   }
 
+  //if (debug_dataweight_cpu_prints < 256 && datastreamindex == 4) {
+  //  if (datans == 36500000) {
+  //       printf("DEBUG_DATAWEIGHT_CPU call=%d ds=%d idx=%d sub=%d nearest=%d sampleIndex=%d weight=%.9f valid=%d offsetsec=%d datasec=%d datans=%d\n",
+  //         debug_dataweight_cpu_calls,
+  //         datastreamindex,
+  //         index,
+  //         subloopindex,
+  //         nearestsample,
+  //         nearestsample - unpackstartsamples,
+  //         dataweight[subloopindex],
+  //         1,
+  //         offsetseconds,
+  //         datasec,
+  //         datans);
+  //  debug_dataweight_cpu_prints++;
+  //}
+
   nearestsampletime = nearestsample*sampletime;
   fracsampleerror = float(starttime - nearestsampletime);
 
@@ -184,9 +253,47 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
   {
       for(int i=0;i<numrecordedbands;i++)
       {
+        //if (datans == 36500000 && datastreamindex == 4 && subloopindex == 87 && i < 2) {
+        
+        if (subloopindex == 87 && i == 0 && datans == 36500000) {  
+          const int pcal_sample_index = nearestsample - unpackstartsamples;
+          const int pcal_sampleoffset = datasamples + nearestsample;
+        //  printf("DEBUG_PCAL_CPU ds=%d idx=%d sub=%d band=%d nearest=%d unpackstart=%d sampleIndex=%d sampleoffset=%d datasamples=%d fftchannels=%zu src0=%.9f src1=%.9f\n",
+        //         datastreamindex,
+        //         index,
+        //        subloopindex,
+        //         i,
+        //         nearestsample,
+        //         unpackstartsamples,
+        //         pcal_sample_index,
+        //         pcal_sampleoffset,
+        //         datasamples,
+        //        fftchannels,
+        //         unpackedarrays[i][pcal_sample_index],
+        //         unpackedarrays[i][pcal_sample_index + 1]);
+
+                 printf("DEBUG_UNPACK_CPU_WINDOW ds=%d idx=%d sub=%d band=%d nearest=%d unpackstart=%d sampleIndex=%d sampleoffset=%d datasamples=%d values=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+                   datastreamindex,
+                   index,
+                   subloopindex,
+                   i,
+                   nearestsample,
+                   unpackstartsamples,
+                   pcal_sample_index,
+                   pcal_sampleoffset,
+                   datasamples,
+                   unpackedarrays[i][pcal_sample_index + 0],
+                   unpackedarrays[i][pcal_sample_index + 1],
+                   unpackedarrays[i][pcal_sample_index + 2],
+                   unpackedarrays[i][pcal_sample_index + 3],
+                   unpackedarrays[i][pcal_sample_index + 4],
+                   unpackedarrays[i][pcal_sample_index + 5],
+                   unpackedarrays[i][pcal_sample_index + 6],
+                   unpackedarrays[i][pcal_sample_index + 7]);
+        }
         extractor[i]->adjustSampleOffset(datasamples+nearestsample);
         if (!usecomplex) {
-          printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", i, subloopindex, nearestsample, unpackstartsamples);
+          //printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", i, subloopindex, nearestsample, unpackstartsamples);
 	        status = extractor[i]->extractAndIntegrate (&(unpackedarrays[i][nearestsample
 	                 - unpackstartsamples]), fftchannels);
         } else

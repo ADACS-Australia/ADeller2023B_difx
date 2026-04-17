@@ -14,7 +14,7 @@ Mk5_GPUMode::Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int r
   : GPUMode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, recordedbandchan*2+4, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, recordedbw*2)
 {
 
-  printf("In Mk5_GPUMode constructor\n");
+  //printf("In Mk5_GPUMode constructor\n");
   char formatname[64];
 
   fanout = config->genMk5FormatName(format, nrecordedbands, recordedbw, nbits, sampling, framebytes, conf->getDDecimationFactor(confindex, dsindex), config->getDAlignmentSeconds(confindex, dsindex), conf->getDNumMuxThreads(confindex, dsindex), formatname);
@@ -90,6 +90,7 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   int mungedoffset = 0;
 
   //work out where to start from
+
   unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
 
   //unpack one frame plus one FFT size worth of samples
@@ -153,7 +154,9 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   return goodsamples/(float)unpacksamples;
 }
 
-void Mk5_GPUMode::unpack_all(int framestounpack) {
+void Mk5_GPUMode::unpack_all(int framestounpack, int & samplegranularity) {
+    //printf("Entered unpack_all\n");
+    fflush(stdout);
     // Hacky little workaround to get the stream struct back !! May not be needed !!
     mark5_stream *tmp_mk5stream;
     cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
@@ -163,7 +166,12 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
 
     int unpack_threads = 64;
     int unpack_blocks = (framestounpack + unpack_threads - 1) / unpack_threads;
-
+   
+    // unpackstartsamples may be needed for pcal extractions
+    int sampleoffset = datasamples;
+    samplegranularity = mark5stream->samplegranularity;
+    //printf("samplegranularity in unpack_all: %d\n", samplegranularity);
+    //fflush(stdout);
     gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(tmp_mk5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
 
     // Unfortunately we have to block here since we need the valid frames to find the correct dataweights
@@ -172,6 +180,26 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
     valid_frames->sync();
 
     cudaFree(tmp_mk5stream);
+
+
+    // AI SLOP
+    // Set the unpack start sample for GPU path, previously this had been set to 0 in
+    // set_weights within gpumode.cu
+    //int sampleoffset = datasamples;
+    //if (mark5stream && mark5stream->samplegranularity > 1) {
+    // This line is in the CPU implementation, we'll try just this for now
+    //unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
+    //} else {
+    //  unpackstartsamples = sampleoffset;
+   // }
+
+    // Compute host-side sample indexes relative to the unpack buffer for each buffered FFT
+    //if (gSampleIndexes && nearestSamples) {
+    //  for (int i = 0; i < cfg_numBufferedFFTs; ++i) {
+    //    gSampleIndexes->ptr()[i] = nearestSamples->ptr()[i] - unpackstartsamples;
+    //  }
+    //}
+    // END AI SLOP
 
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

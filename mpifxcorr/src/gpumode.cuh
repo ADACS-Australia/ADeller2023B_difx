@@ -31,7 +31,7 @@ public:
 
     void process_unpack(int index, int subloopindex);
     void set_weights(int subloopindex, int nframes, int *counts);
-    virtual void unpack_all(int) {}
+    virtual void unpack_all(int, int &) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
@@ -85,6 +85,8 @@ private:
 
     cufftHandle fft_plan;
     int cfg_numBufferedFFTs;
+    int pcalResetDataSec = INVALID_SUBINT;
+    int pcalResetDataNs = 0;
 
     bool is_dataweight_valid(int subloopindex);
     bool is_data_valid(int index, int subloopindex);

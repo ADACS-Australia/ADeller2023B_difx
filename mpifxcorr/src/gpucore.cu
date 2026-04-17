@@ -527,9 +527,10 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         vector<std::thread> streamThreads;
 
         for (int j = 0; j < numdatastreams; j++) {
-          //  std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
+            //std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
           //  if (procslots[index].datalengthbytes[j] > 1) {
     	    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
+            //std::cout << "before process_gpu: fftloop = " << fftloop << ", startblock = " << startblock << std::endl;    
             numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
             });
         //    }

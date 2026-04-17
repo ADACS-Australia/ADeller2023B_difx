@@ -6,6 +6,7 @@
 #include <cufftXt.h>
 #include <pcal.h>
 #include <algorithm>
+#include <cmath>
 
 #include <chrono>
 #include <omp.h>
@@ -20,9 +21,10 @@ __global__ void gpu_allocate_unpacked(float** arrays, float* data, int nchan, in
     // Use arrays to make data into a flattened 2D array
     for (int i = 0; i < nchan; i++) {
         arrays[i] = data + i * dlen;
-        printf("Channel %i starts at %p\n", i, arrays[i]);
+        //printf("Channel %i starts at %p\n", i, arrays[i]);
     }
 }
+
 
 
 
@@ -37,7 +39,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
              recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands,
              nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen,
              cacorrs, bclock), estimatedbytes_gpu(0) {
-
+    std::cout << "Constructing a new GPUMode" << std::endl;
     auto start = high_resolution_clock::now();
 
     size_t buffer_payload_bytes = (config->getMaxDataBytes() / config->getFrameBytes(confindex, dsindex)) * config->getFramePayloadBytes(confindex, dsindex);
@@ -53,7 +55,6 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     checkCuda(cudaStreamCreate(&cuStream));
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
-
     //std::cout << "fftchannels " << fftchannels << std::endl;
 
     complexunpacked_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, true);
@@ -86,9 +87,11 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     gSampleIndexes = new GpuMemHelper<int>(cfg_numBufferedFFTs, cuStream);
     gValidSamples = new GpuMemHelper<bool>(cfg_numBufferedFFTs, cuStream);
+
+
     gInterpolator = new GpuMemHelper<double>(interpolator, 3, cuStream);
     gFracSampleError = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
-    gLoFreqs = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
+    gLoFreqs = new GpuMemHelper<double>(numrecordedbands, cuStream);
 
 
     //printf("MAX_INDICIES = %d \n", MAX_INDICIES);
@@ -98,23 +101,53 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     for (auto i = 0; i < (MAX_INDICIES * numrecordedfreqs); i++) {
         indices->ptr()[i] = 0xffffffff;
     }
-    grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
-    grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
-    grecordedfreqlooffsets = new GpuMemHelper<double>(numrecordedfreqs, cuStream);
+    grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
+    grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedbands, cuStream);
+    grecordedfreqlooffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
     // Copy the lofreq and freq clock offset values to the GPU
-//    std::cout << "numrecordedfreqs = " << numrecordedfreqs << std::endl;
-//    exit(0);
-    for (auto i = 0; i < numrecordedfreqs; i++) {
-        gLoFreqs->ptr()[i] = config->getDRecordedFreq(configindex, datastreamindex, i);
-        grecordedfreqclockoffsets->ptr()[i] = recordedfreqclockoffsets[i];
-        grecordedfreqclockoffsetsdelta->ptr()[i] = recordedfreqclockoffsetsdelta[i];
-        grecordedfreqlooffsets->ptr()[i] = recordedfreqlooffsets[i];
+    std::cout << "numrecordedfreqs = " << numrecordedfreqs << std::endl;
+    std::cout << "numrecordedbands = " << numrecordedbands << std::endl;
+    //    exit(0);
+    for (auto i = 0; i < numrecordedbands; i++) {
+        int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, datastreamindex, i);
+        gLoFreqs->ptr()[i] = config->getDRecordedFreq(configindex, datastreamindex, localfreqindex);
+        grecordedfreqclockoffsets->ptr()[i] = recordedfreqclockoffsets[localfreqindex];
+        grecordedfreqclockoffsetsdelta->ptr()[i] = recordedfreqclockoffsetsdelta[localfreqindex];
+        grecordedfreqlooffsets->ptr()[i] = recordedfreqlooffsets[localfreqindex];
     }
 
     gLoFreqs->copyToDevice();
     grecordedfreqclockoffsets->copyToDevice();
     grecordedfreqclockoffsetsdelta->copyToDevice();
     grecordedfreqlooffsets->copyToDevice();
+
+
+    // The below has be moved from pcal extraction to here 
+    if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) { 
+        pcal_offsets_hz = new GpuMemHelper<int>(numrecordedbands, cuStream);
+        N_pcal_bins = new GpuMemHelper<int>(numrecordedbands, cuStream);
+        double bandwidth_hz = 1e6*recordedbandwidth;
+        double fs_hz = 2 * bandwidth_hz;
+        double pcal_spacing_hz = 1e6*config->getDPhaseCalIntervalMHz(configindex, datastreamindex);
+        int N_pcal_bins_max=0;    
+     
+        for (int ii=0; ii<numrecordedbands; ii++) { 
+            int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, datastreamindex, ii);
+            pcal_offsets_hz->ptr()[ii] = config->getDRecordedFreqPCalOffsetsHz(configindex, datastreamindex, localfreqindex);
+            N_pcal_bins->ptr()[ii] = (int)(fs_hz/gcd(fs_hz,pcal_offsets_hz->ptr()[ii]));
+            if (N_pcal_bins->ptr()[ii] > N_pcal_bins_max) {
+                N_pcal_bins_max = N_pcal_bins->ptr()[ii]; 
+            }  
+        }
+        pcal_bin_stride_length = N_pcal_bins_max*2;  // *2 to avoid buffer wraps in the long-term integration method
+        pcal_offsets_hz->copyToDevice();
+        N_pcal_bins->copyToDevice();
+        pcal_output_real = new GpuMemHelper<float>(numrecordedbands*pcal_bin_stride_length, cuStream);     
+        for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++) {
+            pcal_output_real->ptr()[ii] = 0.0;
+        }
+        pcal_output_real->copyToDevice();
+    }
 
 
 
@@ -163,8 +196,11 @@ static unsigned long long avg_fft;
 static unsigned long long avg_fracrotate;
 static unsigned long long avg_postprocess;
 static unsigned long long processing_time;
+static bool printed_unpack_debug = false;
 
 int calls = 0;
+static int debug_dataweight_gpu_prints = 0;
+static int debug_dataweight_gpu_invalid_prints = 0;
 
 GPUMode::~GPUMode() {
     auto start = high_resolution_clock::now();
@@ -208,8 +244,7 @@ GPUMode::~GPUMode() {
     cout << "Average fft: " << avg_fft / calls << endl;
     cout << "Average fracrotate: " << avg_fracrotate / calls << endl;
     cout << "Average postprocess: " << avg_postprocess / calls << endl;
-    cout << "Actual time processing (seconds): " << (double) processing_time / 1000. / 1000. / 3 << endl;
-
+    cout << "Actual time processing (seconds): " << (double) processing_time / 1000. / 1000. / 3 << endl; 
     duration = duration_cast<microseconds>(stop - constructor_time);
     cout << "GPUMode lifetime: " << duration.count() / 1000. / 1000. << endl;
 }
@@ -222,6 +257,38 @@ __global__ void check_unpack(float** array, int nchan, int nsamp) {
         }
         printf("\n");
     }
+}
+
+__global__ void debug_print_unpack_window(float **array, int sample_index, int max_samples,
+                                          int ds, int idx, int sub, int band,
+                                          int nearest, int unpackstart, int sampleoffset, int datasamples) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) {
+        return;
+    }
+
+    if (sample_index < 0 || sample_index + 7 >= max_samples) {
+        return;
+    }
+
+    const float *src = array[band];
+    printf("DEBUG_UNPACK_GPU_WINDOW ds=%d idx=%d sub=%d band=%d nearest=%d unpackstart=%d sampleIndex=%d sampleoffset=%d datasamples=%d values=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+           ds,
+           idx,
+           sub,
+           band,
+           nearest,
+           unpackstart,
+           sample_index,
+           sampleoffset,
+           datasamples,
+           src[sample_index + 0],
+           src[sample_index + 1],
+           src[sample_index + 2],
+           src[sample_index + 3],
+           src[sample_index + 4],
+           src[sample_index + 5],
+           src[sample_index + 6],
+           src[sample_index + 7]);
 }
 
 
@@ -246,7 +313,8 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 {
 
     //printf("In process_gpu \n");
-    
+    //std::cout << "cfg_numBufferedFFTs = " << cfg_numBufferedFFTs << " numBufferdFFTs = "<< numBufferedFFTs << std::endl;
+    //exit(0);
     //printf("calccrosspolautocorrs = %d \n",calccrosspolautocorrs);
     auto begin_time = high_resolution_clock::now();
     calls += 1;
@@ -343,8 +411,19 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
 
+    // Reset pcal accumulation only once at the start of a subintegration.
+        if (!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0) &&
+            (datasec != pcalResetDataSec || datans != pcalResetDataNs)) {
+        checkCuda(cudaMemsetAsync(pcal_output_real->gpuPtr(), 0,
+                                  sizeof(float) * numrecordedbands * pcal_bin_stride_length, cuStream));
+            pcalResetDataSec = datasec;
+            pcalResetDataNs = datans;
+    }
     // Reset the autocorrelations
     //std::cout << "Reset autocorrelations" << std::endl;
+
+
+
     checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
                               sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
 
@@ -359,10 +438,27 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     //std::cout << "calculatePre_cpu" << std::endl;
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
 
-
+    int samplegranularity = 0;
     //std::cout << "unpack data" << std::endl;
     packeddata_gpu->sync();
-    unpack_all(framestounpack);
+    //printf("About to call unpack_all with framestounpack=%d\n", framestounpack);
+    //fflush(stdout);
+    unpack_all(framestounpack, samplegranularity);
+    //std::cout << "unpack data done" << std::endl;
+
+//    if (!printed_unpack_debug && numrecordedbands >= 2) {
+//        std::cout << "Launching check_unpack kernel to print unpacked data for debugging" << std::endl;
+//        check_unpack<<<1, 1, 0, cuStream>>>(unpackedarrays_gpu->gpuPtr(), numrecordedbands, unpacksamples);
+//        checkCuda(cudaStreamSynchronize(cuStream));
+//        printed_unpack_debug = true;
+//    }
+
+    //printf("samplegranularity = %d \n", samplegranularity);
+    
+    //if (unpackstartsamples != 0) {
+    //    printf("unpackstartsamples = %d\n", unpackstartsamples);
+    //} 
+    
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -374,9 +470,79 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // Set up the FFT window indices and weights
     // Ideally this will move to the GPU but it's a bit tricky. Isn't *too* time intensive anyway I think
     //std::cout << "set_weights" << std::endl;
-    for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
-        set_weights(fftwin, framestounpack, counts);
+    
+    // CRITICAL: nearestSamples->copyToDevice() in calculatePre_cpu() is async.
+    // Sync before reading nearestSamples->ptr() to avoid reading stale data from previous iteration.
+    nearestSamples->sync();
+/// FOR DEBUGGING
+    if (datans == 36500000 && datastreamindex == 4 && numBufferedFFTs > 0) {
+        int min_nearest_sample = INT_MAX;
+        int max_nearest_sample = INT_MIN;
+        for (int ii = 0; ii < numBufferedFFTs; ii++) {
+            const int ns = nearestSamples->ptr()[ii];
+            if (ns >= 0) {
+                if (ns < min_nearest_sample) {
+                    min_nearest_sample = ns;
+                }
+                if (ns > max_nearest_sample) {
+                    max_nearest_sample = ns;
+                }
+            }
+        }
+
+        if (min_nearest_sample == INT_MAX) {
+            min_nearest_sample = -1;
+        }
+        if (max_nearest_sample == INT_MIN) {
+            max_nearest_sample = -1;
+        }
+
+        const int frame_samples = config->getFrameSamples(configindex, datastreamindex);
+        const int unpacked_size_batch = framestounpack * frame_samples;
+        const int max_nearest_plus_fft = (max_nearest_sample >= 0) ? (max_nearest_sample + (int)fftchannels) : -1;
+
+    //    printf("DEBUG_PCAL_GPU_SPAN call=%d ds=%d datasec=%d datans=%d numBufferedFFTs=%d min_nearest=%d max_nearest=%d max_nearest_plus_fft=%d unpacked_size=%d\n",
+    //           calls,
+    //           datastreamindex,
+    //           datasec,
+    //           datans,
+    //           numBufferedFFTs,
+    //           min_nearest_sample,
+    //           max_nearest_sample,
+    //           max_nearest_plus_fft,
+    //           unpacked_size_batch);
     }
+/// END DEBUGGING    
+    for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
+        
+        //std::cout << "before set_weights: fftloop = " << fftloop << ", startblock = " << startblock << std::endl;
+        set_weights(fftwin, framestounpack, counts);
+
+        //if (debug_dataweight_gpu_prints < 64) {
+//        if (datans == 36500000) {
+// //           if (datastreamindex == 4) { 
+//                  printf("DEBUG_DATAWEIGHT_GPU call=%d ds=%d idx=%d nearestSamples=%d sampleIndex=%d weight=%.9f valid=%d offsetsec=%d datasec=%d datans=%d\n",
+//                      calls,
+//                      datastreamindex,
+//                      fftwin,
+//                      nearestSamples->ptr()[fftwin],
+//                      gSampleIndexes->ptr()[fftwin],
+//                      dataweight[fftwin],
+//                      (int)(dataweight[fftwin] > 0.0f),
+//                      offsetseconds,
+//                      datasec,
+//                      datans);
+//                       debug_dataweight_gpu_prints++;
+//  //          }       
+//            
+//        }
+    }
+
+    // Right after the set_weights loop (line 391)
+//    printf("Host array immediately after set_weights:\n");
+//    for (int i = 490; i < 510; i++) {
+//        printf("gValidSamples[%d] = %d\n", i, gValidSamples->ptr()[i]);
+//   }
 //    for (int ii=0; ii<numrecordedfreqs; ii++) {
 //        printf("counts[%d] = %d\n",ii,counts[ii]);
 //    }
@@ -392,39 +558,192 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     gSampleIndexes->copyToDevice();
     gValidSamples->copyToDevice();
 
+
+
+
     // todo: remove
-    //std::cout << "Data copied and unpacked with code: " << cudaGetLastError() << std::endl;
+   //std::cout << "Data copied and unpacked with code: " << cudaGetLastError() << std::endl;
     checkCuda(cudaStreamSynchronize(cuStream));
+
+
+//    gValidSamples->copyToHost();  // Copy back from device to see what's actually on the GPU
+//    for (int i = 490; i < std::min(510, (int)cfg_numBufferedFFTs); i++) {
+//        printf("gValidSamples[%d] on GPU = %d\n", i, gValidSamples->ptr()[i]);
+//    }
+//    checkCuda(cudaStreamSynchronize(cuStream));
+//    exit(0);
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
     avg_copyto += duration.count();
 
 
-
     start = high_resolution_clock::now();
 
-    // Run PCAL extraction
-    
     if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) { 
+
+        if (datans == 36500000 && datastreamindex == 4 && numBufferedFFTs > 87) {
+        //    printf("DEBUG_PCAL_GPU_HOST call=%d ds=%d idx=%d sampleIndex=%d nearest=%d datasamples=%d offsetsec=%d datasec=%d datans=%d\n",
+        //           calls,
+        //           datastreamindex,
+        //           87,
+        //           gSampleIndexes->ptr()[87],
+        //           nearestSamples->ptr()[87],
+        //           datasamples,
+        //           offsetseconds,
+        //           datasec,
+        //           datans);
+
+            const int unpack_sample_index_87 = gSampleIndexes->ptr()[87];
+            const int unpack_nearest_87 = nearestSamples->ptr()[87];
+            const int unpack_sample_offset_87 = datasamples + unpack_sample_index_87;
+            const int unpacked_size_batch = framestounpack * config->getFrameSamples(configindex, datastreamindex);
+            debug_print_unpack_window<<<1, 1, 0, cuStream>>>(
+                unpackedarrays_gpu->gpuPtr(),
+                unpack_sample_index_87,
+                unpacked_size_batch,
+                datastreamindex,
+                87,
+                87,
+                0,
+                unpack_nearest_87,
+                0,
+                unpack_sample_offset_87,
+                datasamples);
+            checkCuda(cudaGetLastError());
+            checkCuda(cudaStreamSynchronize(cuStream));
+        }
+
         pcalExtraction(fftloop, numBufferedFFTs, startblock, numblocks);
         checkCuda(cudaStreamSynchronize(cuStream));
         pcal_output_real->copyToHost();
-        // point pcal_output_real_gpu_mode     
+        checkCuda(cudaStreamSynchronize(cuStream));
+        // point pcal_output_real_gpu_mode
         pcal_output_real_gpu_mode = pcal_output_real->ptr();
-    }
-    
-    
+        if (datans == 36500000 && datastreamindex == 4) {
+            for (int band = 0; band < numrecordedbands && band < 2; band++) {
+                const float *buf = pcal_output_real_gpu_mode + (band * pcal_bin_stride_length);
+                const int n_bins = N_pcal_bins->ptr()[band];
+                const int sample_index_87 = (numBufferedFFTs > 87) ? gSampleIndexes->ptr()[87] : -1;
+                const int sample_offset_87 = datasamples + sample_index_87;
+                int pcal_index_87 = -1;
+                if (n_bins > 0 && sample_index_87 >= 0) {
+                    pcal_index_87 = sample_offset_87 % n_bins;
+                    if (pcal_index_87 < 0) {
+                        pcal_index_87 += n_bins;
+                    }
+                }
+
+                float sum_abs_first_half = 0.0f;
+                float sum_abs_second_half = 0.0f;
+                if (n_bins > 0 && pcal_bin_stride_length >= (2 * n_bins)) {
+                    for (int ii = 0; ii < n_bins; ii++) {
+                        sum_abs_first_half += std::fabs(buf[ii]);
+                        sum_abs_second_half += std::fabs(buf[n_bins + ii]);
+                    }
+                }
+
+                printf("DEBUG_PCAL_GPU_RAW_BINS ds=%d band=%d datasec=%d datans=%d bins=%d values=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+                       datastreamindex,
+                       band,
+                       datasec,
+                       datans,
+                       pcal_bin_stride_length,
+                       buf[0],
+                       buf[1],
+                       buf[2],
+                       buf[3],
+                       buf[4],
+                       buf[5],
+                       buf[6],
+                       buf[7]);
+
+                  if (n_bins > 0 && pcal_index_87 >= 0) {
+                      const int i0 = (pcal_index_87 + n_bins - 3) % n_bins;
+                      const int i1 = (pcal_index_87 + n_bins - 2) % n_bins;
+                      const int i2 = (pcal_index_87 + n_bins - 1) % n_bins;
+                      const int i3 = pcal_index_87;
+                      const int i4 = (pcal_index_87 + 1) % n_bins;
+                      const int i5 = (pcal_index_87 + 2) % n_bins;
+                      const int i6 = (pcal_index_87 + 3) % n_bins;
+                      const int i7 = (pcal_index_87 + 4) % n_bins;
+
+                      printf("DEBUG_PCAL_GPU_RAW_AROUND ds=%d band=%d sampleIndex=%d sampleOffset=%d n_bins=%d pcal_index=%d idx=%d,%d,%d,%d,%d,%d,%d,%d values=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
+                          datastreamindex,
+                          band,
+                          sample_index_87,
+                          sample_offset_87,
+                          n_bins,
+                          pcal_index_87,
+                          i0,
+                          i1,
+                          i2,
+                          i3,
+                          i4,
+                          i5,
+                          i6,
+                          i7,
+                          buf[i0],
+                          buf[i1],
+                          buf[i2],
+                          buf[i3],
+                          buf[i4],
+                          buf[i5],
+                          buf[i6],
+                          buf[i7]);
+
+                      printf("DEBUG_PCAL_GPU_RAW_HALVES ds=%d band=%d n_bins=%d sumabs_first=%.9f sumabs_second=%.9f\n",
+                          datastreamindex,
+                          band,
+                          n_bins,
+                          sum_abs_first_half,
+                          sum_abs_second_half);
+                  }
+            }
+        }
+        // DEBUG: summarize full pcal buffers instead of only first few bins.
+        if (datasec > 0) {
+            for (int band = 0; band < numrecordedbands && band < 2; band++) {
+                const float *buf = pcal_output_real_gpu_mode + (band * pcal_bin_stride_length);
+                int nonzero_count = 0;
+                int first_nonzero = -1;
+                float max_abs = 0.0f;
+                for (int ii = 0; ii < pcal_bin_stride_length; ii++) {
+                    float v = buf[ii];
+                    float av = std::fabs(v);
+                    if (av > 0.0f) {
+                        nonzero_count++;
+                        if (first_nonzero < 0) {
+                            first_nonzero = ii;
+                        }
+                        if (av > max_abs) {
+                            max_abs = av;
+                        }
+                    }
+                }
+                
+                //printf("DEBUG gpumode pcal band=%d datasec=%d nonzero=%d first_nonzero=%d max_abs=%.6e\n",
+                //       band, datasec, nonzero_count, first_nonzero, max_abs);
+            }
+        }
+    }    
+
 
 
     // Run the fringe rotation
     //std::cout << "Starting processing" << std::endl;
     fringeRotation(fftloop, numBufferedFFTs, startblock, numblocks);
 
+    checkCuda(cudaStreamSynchronize(cuStream));
+
+    // Run PCAL extraction
+    
+
+
 
     // todo: remove
     //std::cout << "Fringe rotation ended with code: " << cudaGetLastError() << std::endl;
-    checkCuda(cudaStreamSynchronize(cuStream));
+    
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
@@ -550,6 +869,7 @@ bool GPUMode::is_dataweight_valid(int subloopindex) {
     int status;
 
     if (dataweight[subloopindex] <= 0.0) {
+        printf("Data weight for subloopindex %d is %f, which is invalid. Setting fft outputs to 0.\n", subloopindex, dataweight[subloopindex]);
         for (int i = 0; i < numrecordedbands; i++) {
             status = vectorZero_cf32(fftoutputs[i][subloopindex], recordedbandchannels);
             if (status != vecNoErr)
@@ -566,10 +886,37 @@ bool GPUMode::is_dataweight_valid(int subloopindex) {
 
 bool GPUMode::is_data_valid(int index, int subloopindex) {
     int status;
+    const int validflagwordindex = index / FLAGS_PER_INT;
+    const int validflagbitindex = index % FLAGS_PER_INT;
+    const unsigned int validflagword = static_cast<unsigned int>(validflags[validflagwordindex]);
+    const int validflagbit = ((validflagword >> validflagbitindex) & 0x01);
+    const int reason_datalen = (datalengthbytes <= 1);
+    const int reason_subint = (offsetseconds == INVALID_SUBINT);
+    const int reason_validflag = (validflagbit == 0);
 
     // Check the data is valid for this index
-    if ((datalengthbytes <= 1) || (offsetseconds == INVALID_SUBINT) ||
-        (((validflags[index / FLAGS_PER_INT] >> (index % FLAGS_PER_INT)) & 0x01) == 0)) {
+    if (reason_datalen || reason_subint || reason_validflag) {
+    //    if (datans == 36500000) {
+    //        printf("DEBUG_DATAWEIGHT_GPU_INVALID call=%d ds=%d idx=%d sub=%d datalen=%d offsetsec=%d invalid_subint=%d datasec=%d datans=%d validflag=%d flagword_idx=%d flagbit_idx=%d flagword=0x%08x nearest=%d reason_len=%d reason_subint=%d reason_flag=%d\n",
+    //               calls,
+    //               datastreamindex,
+    //               index,
+    //               subloopindex,
+    //               datalengthbytes,
+    //               offsetseconds,
+    //               (int)(offsetseconds == INVALID_SUBINT),
+    //               datasec,
+    //               datans,
+    //               validflagbit,
+    //               validflagwordindex,
+    //               validflagbitindex,
+    //               validflagword,
+    //               nearestSamples->ptr()[subloopindex],
+    //               reason_datalen,
+    //               reason_subint,
+    //               reason_validflag);
+    //        debug_dataweight_gpu_invalid_prints++;
+    //    }
 //        std::cerr << "to M::p_g; we are in the weird place with the datalengthbytes" << std::endl;
 //        std::cerr << "to M::p_g; numrecorededbands = " << numrecordedbands << std::endl;
         for (int i = 0; i < numrecordedbands; i++) {
@@ -588,6 +935,18 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
     if (nearestSamples->ptr()[subloopindex] < -1 ||
         (((nearestSamples->ptr()[subloopindex] + fftchannels) / samplesperblock) * bytesperblocknumerator) / bytesperblockdenominator >
         datalengthbytes) {
+        if (debug_dataweight_gpu_invalid_prints < 128 && datastreamindex == 4) {
+            printf("DEBUG_DATAWEIGHT_GPU_RANGE_INVALID call=%d ds=%d idx=%d sub=%d nearest=%d fftchannels=%zu datalen=%d samplesperblock=%d\n",
+                   calls,
+                   datastreamindex,
+                   index,
+                   subloopindex,
+                   nearestSamples->ptr()[subloopindex],
+                   fftchannels,
+                   datalengthbytes,
+                   samplesperblock);
+            debug_dataweight_gpu_invalid_prints++;
+        }
 //        std::cerr << "to M::p_g; we are in the 'crap data' branch" << std::endl;
 //        cerror << startl << "MODE error for datastream " << datastreamindex
 //               << " - trying to process data outside range - aborting!!! nearest sample was " << nearestSamples->ptr()[subloopindex]
@@ -623,6 +982,7 @@ void GPUMode::process_unpack(int index, int subloopindex) {
     }
 
     if (!is_data_valid(index, subloopindex)) {
+        
         // since these data weights can be retreived after this processing ends, reset them to a default of zero in case they don't get updated
         dataweight[subloopindex] = 0.0;
 
@@ -698,9 +1058,11 @@ void GPUMode::process_unpack(int index, int subloopindex) {
 }
 
 void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
-    // Not sure if this is still needed. Set to zero for now.
-    unpackstartsamples = 0;
 
+    // Not sure if this is still needed. Set to zero for now.
+     unpackstartsamples = 0;
+    // unpackstartsamples = nearestSamples->ptr()[subloopindex] - (nearestSamples->ptr()[subloopindex]% samplegranularity);
+    //std::cout << "subloopindex = " << subloopindex << ", unpackstartsamples = " << unpackstartsamples <<  ", samplegranularity = " << samplegranularity << std::endl;
     // Clear the perbandweights for this subloopindex
     if(perbandweights)
     {
@@ -710,14 +1072,20 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
         }
     }
 
+    //std::cout << "fftloop = " << fftloop << ", subloopindex = " << subloopindex << ", numBufferedFFTs = " << numBufferedFFTs << ", startblock = " << startblock << std::endl;
+    //int validity_index =  subloopindex + startblock;
+    //if (startblock != 0) {
+        //std::cout << "subloopindex = " << subloopindex << ", validity_index = " << validity_index << std::endl;
+    //}
     if (!is_data_valid(subloopindex, subloopindex)) {
+        
         // since these data weights can be retreived after this processing ends, reset them to a default of zero in case they don't get updated
         dataweight[subloopindex] = 0.0;
 
         gValidSamples->ptr()[subloopindex] = false;
         return;
     }
-
+    //std::cout << "Data is valid for subloopindex " << subloopindex << std::endl;
     gValidSamples->ptr()[subloopindex] = true;
 
     if (nearestSamples->ptr()[subloopindex] == -1) {
@@ -735,6 +1103,7 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
             dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
         }
     } else if (nearestSamples->ptr()[subloopindex] < unpackstartsamples || nearestSamples->ptr()[subloopindex] > unpackstartsamples + unpacksamples - fftchannels) {
+        //std::cout << "Entered standard path subloopindex = " << subloopindex << ", nearestSamples = " << nearestSamples->ptr()[subloopindex] << ", unpackstartsamples = " << unpackstartsamples << ", unpacksamples = " << unpacksamples << ", fftchannels = " << fftchannels << std::endl;
         // Standard path. TODO: above condition can be simplified I think
         int start_frame = nearestSamples->ptr()[subloopindex] / config->getFrameSamples(configindex, datastreamindex);
         int end_frame = (nearestSamples->ptr()[subloopindex + 1] - 1) / config->getFrameSamples(configindex, datastreamindex);
@@ -750,10 +1119,13 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
             abort();
         };
     }
-
+    // Need to access samplegranularity which was out of scope
+    
+    
     gSampleIndexes->ptr()[subloopindex] = nearestSamples->ptr()[subloopindex] - unpackstartsamples;
 
     if (!is_dataweight_valid(subloopindex)) {
+        //std::cout << "Data weight is not valid for subloopindex " << subloopindex << std::endl;
         gValidSamples->ptr()[subloopindex] = false;
     } else {
 	//printf("numrecordedfreqs = %d \n",numrecordedfreqs);
@@ -813,6 +1185,21 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts) {
 void GPUMode::calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks) {
     int startIndex = fftloop * numBufferedFFTs + startblock;
     int endIndex = startblock + numblocks;
+
+    // Always initialize the full batch to avoid carrying stale values
+    // from a previous process_gpu() call when this pass is invalid/short.
+    for (int subloopindex = 0; subloopindex < numBufferedFFTs; subloopindex++) {
+        nearestSamples->ptr()[subloopindex] = -1;
+        gFracSampleError->ptr()[subloopindex] = 0.0f;
+    }
+
+    // Invalid subints are filtered later by is_data_valid(); keep nearestSamples
+    // in a sentinel state so debug output doesn't show misleading large negatives.
+    if (offsetseconds == INVALID_SUBINT) {
+        gFracSampleError->copyToDevice();
+        nearestSamples->copyToDevice();
+        return;
+    }
 
     for (int subloopindex = 0; subloopindex < numBufferedFFTs; subloopindex++) {
         int index = startIndex + subloopindex;
@@ -994,7 +1381,6 @@ __global__ void gpu_pcalextraction(
         size_t fftchannels,
         const int* const nearestSamples,
         int datasamples,
-        int unpackstartsamples,
         double bandwidth_hz,
         double pcal_spacing_hz,
         const int* pcal_offsets_hz,
@@ -1002,7 +1388,7 @@ __global__ void gpu_pcalextraction(
         int pcal_bin_stride_length,
         int* N_pcal_bins
     ) {
-
+    //printf("Entered gpu_pcalextraction kernel with fftloop = %d, startblock = %d, numblocks = %d, fftchannels = %lu \n", fftloop, startblock, numblocks, fftchannels);
     
     // blockIdx.x in this case is the subloopindex index [0 .. numBufferedFFTs]
     // blockIdx.y in this case is the fftchannels_grid. The actual fftchannels value is calculated by fftchannels_grid idx * fftchannels_block size + fftchannels idx (blockIdx.y * blockDim.y) + threadIdx.y
@@ -1020,19 +1406,40 @@ __global__ void gpu_pcalextraction(
     //int thread_index = threadIdx.x + blockIdx.x * blockDim.x;
  
     const size_t subloopindex = blockIdx.x;
+    //printf("subloopindex = %lu \n", subloopindex);
     if (!validSamples[subloopindex]) {
+        //printf("Invalid sample at subloopindex = %lu \n", subloopindex);
         // Not valid, so don't do anything
         return;
     }
+    //printf("Valid subloopindex in pcal_extraction= %lu \n", subloopindex);
 
-    //printf("In gpu pcalextractions!\n");
+    // May not have to fully complete last fftloop; keep behaviour aligned with other kernels.
+    size_t index = fftloop * gridDim.x + subloopindex + startblock;
+    if (index >= startblock + numblocks) {
+        return;
+    }
     
-    int sampleoffset = datasamples+nearestSamples[subloopindex];
     
+    const int sample_index = sampleIndexes[subloopindex];
+    if (sample_index < 0) {
+        return;
+    }
+    int sampleoffset = datasamples + sample_index;
+   
+   
+
+
     // Determine fftchannel number
     const size_t channelindex = (blockIdx.y * blockDim.y) + threadIdx.y;
 
     if (channelindex >= fftchannels) {
+        return;
+    }
+
+    // One thread per (subloopindex, bandindex) performs the pcal accumulation.
+    // Additional channel threads would duplicate the same sums.
+    if (channelindex != 0) {
         return;
     }
 
@@ -1050,7 +1457,7 @@ __global__ void gpu_pcalextraction(
      
     // Pointer to pcal data within unpacked data 
     //printf("nearestSamples[subloopindex], unpackstartsamples = %d, %d \n",nearestSamples[subloopindex],unpackstartsamples);
-    f32 *samples = &(unpackedarrays[bandindex][nearestSamples[subloopindex]-unpackstartsamples]);
+    f32 *samples = &(unpackedarrays[bandindex][sample_index]);
      //printf("fftchannels, N_pcal_bins[%d], tail = %ld, %ld, %d \n", bandindex, fftchannels, N_pcal_bins[bandindex],tail);
     size_t tail = (fftchannels % N_pcal_bins[bandindex]);
     size_t end  = fftchannels - tail;   
@@ -1060,6 +1467,23 @@ __global__ void gpu_pcalextraction(
     // Pointer to storage location for pcal output taking into account stride length 
     // of pcal_bin_stride_length = N_pcal_bins_max*2
     float* dst = (pcal_output_real + (bandindex * pcal_bin_stride_length)) + pcal_index;
+
+//    if (subloopindex == 87 && bandindex == 0) {
+//
+//        printf("DEBUG_PCAL_GPU sub=%llu band=%d sample_index=%d sampleoffset=%d datasamples=%d pcal_index=%llu N_bins=%d fftchannels=%llu tail=%llu end=%llu src0=%.9f src1=%.9f\n",
+//               (unsigned long long)subloopindex,
+//               bandindex,
+//               sample_index,
+//               sampleoffset,
+//               datasamples,
+//               (unsigned long long)pcal_index,
+//               N_pcal_bins[bandindex],
+//               (unsigned long long)fftchannels,
+//               (unsigned long long)tail,
+//               (unsigned long long)end,
+//               src[0],
+//               src[1]);
+//    }
 
     for (size_t ii=0; ii<end; ii+=N_pcal_bins[bandindex]) {
         // src[ii+cc] -> dst[cc]
@@ -1075,8 +1499,9 @@ __global__ void gpu_pcalextraction(
             atomicAdd(&dst[cc], src[end+cc]);
         }
     }
-    
-    printf("bandindex = %d, subloopindex = %d, nearestsample = %d, unpackstartsamples = %d, \n", bandindex, subloopindex, nearestSamples[subloopindex], unpackstartsamples);
+    //if (subloopindex != 499) {
+        //printf("bandindex = %d, subloopindex = %lu, nearestsample = %d, unpackstartsamples = %d, \n", bandindex, subloopindex, nearestSamples[subloopindex], unpackstartsamples);
+    //}
 
 //    if (src[end+0] != 0.0) {
 //       printf("src[end+0], src[end+1], src[end+3] = %f, %f, %f \ndst[0], dst[1], dst[3] = %f, %f, %f \n",src[end+0],src[end+1],src[end+2],dst[0],dst[1],dst[2]);
@@ -1127,44 +1552,38 @@ void GPUMode::pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, i
 
 
     //std::cout << "In pcalExtraction" << std::endl;
-    size_t fftchannels_block = fftchannels;
+    // Kernel accumulates across all fftchannels internally, so channel threading is unnecessary.
+    size_t fftchannels_block = 1;
     size_t fftchannels_grid = 1;
 
-    size_t divisor = cudaMaxThreadsPerBlock / numrecordedbands;
-    if (fftchannels > divisor) {
-        fftchannels_block = divisor;
-        fftchannels_grid = (fftchannels / divisor);
-
-        if (fftchannels % divisor != 0) {
-            fftchannels_grid++;
-        }
-    }
-
-    pcal_offsets_hz = new GpuMemHelper<int>(numrecordedbands, cuStream);
-    N_pcal_bins = new GpuMemHelper<int>(numrecordedbands, cuStream);
     double bandwidth_hz = 1e6*recordedbandwidth;
-    double fs_hz = 2 * bandwidth_hz;
     double pcal_spacing_hz = 1e6*config->getDPhaseCalIntervalMHz(configindex, datastreamindex);
-    int N_pcal_bins_max=0;    
- 
-    for (int ii=0; ii<numrecordedbands; ii++) { 
-        int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, datastreamindex, ii);
-        pcal_offsets_hz->ptr()[ii] = config->getDRecordedFreqPCalOffsetsHz(configindex, datastreamindex, localfreqindex);
-        N_pcal_bins->ptr()[ii] = (int)(fs_hz/gcd(fs_hz,pcal_offsets_hz->ptr()[ii]));
-        if (N_pcal_bins->ptr()[ii] > N_pcal_bins_max) {
-            N_pcal_bins_max = N_pcal_bins->ptr()[ii]; 
-        }  
-    }
-    pcal_bin_stride_length = N_pcal_bins_max*2;
-    pcal_offsets_hz->copyToDevice();
-    N_pcal_bins->copyToDevice();
-    //printf("N_pcal_bins_max*numrecordedbands*2 = %d \n",numrecordedbands*pcal_bin_stride_length);
-    //exit(0);
-    pcal_output_real = new GpuMemHelper<float>(numrecordedbands*pcal_bin_stride_length, cuStream);     
-    for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++) {
-        pcal_output_real->ptr()[ii] = 0.0;
-    }
-    pcal_output_real->copyToDevice();
+
+//    Moving the below allocations to the mode constructor  
+
+//    pcal_offsets_hz = new GpuMemHelper<int>(numrecordedbands, cuStream);
+//    N_pcal_bins = new GpuMemHelper<int>(numrecordedbands, cuStream);
+//    double bandwidth_hz = 1e6*recordedbandwidth;
+//    double fs_hz = 2 * bandwidth_hz;
+//    double pcal_spacing_hz = 1e6*config->getDPhaseCalIntervalMHz(configindex, datastreamindex);
+//    int N_pcal_bins_max=0;    
+// 
+//    for (int ii=0; ii<numrecordedbands; ii++) { 
+//        int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, datastreamindex, ii);
+//        pcal_offsets_hz->ptr()[ii] = config->getDRecordedFreqPCalOffsetsHz(configindex, datastreamindex, localfreqindex);
+//        N_pcal_bins->ptr()[ii] = (int)(fs_hz/gcd(fs_hz,pcal_offsets_hz->ptr()[ii]));
+//        if (N_pcal_bins->ptr()[ii] > N_pcal_bins_max) {
+//            N_pcal_bins_max = N_pcal_bins->ptr()[ii]; 
+//        }  
+//    }
+//    pcal_bin_stride_length = N_pcal_bins_max*2;  // *2 to avoid buffer wraps in the long-term integration method
+//    pcal_offsets_hz->copyToDevice();
+//    N_pcal_bins->copyToDevice();
+//    pcal_output_real = new GpuMemHelper<float>(numrecordedbands*pcal_bin_stride_length, cuStream);     
+//    for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++) {
+//        pcal_output_real->ptr()[ii] = 0.0;
+//    }
+//    pcal_output_real->copyToDevice();
 
 
 
@@ -1189,7 +1608,6 @@ void GPUMode::pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, i
                     fftchannels,
                     nearestSamples->gpuPtr(),
                     datasamples,
-                    unpackstartsamples,
                     bandwidth_hz,
                     pcal_spacing_hz,
                     pcal_offsets_hz->gpuPtr(),
@@ -1335,7 +1753,7 @@ __global__ void gpu_resultsrotatorMultiply(
         const size_t dataIndex = (subloopindex * fftchannels * numrecordedbands) + (bandindex * fftchannels) + channelindex;
 
         // Calculate fracsampleerror - recordedfreqclockoffsets[f] + recordedfreqclockoffsetsdelta[f]/2
-        double bigAval = fracSampleError[subloopindex] - recordedfreqclockoffsets[0] + recordedfreqclockoffsetsdelta[0] / 2;
+        double bigAval = fracSampleError[subloopindex] - recordedfreqclockoffsets[bandindex] + recordedfreqclockoffsetsdelta[bandindex] / 2;
 
         // Calculate fftchannels[j] = recordedbandwidth * j / fftchannels
         double subFreq = recordedbandwidth * (double) channelindex / (double) recordedbandchannels;

@@ -168,7 +168,22 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 
 	bool bitreadflag = (nbit == 1) || (nbit == 2);
 
-	int start = decomp_factor * ms->databytes * ms->framenum;
+	// Original formula (kept for reference):
+	// int start = decomp_factor * ms->databytes * ms->framenum;
+	int start = ms->framesamples * ms->framenum;
+//	if (ms->framenum < 10) {
+//		printf("DEBUG_DECODE_LAYOUT frame=%lld framesamples=%d nsamp=%d databytes=%d nbit=%d nchan=%d decomp_factor=%d decomp_databytes=%d start=%d expected_start=%lld\n",
+//		       (long long)ms->framenum,
+//		       ms->framesamples,
+//		       nsamp,
+//		       ms->databytes,
+//		       nbit,
+//		       nchan,
+//		       decomp_factor,
+//		       decomp_factor * ms->databytes,
+//		       start,
+//		       (long long)ms->framenum * (long long)ms->framesamples);
+//	}
 	for(o = start; o < start + nsamp; o++) {
 
 		if (bit_counter / 8 >= ms->blankzoneendvalid[0])
@@ -199,6 +214,8 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 		// Decimation not really used so this hasn't been tested much
 		bit_counter += (decimation - 1) * nbit * nchan;
 	}
+
+	
 
 	// Return value is no longer needed but exists because mark5 expects one
 	return nsamp-nblank;
@@ -234,6 +251,7 @@ __global__ void gpu_unpack(struct mark5_stream *ms, const void *packed, float **
 
 	// Check whether this frame is valid
 	goodframes[index] = thread_ms.blanker(&thread_ms);
+
 	
 	// Now actually decode this frame
 	thread_ms.decode(&thread_ms, thread_ms.framesamples, unpacked);
