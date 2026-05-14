@@ -31,7 +31,7 @@ public:
 
     void process_unpack(int index, int subloopindex);
     void set_weights(int subloopindex, int nframes, int *counts);
-    virtual void unpack_all(int, int &) {}
+    virtual void unpack_all(int) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
@@ -81,7 +81,10 @@ protected:
 
     // precalc
     GpuMemHelper<int> *nearestSamples;
+
+    //GpuMemHelper<int> *counts_gpu;
 private:
+
 
     cufftHandle fft_plan;
     int cfg_numBufferedFFTs;

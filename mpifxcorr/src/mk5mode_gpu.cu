@@ -7,6 +7,9 @@
 #include <iostream>
 #include <bitset>
 #include <unistd.h>
+#include <chrono>
+
+using namespace std::chrono;
 
 #define NOT_SUPPORTED(x) { std::cerr << "Whoops, we don't support this on the GPU: " << x << std::endl; exit(1); }
 
@@ -154,52 +157,54 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   return goodsamples/(float)unpacksamples;
 }
 
-void Mk5_GPUMode::unpack_all(int framestounpack, int & samplegranularity) {
-    //printf("Entered unpack_all\n");
-    fflush(stdout);
-    // Hacky little workaround to get the stream struct back !! May not be needed !!
-    mark5_stream *tmp_mk5stream;
-    cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
-    *tmp_mk5stream = *mark5stream;
-
-    //std::cout << "frames to unpack: " << framestounpack << std::endl;
-
-    int unpack_threads = 64;
-    int unpack_blocks = (framestounpack + unpack_threads - 1) / unpack_threads;
+void Mk5_GPUMode::unpack_all(int framestounpack) {
+  
+    auto total_start = high_resolution_clock::now();
    
+    // Hacky little workaround to get the stream struct back !! May not be needed !!
+    //mark5_stream *tmp_mk5stream;
+    //cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
+    //*tmp_mk5stream = *mark5stream;
+    
+    auto setup_done = high_resolution_clock::now();
+    
+
+    // 2D block: x=frames, y=samples
+    dim3 unpack_threads(32, 32);  // 1024 threads/block, tunable
+    dim3 unpack_blocks(
+        (framestounpack + unpack_threads.x - 1) / unpack_threads.x,
+        (mark5stream->framesamples + unpack_threads.y - 1) / unpack_threads.y
+    );
+
+     
     // unpackstartsamples may be needed for pcal extractions
     int sampleoffset = datasamples;
-    samplegranularity = mark5stream->samplegranularity;
-    //printf("samplegranularity in unpack_all: %d\n", samplegranularity);
-    //fflush(stdout);
-    gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(tmp_mk5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    
+    auto kernel_start = high_resolution_clock::now();
+    gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    auto kernel_queued = high_resolution_clock::now();
 
+    //valid_frames->sync();  // Explicit sync
+
+
+    
     // Unfortunately we have to block here since we need the valid frames to find the correct dataweights
-    valid_frames->sync();
+    // OPTIMIZATION: Removed first redundant sync. copyToHost() + single sync waits for both kernel and copy.
     valid_frames->copyToHost();
-    valid_frames->sync();
+    auto copy_queued = high_resolution_clock::now();
+    valid_frames->sync();  // Single sync waits for kernel and async copy to complete
+    auto sync_done = high_resolution_clock::now();
+    //cudaFree(tmp_mk5stream);
 
-    cudaFree(tmp_mk5stream);
+    auto cleanup_done = high_resolution_clock::now();
+    //printf("Unpack breakdown:\n");
+    //printf("  Setup:        %ld μs\n", duration_cast<microseconds>(setup_done - total_start).count());
+    //printf("  Kernel queue: %ld μs\n", duration_cast<microseconds>(kernel_queued - kernel_start).count());
+    //printf("  Copy queue:   %ld μs\n", duration_cast<microseconds>(copy_queued - kernel_queued).count());
+    //printf("  Sync:         %ld μs\n", duration_cast<microseconds>(sync_done - copy_queued).count());
+    //printf("  Cleanup:      %ld μs\n", duration_cast<microseconds>(cleanup_done - sync_done).count());
+    //printf("  Total:        %ld μs\n", duration_cast<microseconds>(cleanup_done - total_start).count());
 
-
-    // AI SLOP
-    // Set the unpack start sample for GPU path, previously this had been set to 0 in
-    // set_weights within gpumode.cu
-    //int sampleoffset = datasamples;
-    //if (mark5stream && mark5stream->samplegranularity > 1) {
-    // This line is in the CPU implementation, we'll try just this for now
-    //unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
-    //} else {
-    //  unpackstartsamples = sampleoffset;
-   // }
-
-    // Compute host-side sample indexes relative to the unpack buffer for each buffered FFT
-    //if (gSampleIndexes && nearestSamples) {
-    //  for (int i = 0; i < cfg_numBufferedFFTs; ++i) {
-    //    gSampleIndexes->ptr()[i] = nearestSamples->ptr()[i] - unpackstartsamples;
-    //  }
-    //}
-    // END AI SLOP
 
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

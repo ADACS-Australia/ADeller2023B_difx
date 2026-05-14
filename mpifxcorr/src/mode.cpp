@@ -896,23 +896,23 @@ void Mode::finalisepcal()
         extractor[i]->setPcalReal(pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)));     
     }
     uint64_t samples = extractor[i]->getFinalPCal(pcalresults[i]);
-    if (datans == 36500000 && datastreamindex == 4 && i < 2) {
-      printf("DEBUG_PCAL_FINAL_BINS use_gpu=%d ds=%d band=%d datasec=%d datans=%d samples=%llu v0=(%.9f,%.9f) v1=(%.9f,%.9f) v2=(%.9f,%.9f) v3=(%.9f,%.9f)\n",
-           (int)config->get_use_gpu(),
-           datastreamindex,
-           i,
-           datasec,
-           datans,
-           (unsigned long long)samples,
-           pcalresults[i][0].re,
-           pcalresults[i][0].im,
-           pcalresults[i][1].re,
-           pcalresults[i][1].im,
-           pcalresults[i][2].re,
-           pcalresults[i][2].im,
-           pcalresults[i][3].re,
-           pcalresults[i][3].im);
-    }
+  //  if (datans == 36500000 && datastreamindex == 4 && i < 2) {
+  //    printf("DEBUG_PCAL_FINAL_BINS use_gpu=%d ds=%d band=%d datasec=%d datans=%d samples=%llu v0=(%.9f,%.9f) v1=(%.9f,%.9f) v2=(%.9f,%.9f) v3=(%.9f,%.9f)\n",
+  //         (int)config->get_use_gpu(),
+  //         datastreamindex,
+  //         i,
+  //         datasec,
+  //         datans,
+  //         (unsigned long long)samples,
+  //         pcalresults[i][0].re,
+  //         pcalresults[i][0].im,
+  //         pcalresults[i][1].re,
+  //         pcalresults[i][1].im,
+  //         pcalresults[i][2].re,
+  //         pcalresults[i][2].im,
+  //         pcalresults[i][3].re,
+  //         pcalresults[i][3].im);
+  //  }
     if ((samples == 0) && (datasec != INVALID_SUBINT) && (datalengthbytes > 1)) {
         //cdebug << startl << "finalisepcal band " << i << " samples==0 over valid subint " << datasec << "s+" << datans << "ns" << endl;
     }

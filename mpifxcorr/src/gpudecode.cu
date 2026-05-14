@@ -154,7 +154,7 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 
 	int bit_counter = 0;
 
-	int decomp_factor = 8 / (ms->nbit * ms->nchan);
+	
 
 	// Get the number of skipped channels (if nchan != 2^n)
 	int skipped = 0;
@@ -167,28 +167,18 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 	skipped = ((1 << skipped) - nchan) % nchan;
 
 	bool bitreadflag = (nbit == 1) || (nbit == 2);
-
+    // BUG decomp_factor was rounding to 0, untimately it was uneccessary 
 	// Original formula (kept for reference):
+	// int decomp_factor = 8 / (ms->nbit * ms->nchan);
 	// int start = decomp_factor * ms->databytes * ms->framenum;
 	int start = ms->framesamples * ms->framenum;
-//	if (ms->framenum < 10) {
-//		printf("DEBUG_DECODE_LAYOUT frame=%lld framesamples=%d nsamp=%d databytes=%d nbit=%d nchan=%d decomp_factor=%d decomp_databytes=%d start=%d expected_start=%lld\n",
-//		       (long long)ms->framenum,
-//		       ms->framesamples,
-//		       nsamp,
-//		       ms->databytes,
-//		       nbit,
-//		       nchan,
-//		       decomp_factor,
-//		       decomp_factor * ms->databytes,
-//		       start,
-//		       (long long)ms->framenum * (long long)ms->framesamples);
-//	}
+    //printf("ms->framesamples: %d\tms->framenum: %lld\tstart: %d\n", ms->framesamples, ms->framenum, start);
 	for(o = start; o < start + nsamp; o++) {
 
 		if (bit_counter / 8 >= ms->blankzoneendvalid[0])
 		{
 			// This entire sample is zero. Store in data and skip ahead
+			// PCH can this be parallelised, unrolled 
 			for (int c = 0; c < nchan; c++) {
 				data[c][o] = 0.0;
 				bit_counter += nbit;
@@ -221,6 +211,37 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 	return nsamp-nblank;
 }
 
+// This is a rewrite of the above mk5_decode_general_gpu the decodes one sample at a time but can be 
+// run in parallel across samples. 
+__device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int skipped, float **data) {
+    const unsigned char *buf = ms->payload;
+    const int nbit = ms->nbit;
+    const int nchan = ms->nchan;
+    const int decimation = ms->decimation;
+    const bool bitreadflag = (nbit == 1) || (nbit == 2);
+
+    // Directly compute bit offset for this sample - no serial dependency
+    //int bit_counter = sample * nbit * (nchan + skipped) * decimation;
+	int bit_counter = sample * nbit * (nchan * decimation + skipped);
+    int global_sample = ms->framesamples * ms->framenum + sample;
+
+    if (bit_counter / 8 >= ms->blankzoneendvalid[0]) {
+        for (int c = 0; c < nchan; c++) {
+            data[c][global_sample] = 0.0f;
+        }
+    } else {
+        for (int c = 0; c < nchan; c++) {
+            if (bitreadflag) {
+                data[c][global_sample] = bitsread_gpu(buf[bit_counter / 8], bit_counter % 8, nbit);
+            } else {
+                data[c][global_sample] = multibitsread_gpu(((u_int32_t*)buf)[bit_counter / 32], bit_counter % 32, nbit);
+            }
+            bit_counter += nbit;
+        }
+    }
+}
+
+
 __device__ int validate_gpudata(const struct mark5_stream *ms) {
 	return 1;	// The data is perfect and no one can tell it otherwise
 }
@@ -230,30 +251,79 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 	return 1;	// The data is perfect and no one can tell it otherwise
 }
 
-__global__ void gpu_unpack(struct mark5_stream *ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
-	// Set up the required function pointers
-	ms->decode = *mk5_decode_general_gpu;
-    ms->validate = *validate_gpudata;
-	ms->next = *mark5_stream_unpacker_next_gpu;
-	ms->blanker = *blanker_vdif_gpu;
+//__global__ void gpu_unpack(struct mark5_stream ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
+//
+//
+//
+//	int index = blockIdx.x * blockDim.x + threadIdx.x;
+//	if (index >= nframes) {
+//		return;
+//	}
+//    // Only thread 0 sets up function pointers once per block
+//    //if (threadIdx.x == 0) {	
+//	//    ms->decode = *mk5_decode_general_gpu;
+//	//    ms->validate = *validate_gpudata;
+//	//    ms->next = *mark5_stream_unpacker_next_gpu;
+//	//    ms->blanker = *blanker_vdif_gpu;
+//	//}
+//	//__syncthreads();  // Ensure all threads see the updated function pointers
+//	ms.decode = *mk5_decode_general_gpu;
+//	ms.validate = *validate_gpudata;
+//	ms.next = *mark5_stream_unpacker_next_gpu;
+//	ms.blanker = *blanker_vdif_gpu;
+//
+//
+//
+//
+//
+//	//mark5_stream thread_ms = *ms;
+//
+//	//thread_ms.frame = (const unsigned char *)packed + index * ms->framebytes;
+//	//thread_ms.payload = thread_ms.frame + thread_ms.payloadoffset;
+//	//thread_ms.readposition = 0;
+//	//thread_ms.framenum = index;
+//
+//	ms.frame = (const unsigned char *)packed + index * ms.framebytes;
+//	ms.payload = ms.frame + ms.payloadoffset;
+//	ms.readposition = 0;
+//	ms.framenum = index;
+//
+//	// Check whether this frame is valid
+//	//goodframes[index] = thread_ms.blanker(&thread_ms);
+//    goodframes[index] = ms.blanker(&ms);
+//	
+//	// Now actually decode this frame
+//	//thread_ms.decode(&thread_ms, thread_ms.framesamples, unpacked);
+//    ms.decode(&ms, ms.framesamples, unpacked);
+//}
 
-	int index = blockIdx.x * blockDim.x + threadIdx.x;
-	if (index >= nframes) {
-		return;
-	}
+__global__ void gpu_unpack(struct mark5_stream ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
+    int frame  = blockIdx.x * blockDim.x + threadIdx.x;
+    int sample = blockIdx.y * blockDim.y + threadIdx.y;
 
-	mark5_stream thread_ms = *ms;
+    if (frame >= nframes || sample >= ms.framesamples) return;
 
-	thread_ms.frame = (const unsigned char *)packed + index * ms->framebytes;
-	thread_ms.payload = thread_ms.frame + thread_ms.payloadoffset;
-	thread_ms.readposition = 0;
-	thread_ms.framenum = index;
+    ms.validate = *validate_gpudata;
+    ms.next     = *mark5_stream_unpacker_next_gpu;
+    ms.blanker  = *blanker_vdif_gpu;
 
-	// Check whether this frame is valid
-	goodframes[index] = thread_ms.blanker(&thread_ms);
+    ms.frame        = (const unsigned char *)packed + frame * ms.framebytes;
+    ms.payload      = ms.frame + ms.payloadoffset;
+    ms.readposition = 0;
+    ms.framenum     = frame;
 
-	
-	// Now actually decode this frame
-	thread_ms.decode(&thread_ms, thread_ms.framesamples, unpacked);
+    // Every thread calls blanker on its own ms copy to set blankzoneendvalid[0]
+    bool frame_valid = ms.blanker(&ms);
 
+    // Only one thread per frame writes to goodframes
+    if (sample == 0) {
+        goodframes[frame] = frame_valid;
+    }
+
+    int skipped = 0;
+    int n = ms.nchan;
+    while (n != 0) { n >>= 1; skipped++; }
+    skipped = ((1 << skipped) - ms.nchan) % ms.nchan;
+
+    mk5_decode_sample_gpu(&ms, sample, skipped, unpacked);
 }
