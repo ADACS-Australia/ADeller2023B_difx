@@ -77,6 +77,7 @@ protected:
     GpuMemHelper<int>* pcal_offsets_hz;
     GpuMemHelper<float> *pcal_output_real;  // temporary unassembled output for the pcaloffsethz==0.0f case
     GpuMemHelper<int>* N_pcal_bins;
+    GpuMemHelper<int>* counts_gpu;
     cudaStream_t cuStream;
 
     // precalc

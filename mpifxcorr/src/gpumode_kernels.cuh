@@ -33,33 +33,55 @@ inline cufftResult_t __checkCufft(const cufftResult_t err, const char *const fil
 template <class T>
 class GpuMemHelper {
 public:
+    //GpuMemHelper(size_t nElems, cudaStream_t stream) : managed(true), nBytes(sizeof(T) * nElems), cuStream(stream) {
+    //    cpuData = new T[nElems];
+    //    checkCuda(cudaHostRegister(cpuData, nBytes, cudaHostRegisterPortable));
+    //    checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
+    //}
     GpuMemHelper(size_t nElems, cudaStream_t stream) : managed(true), nBytes(sizeof(T) * nElems), cuStream(stream) {
-        cpuData = new T[nElems];
-        checkCuda(cudaHostRegister(cpuData, nBytes, cudaHostRegisterPortable));
+        checkCuda(cudaMallocHost(&cpuData, nBytes));
         checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
     }
+
 
     GpuMemHelper(T* hostPtr, size_t nElems, cudaStream_t stream) : managed(false), cpuData(hostPtr), nBytes(sizeof(T) * nElems), cuStream(stream) {
         checkCuda(cudaHostRegister(cpuData, nBytes, cudaHostRegisterPortable));
         checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
     }
 
-    GpuMemHelper(size_t nElems, cudaStream_t stream, bool gpuOnly) : managed(false), cpuData(nullptr), nBytes(sizeof(T) * nElems), cuStream(stream) {
-        checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
+//    GpuMemHelper(size_t nElems, cudaStream_t stream, bool gpuOnly) : managed(false), cpuData(nullptr), nBytes(sizeof(T) * nElems), cuStream(stream) {
+//        checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
 
+//        if (!gpuOnly) {
+//            cpuData = new T[nElems];
+//            checkCuda(cudaHostRegister(cpuData, nBytes, cudaHostRegisterPortable));
+//        }
+    GpuMemHelper(size_t nElems, cudaStream_t stream, bool gpuOnly) : managed(true), cpuData(nullptr), nBytes(sizeof(T) * nElems), cuStream(stream) {
+        checkCuda(cudaMallocAsync(&gpuData, nBytes, cuStream));
+        
         if (!gpuOnly) {
-            cpuData = new T[nElems];
-            checkCuda(cudaHostRegister(cpuData, nBytes, cudaHostRegisterPortable));
+            checkCuda(cudaMallocHost(&cpuData, nBytes));
         }
     }
 
-    ~GpuMemHelper() {
-        if (cpuData) {
-            checkCuda(cudaHostUnregister(cpuData));
 
+    
+
+    ~GpuMemHelper() {
+//      if (cpuData) {
+//          checkCuda(cudaHostUnregister(cpuData));
+//
+//          if (managed) {
+//              delete[] cpuData;
+//              cpuData = nullptr;
+//          }
+//      }
+        if (cpuData) {
             if (managed) {
-                delete[] cpuData;
+                checkCuda(cudaFreeHost(cpuData));
                 cpuData = nullptr;
+            } else {
+                checkCuda(cudaHostUnregister(cpuData));
             }
         }
 
