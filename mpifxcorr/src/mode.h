@@ -54,6 +54,7 @@ public:
   f32 **  unpackedarrays;
   cf32 **  unpackedcomplexarrays;
   f32 * pcal_output_real_gpu_mode = nullptr;
+  //cf32 * pcal_output_complex_gpu_mode = nullptr;
   int pcal_bin_stride_length = 0;
   
  /**
@@ -276,8 +277,8 @@ protected:
   double * recordedfreqlooffsets;
   bool deltapoloffsets, phasepoloffset;
   u8  *   data;
-  s16 *   lookup;
-  s16 *   linearunpacked;
+  s16 *   lookup = nullptr;
+  s16 *   linearunpacked = nullptr;
   cf32*** fftoutputs;
   cf32*** conjfftoutputs;
   f32 **  weights;
@@ -291,75 +292,75 @@ protected:
   f64 * interpolator;
 
   //new arrays for strided complex multiply for fringe rotation and fractional sample correction
-  cf32 * complexrotator;
-  cf32 * complexunpacked;
-  cf32 * fracsamprotatorA, * fracsamprotatorB;  // Allow different delay correction for each pol
-  cf32 * fftd;
+  cf32 * complexrotator = nullptr;
+  cf32 * complexunpacked = nullptr;
+  cf32 * fracsamprotatorA = nullptr, * fracsamprotatorB = nullptr;  // Allow different delay correction for each pol
+  cf32 * fftd = nullptr;
 
   // variables for pcal
-  int * pcalnbins;
-  cf32 ** pcalresults;
-  PCal ** extractor;
+  int * pcalnbins = nullptr;
+  cf32 ** pcalresults = nullptr;
+  PCal ** extractor = nullptr;
 
   
-  f64 * subtoff;
-  f64 * subtval;
-  f64 * subxoff;
-  f64 * subxval;
-  f64 * subphase;
-  f32 * subarg;
-  f32 * subsin;
-  f32 * subcos;
+  f64 * subtoff = nullptr;
+  f64 * subtval = nullptr;
+  f64 * subxoff = nullptr;
+  f64 * subxval = nullptr;
+  f64 * subphase = nullptr;
+  f32 * subarg = nullptr;
+  f32 * subsin = nullptr;
+  f32 * subcos = nullptr;
 
-  f64 * steptoff;
-  f64 * steptval;
-  f64 * stepxoff;
-  f64 * stepxval;
-  f64 * stepphase;
-  f32 * steparg;
-  f32 * stepsin;
-  f32 * stepcos;
-  cf32 * stepcplx;
+  f64 * steptoff = nullptr;
+  f64 * steptval = nullptr;
+  f64 * stepxoff = nullptr;
+  f64 * stepxval = nullptr;
+  f64 * stepphase = nullptr;
+  f32 * steparg = nullptr;
+  f32 * stepsin = nullptr;
+  f32 * stepcos = nullptr;
+  cf32 * stepcplx = nullptr;
 
-  f32 * subchannelfreqs;
-  f32 * ldsbsubchannelfreqs;
-  f32 * subfracsamparg;
-  f32 * subfracsampsin;
-  f32 * subfracsampcos;
+  f32 * subchannelfreqs = nullptr;
+  f32 * ldsbsubchannelfreqs = nullptr;
+  f32 * subfracsamparg = nullptr;
+  f32 * subfracsampsin = nullptr;
+  f32 * subfracsampcos = nullptr;
 
-  f32 * stepchannelfreqs;
-  f32 * lsbstepchannelfreqs;
-  f32 * dsbstepchannelfreqs;
-  f32 * ldsbstepchannelfreqs;
-  f32 * stepfracsamparg;
-  f32 * stepfracsampsin;
-  f32 * stepfracsampcos;
-  cf32 * stepfracsampcplx;
+  f32 * stepchannelfreqs = nullptr;
+  f32 * lsbstepchannelfreqs = nullptr;
+  f32 * dsbstepchannelfreqs = nullptr;
+  f32 * ldsbstepchannelfreqs = nullptr;
+  f32 * stepfracsamparg = nullptr;
+  f32 * stepfracsampsin = nullptr;
+  f32 * stepfracsampcos = nullptr;
+  cf32 * stepfracsampcplx = nullptr;
 
   //extras necessary for quadratic (order == 2)
-  cf32 * piecewiserotator;
-  cf32 * quadpiecerotator;
+  cf32 * piecewiserotator = nullptr;
+  cf32 * quadpiecerotator = nullptr;
 
-  f64 * subquadxval;
-  f64 * subquadphase;
-  f32 * subquadarg;
-  f32 * subquadsin;
-  f32 * subquadcos;
+  f64 * subquadxval = nullptr;
+  f64 * subquadphase = nullptr;
+  f32 * subquadarg = nullptr;
+  f32 * subquadsin = nullptr;
+  f32 * subquadcos = nullptr;
 
-  f64 * stepxoffsquared;
-  f64 * tempstepxval;
+  f64 * stepxoffsquared = nullptr;
+  f64 * tempstepxval = nullptr;
 
   //kurtosis-specific variables
   bool dumpkurtosis;
-  f32 *  kscratch; //[recordedbandchannels]
-  f32 ** s1; //[numrecordedbands][recordedbandchannels]
-  f32 ** s2; //[numrecordedbands][recordedbandchannels]
-  f32 ** sk; //[numrecordedbands][recordedbandchannels]
+  f32 *  kscratch = nullptr; //[recordedbandchannels]
+  f32 ** s1 = nullptr; //[numrecordedbands][recordedbandchannels]
+  f32 ** s2 = nullptr; //[numrecordedbands][recordedbandchannels]
+  f32 ** sk = nullptr; //[numrecordedbands][recordedbandchannels]
 
   // Linear to circular conversion
 
-  cf32 *phasecorrA, *phasecorrconjA, *phasecorrB, *phasecorrconjB; // 90 degrees + phase correction
-  cf32 * tmpvec; 
+  cf32 *phasecorrA = nullptr, *phasecorrconjA = nullptr, *phasecorrB = nullptr, *phasecorrconjB = nullptr; // 90 degrees + phase correction
+  cf32 * tmpvec = nullptr; 
 
 private:
   ///Array containing decorrelation percentages for a given number of bits

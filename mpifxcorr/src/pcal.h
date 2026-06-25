@@ -131,6 +131,11 @@ class PCal {
        */
       void setPcalReal(f32* pcal_real);
 
+   
+      void setPcalComplex(cf32* pcal_complex);
+
+
+
    public:
       /**
        * Clear the extracted and accumulated PCal data by setting it to zero.

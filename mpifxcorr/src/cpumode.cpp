@@ -9,15 +9,6 @@ static int debug_dataweight_cpu_calls = 0;
 CPUMode::CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock):
     Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, bclock)
 {
-	/*
-    unpackedarrays = new f32*[numrecordedbands];
-    if (usecomplex) unpackedcomplexarrays = new cf32*[numrecordedbands];
-    for(int i=0;i<numrecordedbands;i++) {
-      unpackedarrays[i] = vectorAlloc_f32(unpacksamples);
-      estimatedbytes += sizeof(f32)*unpacksamples;
-      if (usecomplex) unpackedcomplexarrays[i] = (cf32*) unpackedarrays[i];
-    }
-	*/
   int status;
   switch(fringerotationorder) {
     case 2:
@@ -705,8 +696,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
 	    std::cout << "unpacked data: " << unpackedarrays[j][nearestsample - unpackstartsamples] << std::endl;
             break;
           case 1: // Linear
+             //std::cout << "linear" << std::endl;
             //std::cout << "unpackedarrays[" << j << "][" << nearestsample - unpackstartsamples << "] = " << unpackedarrays[j][nearestsample - unpackstartsamples] << std::endl;
           case 2: // Quadratic
+              //std::cout << "quadratic" << std::endl;
             if (usecomplex) {
               status = vectorMul_cf32(complexrotator, &unpackedcomplexarrays[j][nearestsample - unpackstartsamples], complexunpacked, fftchannels);
               // The following can be uncommented (and the above commented) if wanting to 'turn off' fringe rotation for testing in the complex case
@@ -879,10 +872,8 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       }
 
       //if we need to, do the cross-polar autocorrelations
-      printf("calccrosspolautocorrs = %d \n",calccrosspolautocorrs);
-      if(calccrosspolautocorrs) {
-	printf("calccrosspolautocorrs is true!\n");
-        exit(0);	
+
+      if(calccrosspolautocorrs) {	
 	status = vectorAddProduct_cf32(fftoutputs[indices[0]][subloopindex], conjfftoutputs[indices[1]][subloopindex], autocorrelations[1][indices[0]], recordedbandchannels);
 	if(status != vecNoErr)
 	  csevere << startl << "Error in cross-polar autocorrelation!!!" << status << endl;

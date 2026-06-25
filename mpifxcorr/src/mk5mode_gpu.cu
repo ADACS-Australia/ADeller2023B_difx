@@ -19,8 +19,10 @@ Mk5_GPUMode::Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int r
 
   //printf("In Mk5_GPUMode constructor\n");
   char formatname[64];
-
+  //cout << "Mk5 format parameters: " << nrecordedbands << " bands, " << recordedbw << " MHz bandwidth, " << nbits << " bits/sample, sampling type " << sampling << ", framebytes = " << framebytes << endl;
   fanout = config->genMk5FormatName(format, nrecordedbands, recordedbw, nbits, sampling, framebytes, conf->getDDecimationFactor(confindex, dsindex), config->getDAlignmentSeconds(confindex, dsindex), conf->getDNumMuxThreads(confindex, dsindex), formatname);
+  //cout << "Mk5 format: " << formatname << " (fanout = " << fanout << ")" << endl;
+  //exit(0);
   invalid = 0;
 
   if(fanout < 0)
@@ -61,11 +63,16 @@ Mk5_GPUMode::Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int r
       {
         this->framesamples = mark5stream->framesamples;
       }
+      /*
+      * Currently not using perbandweights - to be added 
+      */
+      /*
       if(format == Configuration::INTERLACEDVDIF)
       {
         invalid = new int[nrecordedbands];
-        perbandweights = new f32*[config->getNumBufferedFFTs(configindex)];
-        for(int i=0;i<config->getNumBufferedFFTs(configindex);++i)
+        std::cout << "mk5_gpu ctor: allocating perbandweights with cfg_numBufferedFFTs and nrecordedbands = " << cfg_numBufferedFFTs << " " << nrecordedbands << std::endl;
+        perbandweights = new f32*[cfg_numBufferedFFTs];
+        for(int i=0;i<cfg_numBufferedFFTs;++i)
         {
           perbandweights[i] = new f32[nrecordedbands];
           for(int b = 0; b < nrecordedbands; ++b)
@@ -74,6 +81,7 @@ Mk5_GPUMode::Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int r
           }
         }
       }
+      */
     }
   }
 }
@@ -97,10 +105,10 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
 
   //unpack one frame plus one FFT size worth of samples
-  if(usecomplex) 
-  {
-    NOT_SUPPORTED("unpack - usecomplex");
-  }
+  //if(usecomplex) 
+  //{
+  //  NOT_SUPPORTED("unpack - usecomplex");
+  //}
   if(mark5stream->samplegranularity > 1)
     { // CHRIS not sure what this is mean to do
       // WALTER: unpacking of some mark5 modes (those with granularity > 1) must be unpacked not as individual samples but in groups of sample granularity
@@ -127,15 +135,15 @@ float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
   }
   if(perbandweights)
   {
-      if(usecomplex)
-      {
-          NOT_SUPPORTED("unpack - usecomplex");
-      }
-      else
-      {
-          blank_vdif_EDV4(data, unpackstartsamples, &unpackedarrays_gpu->ptr()[subloopindex * numrecordedbands], samplestounpack, invalid);
-      }
-
+      //if(usecomplex)
+      //{
+      //    NOT_SUPPORTED("unpack - usecomplex");
+      //}
+      //else
+      //{
+      //    blank_vdif_EDV4(data, unpackstartsamples, &unpackedarrays_gpu->ptr()[subloopindex * numrecordedbands], samplestounpack, invalid);
+      //}
+      blank_vdif_EDV4(data, unpackstartsamples, &unpackedarrays_gpu->ptr()[subloopindex * numrecordedbands], samplestounpack, invalid);
       int totalinvalid = 0;
       for(int b = 0; b < mark5stream->nchan; ++b)
       {
@@ -173,15 +181,29 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
     dim3 unpack_threads(32, 32);  // 1024 threads/block, tunable
     dim3 unpack_blocks(
         (framestounpack + unpack_threads.x - 1) / unpack_threads.x,
-        (mark5stream->framesamples + unpack_threads.y - 1) / unpack_threads.y
+        (framesamples + unpack_threads.y - 1) / unpack_threads.y
     );
 
-     
+    //std::cout << "framesamples: " << framesamples << ", framestounpack: " << framestounpack << std::endl; 
     // unpackstartsamples may be needed for pcal extractions
     int sampleoffset = datasamples;
+
+
+    size_t maxframes = config->getMaxDataBytes() / config->getMultiplexedFrameBytes(configindex, datastreamindex);
+    //    std::cout << "DS=" << datastreamindex
+    //      << " framestounpack=" << framestounpack
+    //      << " maxframes="      << maxframes
+    //      << " framesamples="   << framesamples
+    //      << " numrecordedbands=" << numrecordedbands
+    //      << " ms.nchan="       << mark5stream->nchan
+    //      << std::endl;
     
     auto kernel_start = high_resolution_clock::now();
-    gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    if (usecomplex) {
+      gpu_unpack_complex<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), complex_unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    } else {
+      gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
+    }
     auto kernel_queued = high_resolution_clock::now();
 
     //valid_frames->sync();  // Explicit sync

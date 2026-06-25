@@ -500,7 +500,7 @@ void VDIFDataStream::updateConfig(int segmentindex)
 
 	//take care of the case where an integral number of frames is not an integral number of blockspersend - ensure sendbytes is long enough
 	//note below, the math should produce a pure integer, but add 0.5 to make sure that the fuzziness of floats doesn't cause an off-by-one error
-	bufferinfo[segmentindex].sendbytes = int(((((double)bufferinfo[segmentindex].sendbytes)* ((double)config->getSubintNS(bufferinfo[segmentindex].configindex)))/(config->getSubintNS(bufferinfo[segmentindex].configindex) + config->getGuardNS(bufferinfo[segmentindex].configindex)) + 0.5));
+    bufferinfo[segmentindex].sendbytes = config->getDataBytes(bufferinfo[segmentindex].configindex,streamnum);
 }
 
 void VDIFDataStream::initialiseFile(int configindex, int fileindex)

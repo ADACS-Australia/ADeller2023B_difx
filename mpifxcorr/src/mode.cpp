@@ -160,7 +160,10 @@ Mode::Mode(Configuration * conf, int confindex, int dsindex, int recordedbandcha
       numlookups++;
 
     interpolator = new f64[3];
-
+    fprintf(stderr, "getNumBufferedFFTs(confindex) = %d\n",
+        config->getNumBufferedFFTs(configindex));
+    std::cout << "get_use_gpu(): " << config->get_use_gpu() << std::endl;
+    
     fftoutputs = new cf32**[numrecordedbands + numzoombands];
     conjfftoutputs = new cf32**[numrecordedbands + numzoombands];
     estimatedbytes += 4*(numrecordedbands + numzoombands);
@@ -457,12 +460,12 @@ Mode::Mode(Configuration * conf, int confindex, int dsindex, int recordedbandcha
 
 Mode::~Mode()
 {
-  std::cout << "In Mode destructor" << std::endl;	  
+  //std::cout << "In Mode destructor" << std::endl;	  
   
 
   if(perbandweights)
   {
-    std::cout << "loop 1" << std::endl; 
+    //std::cout << "loop 1" << std::endl; 
     for(int i=0;i<config->getNumBufferedFFTs(configindex);++i)
     {
       delete [] perbandweights[i];
@@ -471,7 +474,7 @@ Mode::~Mode()
   }
   vectorFree(dataweight);
   vectorFree(validflags);
-  std::cout << "loop2" << std::endl;
+  //std::cout << "loop2" << std::endl;
   for(int j=0;j<numrecordedbands+numzoombands;j++)
   {
     for(int k=0;k<config->getNumBufferedFFTs(configindex);k++)
@@ -484,102 +487,102 @@ Mode::~Mode()
     delete [] fftoutputs[j];
     delete [] conjfftoutputs[j];
   }
-  std::cout << "post loop 2" << std::endl;
+  //std::cout << "post loop 2" << std::endl;
   delete [] fftoutputs;
   delete [] conjfftoutputs;
   delete [] interpolator;
   
-  std::cout << "fringe rotation block" << std::endl;
+  //std::cout << "fringe rotation block" << std::endl;
   switch(fringerotationorder) {
     case 2: // Quadratic
-      vectorFree(piecewiserotator);
-      vectorFree(quadpiecerotator);
+      if(piecewiserotator) vectorFree(piecewiserotator);
+      if(quadpiecerotator) vectorFree(quadpiecerotator);
 
-      vectorFree(subquadxval);
-      vectorFree(subquadphase);
-      vectorFree(subquadarg);
-      vectorFree(subquadsin);
-      vectorFree(subquadcos);
+      if(subquadxval) vectorFree(subquadxval);
+      if(subquadphase) vectorFree(subquadphase);
+      if(subquadarg) vectorFree(subquadarg);
+      if(subquadsin) vectorFree(subquadsin);
+      if(subquadcos) vectorFree(subquadcos);
 
-      vectorFree(stepxoffsquared);
-      vectorFree(tempstepxval);
+      if(stepxoffsquared) vectorFree(stepxoffsquared);
+      if(tempstepxval)  vectorFree(tempstepxval);
     case 1:
-      vectorFree(subtoff);
-      vectorFree(subtval);
-      vectorFree(subxoff);
-      vectorFree(subxval);
-      vectorFree(subphase);
-      vectorFree(subarg);
-      vectorFree(subsin);
-      vectorFree(subcos);
+      if(subtoff) vectorFree(subtoff);
+      if(subtval) vectorFree(subtval);
+      if(subxoff) vectorFree(subxoff);
+      if(subxval) vectorFree(subxval);
+      if(subphase) vectorFree(subphase);
+      if(subarg) vectorFree(subarg);
+      if(subsin) vectorFree(subsin);
+      if(subcos) vectorFree(subcos);
 
-      vectorFree(steptoff);
-      vectorFree(steptval);
-      vectorFree(stepxoff);
-      vectorFree(stepxval);
-      vectorFree(stepphase);
-      vectorFree(steparg);
-      vectorFree(stepsin);
-      vectorFree(stepcos);
-      vectorFree(stepcplx);
+      if(steptoff) vectorFree(steptoff);
+      if(steptval) vectorFree(steptval);
+      if(stepxoff) vectorFree(stepxoff);
+      if(stepxval) vectorFree(stepxval);
+      if(stepphase) vectorFree(stepphase);
+      if(steparg) vectorFree(steparg);
+      if(stepsin) vectorFree(stepsin);
+      if(stepcos) vectorFree(stepcos);
+      if(stepcplx) vectorFree(stepcplx);
 
-      vectorFree(complexunpacked);
-      vectorFree(complexrotator);
-      vectorFree(fftd);
+      if(complexunpacked) vectorFree(complexunpacked);
+      if(complexrotator) vectorFree(complexrotator);
+      if(fftd) vectorFree(fftd);
       break;
     case 0: //zeroth order interpolation, "post-F"
       if(isfft) {
-	vectorFreeFFTR_f32(pFFTSpecR);
+	      if(pFFTSpecR) vectorFreeDFTR_f32(pFFTSpecR);
       }
       else{
-	vectorFreeDFTR_f32(pDFTSpecR);
+	      if(pDFTSpecR) vectorFreeDFTR_f32(pDFTSpecR);
       }
       break;
   }
-  std::cout << "post fringe rotation block" << std::endl;
+  //std::cout << "post fringe rotation block" << std::endl;
 
 
 //  std::cout << "lookup" << std::endl;
-  vectorFree(lookup);
+  if(lookup)              vectorFree(lookup);
 //  std::cout << "linearunpacked" << std::endl;
-  vectorFree(linearunpacked);
-  std::cout << "fftbuffer DO I WORK NOW? " << std::endl;
+  if(linearunpacked)      vectorFree(linearunpacked);
+  //std::cout << "fftbuffer DO I WORK NOW? " << std::endl;
 
   if (fftbuffer != nullptr) {
-      std::cout << "Why am I doing this?" << std::endl;
+      //std::cout << "Why am I doing this?" << std::endl;
       vectorFree(fftbuffer);
   }
-  std::cout << "subfracsamparg" << std::endl;
-  vectorFree(subfracsamparg);  
+  //std::cout << "subfracsamparg" << std::endl;
+  if(subfracsamparg)      vectorFree(subfracsamparg);
 //  std::cout << "subfracsampsin" << std::endl;
-  vectorFree(subfracsampsin);
+  if(subfracsampsin)      vectorFree(subfracsampsin);
 //  std::cout << "subfracsampcos" << std::endl;
-  vectorFree(subfracsampcos);
+  if(subfracsampcos)      vectorFree(subfracsampcos);
 //  std::cout << "subchannelfreqs" << std::endl;
-  vectorFree(subchannelfreqs);
+  if(subchannelfreqs)      vectorFree(subchannelfreqs);
 //  std::cout << "ldsbsubchannelfreqs " << std::endl;
-  vectorFree(ldsbsubchannelfreqs);
+  if(ldsbsubchannelfreqs)      vectorFree(ldsbsubchannelfreqs);
 //    std::cout << "stepfracsamparg" << std::endl;
 
-  vectorFree(stepfracsamparg);
+  if(stepfracsamparg)      vectorFree(stepfracsamparg);
 //    std::cout << "stepfracsampsin" << std::endl;
-  vectorFree(stepfracsampsin);
+  if(stepfracsampsin)      vectorFree(stepfracsampsin);
 //    std::cout << "stepfracsampcos" << std::endl;
-  vectorFree(stepfracsampcos);
+  if(stepfracsampcos)      vectorFree(stepfracsampcos);
 //    std::cout << "stepfracsampcplx" << std::endl;
-  vectorFree(stepfracsampcplx);
+  if(stepfracsampcplx)     vectorFree(stepfracsampcplx);
 //    std::cout << "stepchannelfreqs" << std::endl;
-  vectorFree(stepchannelfreqs);
+  if(stepchannelfreqs)     vectorFree(stepchannelfreqs);
 //    std::cout << "lsbstepchannelfreqs" << std::endl;
-  vectorFree(lsbstepchannelfreqs);
+  if(lsbstepchannelfreqs)  vectorFree(lsbstepchannelfreqs);
 //    std::cout << "dsbstepchannelfreqs" << std::endl;
-  vectorFree(dsbstepchannelfreqs);
+  if(dsbstepchannelfreqs)  vectorFree(dsbstepchannelfreqs);
 //    std::cout << "ldsbstepchannelfreqs" << std::endl;
-  vectorFree(ldsbstepchannelfreqs);
+  if(ldsbstepchannelfreqs) vectorFree(ldsbstepchannelfreqs);
 //  std::cout << "fracsamprotatorA" << std::endl;
-  vectorFree(fracsamprotatorA);
+  if(fracsamprotatorA)      vectorFree(fracsamprotatorA);
 //  std::cout << "fracsamprotatorB" << std::endl;
-  if (deltapoloffsets) vectorFree(fracsamprotatorB);
+  if (deltapoloffsets && fracsamprotatorB) vectorFree(fracsamprotatorB);
   //vectorFree(fracmult);
   //vectorFree(fracmultcos);
   //vectorFree(fracmultsin);
@@ -589,7 +592,7 @@ Mode::~Mode()
   for(int i=0;i<autocorrwidth;i++)
   {
     for(int j=0;j<numrecordedbands;j++)
-      vectorFree(autocorrelations[i][j]);
+      if(autocorrelations[i][j]) vectorFree(autocorrelations[i][j]);
     delete [] autocorrelations[i];
     delete [] weights[i];
   }
@@ -599,8 +602,8 @@ Mode::~Mode()
   if(config->getDPhaseCalIntervalMHz(configindex, datastreamindex))
   {
     for(int i=0;i<numrecordedbands;i++) {
-       delete extractor[i];
-       delete[] pcalresults[i];
+       if(extractor[i]) delete extractor[i];
+       if(pcalresults[i]) delete[] pcalresults[i];
     }
     delete[] pcalresults;
     delete[] extractor;
@@ -611,20 +614,20 @@ Mode::~Mode()
   {
     for(int i=0;i<numrecordedbands;i++)
     {
-      vectorFree(s1[i]);
-      vectorFree(s2[i]);
-      vectorFree(sk[i]);
+      if(s1[i]) vectorFree(s1[i]);
+      if(s2[i]) vectorFree(s2[i]);
+      if(sk[i]) vectorFree(sk[i]);
     }
     delete [] s1;
     delete [] s2;
     delete [] sk;
-    vectorFree(kscratch);
+    if(kscratch) vectorFree(kscratch);
   }
 
   if (linear2circular) {
     delete [] tmpvec;
   }
-  std::cout << "At the end of mode destructor" << std::endl;
+  //std::cout << "At the end of mode destructor" << std::endl;
 }
 
 float Mode::unpack(int sampleoffset, int subloopindex)
@@ -867,33 +870,44 @@ void Mode::finalisepcal()
             csevere << startl << "invalid pcal_bin_stride_length=" << pcal_bin_stride_length << endl;
             continue;
         }
-        if (pcal_output_real_gpu_mode == nullptr) {
-            csevere << startl << "pcal_output_real_gpu_mode is NULL" << endl;
-            continue;
-        }
-        if (i <= 1) {
-          const f32 *dbg = pcal_output_real_gpu_mode + (i * pcal_bin_stride_length);
-          int nonzero_count = 0;
-          int first_nonzero = -1;
-          f32 max_abs = 0.0f;
-          for (int ii = 0; ii < pcal_bin_stride_length; ii++) {
-            f32 v = dbg[ii];
-            f32 av = std::fabs(v);
-            if (av > 0.0f) {
-              nonzero_count++;
-              if (first_nonzero < 0) {
-                first_nonzero = ii;
-              }
-              if (av > max_abs) {
-                max_abs = av;
-              }
+        //if (usecomplex) {
+            //if (pcal_output_complex_gpu_mode == nullptr) {
+            //    csevere << startl << "pcal_output_complex_gpu_mode is NULL" << endl;
+            //    continue;
+            //}
+        //} else {
+            if (pcal_output_real_gpu_mode == nullptr) {
+                csevere << startl << "pcal_output_real_gpu_mode is NULL" << endl;
+                continue;
             }
-          }
+        //}
+
+//        if (i <= 1) {
+//          const f32 *dbg = pcal_output_real_gpu_mode + (i * pcal_bin_stride_length);
+//          int nonzero_count = 0;
+//          int first_nonzero = -1;
+//          f32 max_abs = 0.0f;
+//          for (int ii = 0; ii < pcal_bin_stride_length; ii++) {
+//            f32 v = dbg[ii];
+//            f32 av = std::fabs(v);
+//            if (av > 0.0f) {
+//              nonzero_count++;
+//              if (first_nonzero < 0) {
+//                first_nonzero = ii;
+//              }
+//              if (av > max_abs) {
+//                max_abs = av;
+//              }
+//            }
+//          }
           //printf("DEBUG finalisepcal band=%d pcal_bin_stride=%d nonzero=%d first_nonzero=%d max_abs=%.6e\n",
           //     i, pcal_bin_stride_length, nonzero_count, first_nonzero, max_abs);
-        }
-
-        extractor[i]->setPcalReal(pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)));     
+    //    }
+       // if (usecomplex) {
+    //      extractor[i]->setPcalComplex(pcal_output_complex_gpu_mode+(i*(pcal_bin_stride_length)));
+       // } else {     
+          extractor[i]->setPcalReal(pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)));    
+       // } 
     }
     uint64_t samples = extractor[i]->getFinalPCal(pcalresults[i]);
   //  if (datans == 36500000 && datastreamindex == 4 && i < 2) {

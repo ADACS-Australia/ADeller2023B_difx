@@ -22,6 +22,7 @@ if WITH_CUDA
 cuda_files = \
 	gpumode.cu \
 	gpucore.cu \
+	mk5mode_gpu.cu \
 	gpudecode.cu
 else
 cuda_files =
@@ -43,7 +44,6 @@ mpifxcorr_SOURCES = \
 	model.cpp \
 	mk5.cpp \
 	mk5mode.cpp \
-	mk5mode_gpu.cpp \
 	datamuxer.cpp \
 	mark5bfile.cpp \
 	vdiffile.cpp \
@@ -103,7 +103,6 @@ libmpifxcorr_a_SOURCES = \
 	polyco.cpp \
 	mk5.cpp \
 	mk5mode.cpp \
-	mk5mode_gpu.cpp \
 	fxmanager.cpp \
 	mathutil.cpp \
 	sysutil.cpp \
@@ -128,7 +127,6 @@ libfxcorr_a_SOURCES = \
 	mode.cpp \
 	cpumode.cpp \
 	mk5mode.cpp \
-	mk5mode_gpu.cpp \
 	polyco.cpp \
 	visibility.cpp \
 	model.cpp \
@@ -171,4 +169,4 @@ sysutil_test_SOURCES = \
 sysutil_test_CXXFLAGS = -g -I$(top_srcdir)/src/ -I $(AM_CXXFLAGS)
 
 .cu.o:
-	nvcc -I.. $(CXXFLAGS) -c -o $@ $<
+	nvcc -I.. -I. -g -O2 -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include   -DIPP9   -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include -Xcompiler -fopenmp -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include -c -o $@ $<

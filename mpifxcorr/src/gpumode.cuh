@@ -30,7 +30,7 @@ public:
 //                         int numblocks);
 
     void process_unpack(int index, int subloopindex);
-    void set_weights(int subloopindex, int nframes, int *counts);
+    void set_weights(int subloopindex, int nframes, int *counts, int numBufferedFFTs);
     virtual void unpack_all(int) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
@@ -52,9 +52,12 @@ public:
 
 protected:
     int cudaMaxThreadsPerBlock;
+    int cfg_numBufferedFFTs;
     GpuMemHelper<float*> *unpackedarrays_gpu;
     GpuMemHelper<float> *unpackeddata_gpu;
-    GpuMemHelper<cuFloatComplex> *complexunpacked_gpu;
+    GpuMemHelper<cuFloatComplex*> *complex_unpackedarrays_gpu;
+    GpuMemHelper<cuFloatComplex> *complex_unpackeddata_gpu;
+    GpuMemHelper<cuFloatComplex> *complex_fringe_rotated_gpu;
     GpuMemHelper<cuFloatComplex> *temp_autocorrelations_gpu;
     GpuMemHelper<char> *packeddata_gpu;
     GpuMemHelper<bool> *valid_frames;
@@ -76,6 +79,7 @@ protected:
     GpuMemHelper<double>* grecordedfreqlooffsets;
     GpuMemHelper<int>* pcal_offsets_hz;
     GpuMemHelper<float> *pcal_output_real;  // temporary unassembled output for the pcaloffsethz==0.0f case
+    GpuMemHelper<cuFloatComplex> *pcal_output_complex;  // temporary unassembled output for the pcaloffsethz!=0.0f case
     GpuMemHelper<int>* N_pcal_bins;
     GpuMemHelper<int>* counts_gpu;
     cudaStream_t cuStream;
@@ -85,10 +89,7 @@ protected:
 
     //GpuMemHelper<int> *counts_gpu;
 private:
-
-
     cufftHandle fft_plan;
-    int cfg_numBufferedFFTs;
     int pcalResetDataSec = INVALID_SUBINT;
     int pcalResetDataNs = 0;
 
@@ -96,6 +97,23 @@ private:
     bool is_data_valid(int index, int subloopindex);
 
     std::chrono::time_point<std::chrono::system_clock, std::chrono::system_clock::duration> constructor_time;
+    // Per-instance CUDA timing events
+    cudaEvent_t ev_start = nullptr, ev_copy1 = nullptr, ev_unpack = nullptr;
+    cudaEvent_t ev_copy2 = nullptr, ev_pcal  = nullptr, ev_rotate = nullptr;
+    cudaEvent_t ev_fft   = nullptr, ev_frac  = nullptr;
+
+    // Per-instance timing accumulators (microseconds)
+    long long t_copyto      = 0;
+    long long t_unpack      = 0;
+    long long t_pcal        = 0;
+    long long t_rotate      = 0;
+    long long t_fft         = 0;
+    long long t_fracrotate  = 0;
+    long long t_postprocess = 0;
+    long long t_total       = 0;
+    int calls               = 0;
+
+
 };
 
 #endif

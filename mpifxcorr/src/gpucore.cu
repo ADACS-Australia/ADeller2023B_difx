@@ -14,6 +14,10 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     checkCuda(cudaGetDeviceProperties(&prop, 0));
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
+    if(numprocessthreads > 1) {
+      cerr << "GPU DiFX must have 1 thread per Core process - had " << numprocessthreads << endl;
+      exit(1);
+    }
 }
 
 static unsigned long long avg_preprocess;
@@ -238,8 +242,8 @@ void GPUCore::loopprocess(int threadid) {
 
     cinfo << startl << "PROCESS " << mpiid << "/" << threadid << " process thread exiting!!!" << endl;
 
-    extern int calls;
-    cout << "process calls: " << calls << endl;
+//    extern int calls;
+//    cout << "process calls: " << calls << endl;
 }
 
 // Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
@@ -393,13 +397,15 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     if (procslots[index].pulsarbin && !procslots[index].scrunchoutput)
         binloop = procslots[index].numpulsarbins;
 
-    numBufferedFFTs = config->getNumBufferedFFTs(procslots[index].configindex);
-
     //set up the mode objects that will do the station-based processing
     for (int j = 0; j < numdatastreams; j++) {
         //zero the autocorrelations and set delays
         modes[j]->zeroAutocorrelations();
         modes[j]->setValidFlags(&(procslots[index].controlbuffer[j][3]));
+        //std::cout << "Setting data for datastream " << j << " with datalengthbytes: " << procslots[index].datalengthbytes[j]
+        //          << " and controlbuffer: " << procslots[index].controlbuffer[j][0] << ", "
+       //           << procslots[index].controlbuffer[j][1] << ", " << procslots[index].controlbuffer[j][2]
+       //           << std::endl;
         modes[j]->setData(procslots[index].databuffer[j], procslots[index].datalengthbytes[j],
                           procslots[index].controlbuffer[j][0], procslots[index].controlbuffer[j][1],
                           procslots[index].controlbuffer[j][2]);
@@ -456,8 +462,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     acblockcount = 0;
     acshiftcount = 0;
     // Force a single data transfer to the GPU
-    numBufferedFFTs = numblocks;
-    numfftloops = numblocks / numBufferedFFTs;
+    numBufferedFFTs = numblocks; // Do all the FFTs in one go
+    numfftloops = numblocks / numBufferedFFTs; // so this will always be 1
     if (numblocks % numBufferedFFTs != 0)
         numfftloops++;
     blockns = ((double) (config->getSubintNS(procslots[index].configindex))) /
@@ -529,10 +535,12 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         for (int j = 0; j < numdatastreams; j++) {
             //std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
           //  if (procslots[index].datalengthbytes[j] > 1) {
-    	    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
+    	//    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
             //std::cout << "before process_gpu: fftloop = " << fftloop << ", startblock = " << startblock << std::endl;    
-            numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
-            });
+        //    numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
+        //    });
+             numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
+
         //    }
         }
 
@@ -639,6 +647,30 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
             ((GPUMode *) modes[j])->conj_fftd_gpu->sync();
         }
 
+        // DEBUG: check whether post-FFT/frac-rotation results are non-zero
+        for (int j = 0; j < numdatastreams; j++) {
+            GPUMode *m = (GPUMode *) modes[j];
+            cf32 *h = (cf32 *) m->fftd_gpu->ptr();
+            size_t n = 16 * 2 * 16; // fftchannels(16) * numrecordedbands(2) * first 16 subloops
+            double sumabs = 0.0;
+            int nonzero = 0;
+            cf32 first_nz = {0.0f, 0.0f};
+            for (size_t k = 0; k < n; k++) {
+                float re = h[k].re, im = h[k].im;
+                if (re != 0.0f || im != 0.0f) {
+                    if (nonzero == 0) first_nz = h[k];
+                    nonzero++;
+                }
+                sumabs += fabs(re) + fabs(im);
+            }
+            // weights for the first 8 subloops, band 0
+            double weight_sum = 0.0;
+            float weight_0 = m->getDataWeight(0, 0);
+            for (int s = 0; s < 8; s++) weight_sum += m->getDataWeight(0, s);
+            fprintf(stderr, "POST_FFT ds=%d fftloop=%d scanned=%zu nonzero=%d sumabs=%g first_nz=(%g,%g) weight[0]=%g weight_sum[0..7]=%g\n",
+                    j, fftloop, n, nonzero, sumabs, first_nz.re, first_nz.im, weight_0, weight_sum);
+        }
+
         //do the baseline-based processing for this batch of FFT chunks
         auto resultindex = 0;
         for(int f=0;f<config->getFreqTableLength();f++) {
@@ -684,6 +716,23 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                                         config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex,
                                                                          p), fftsubloop)[xmacstart]);
 
+                               // DEBUG: dump indices and operands going into the cross-multiply
+                                if (fftsubloop == 8) {
+                                    int debug_band1 = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                                    int debug_band2 = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                                    const cf32 *debug_vis1 = m1->getGpuFreqsHost(debug_band1, fftsubloop);
+                                    const cf32 *debug_vis2 = m2->getGpuConjugatedFreqsHost(debug_band2, fftsubloop);
+                                    fprintf(stderr,
+                                        "CROSSMULT  freq=%d  xmacpass=%d  baseline=%d  localfreqindex=%d  "
+                                        "polproduct=%d  subloop=%d  xmacstart=%d  |  "
+                                        "stream1_band=%d  stream2_band=%d  |  "
+                                        "vis1[first channel]=(%g, %g)  vis2_conj[first channel]=(%g, %g)\n",
+                                        f, x, j, localfreqindex, p, fftsubloop, xmacstart,
+                                        debug_band1, debug_band2,
+                                        debug_vis1[xmacstart].re, debug_vis1[xmacstart].im,
+                                        debug_vis2[xmacstart].re, debug_vis2[xmacstart].im);
+                                }
+
 
                                 //not pulsar binning, so this is nice and simple - just cross multiply accumulate
                                 //baselineweight gets updated later
@@ -691,6 +740,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                                                                &(scratchspace->threadcrosscorrs[resultindex +
                                                                                                 p * xmacstridelength]),
                                                                xmacstrideremain);
+                                //std::cout << "resultindex = " << resultindex << ", p = " << p << ", xmacstridelength = " << xmacstridelength << std::endl;              
+                                //std::cout << "resultindex + p * xmacstridelength = " << resultindex + p * xmacstridelength << std::endl;
                                 if (status != vecNoErr)
                                     csevere << startl << "Error trying to xmac baseline " << j << " frequency "
                                             << localfreqindex << " polarisation product " << p << ", status " << status

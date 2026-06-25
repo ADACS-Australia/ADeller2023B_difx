@@ -112,9 +112,11 @@ class pcal_config_pimpl {
     cf32*    rotated;        // temporary
     cf32*    pcal_complex;   // temporary unassembled output, later final output
     f32*     pcal_real;      // temporary unassembled output for the pcaloffsethz==0.0f case
+    bool     pcal_owned = true;   // false once an external (GPU) buffer is injected
     size_t   rotatorlen;
     size_t   pcal_index;     // zero, changes when extract() is called at least once with "leftover" samples
     size_t   rotator_index;  // zero, changes when extract() is called at least once with "leftover" samples
+
   public:
     vecDFTSpecC_cf32* dftspec;
     u8* dftworkbuf;
@@ -230,8 +232,28 @@ int PCal::calcNumTones(double bw, double offset, double step)
 */
 void PCal::setPcalReal(f32* pcal_real)
 {
-    _cfg->pcal_real = pcal_real;
+    if (_cfg->pcal_owned && _cfg->pcal_real != nullptr) {
+        vectorFree(_cfg->pcal_real);   // free the IPP buffer we allocated
+    }
+    _cfg->pcal_real = pcal_real;       // borrow the GPU buffer
+    _cfg->pcal_owned = false;
 }
+
+/**
+/**
+/**
+* Sets pcal accumulation buffer for GPU implementation in the complex case. 
+* @param pcal_complex Pointer to complex valued pcal accumulation buffer
+*/
+void PCal::setPcalComplex(cf32* pcal_complex)
+{
+    if (_cfg->pcal_owned && _cfg->pcal_complex != nullptr) {
+        vectorFree(_cfg->pcal_complex);   // free the IPP buffer we allocated
+    }
+    _cfg->pcal_complex = pcal_complex;       // borrow the GPU buffer
+    _cfg->pcal_owned = false;
+}
+
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////
 // BASE CLASS: c'stor
@@ -379,8 +401,10 @@ PCalExtractorTrivial::PCalExtractorTrivial(double bandwidth_hz, double pcal_spac
 
 PCalExtractorTrivial::~PCalExtractorTrivial()
 {
-    vectorFree(_cfg->pcal_complex);
-    vectorFree(_cfg->pcal_real);
+    //vectorFree(_cfg->pcal_complex);
+    if (_cfg->pcal_owned) {
+      vectorFree(_cfg->pcal_real);
+    }
     vectorFreeDFTC_cf32(_cfg->dftspec);
     vectorFree(_cfg->dftworkbuf);
     vectorFree(_cfg->dft_out);
@@ -555,7 +579,7 @@ PCalExtractorShifting::PCalExtractorShifting(double bandwidth_hz, double pcal_sp
 PCalExtractorShifting::~PCalExtractorShifting()
 {
     vectorFree(_cfg->pcal_complex);
-    vectorFree(_cfg->pcal_real);
+    if (_cfg->pcal_owned) vectorFree(_cfg->pcal_real);
     vectorFree(_cfg->rotator);
     vectorFree(_cfg->rotated);
     vectorFreeDFTC_cf32(_cfg->dftspec);
@@ -783,7 +807,7 @@ PCalExtractorComplex::PCalExtractorComplex(double bandwidth_hz,
 PCalExtractorComplex::~PCalExtractorComplex()
 {
     vectorFree(_cfg->pcal_complex);
-    vectorFree(_cfg->pcal_real);
+    if (_cfg->pcal_owned) vectorFree(_cfg->pcal_real);
     vectorFree(_cfg->rotator);
     vectorFree(_cfg->rotated);
     vectorFreeDFTC_cf32(_cfg->dftspec);
@@ -985,7 +1009,7 @@ int pcal_offset_hz, const size_t sampleoffset)
 PCalExtractorImplicitShift::~PCalExtractorImplicitShift()
 {
     vectorFree(_cfg->pcal_complex);
-    vectorFree(_cfg->pcal_real);
+    if (_cfg->pcal_owned) vectorFree(_cfg->pcal_real);
     vectorFreeDFTC_cf32(_cfg->dftspec);
     vectorFree(_cfg->dftworkbuf);
     vectorFree(_cfg->dft_out);

@@ -21,6 +21,11 @@ __device__ __forceinline__ float bitsread_gpu(char byte, int pos, int nbit) {
 	return lutall[((byte >> pos) & ((1 << nbit) - 1)) + (nbit << 1) - 2];		// Should see if this can be optimised
 }
 
+__device__ __forceinline__ cuFloatComplex complex_bitsread_gpu(char byte, int pos, int nbit) {
+	return make_cuFloatComplex(lutall[((byte >> pos) & ((1 << nbit) - 1)) + (nbit << 1) - 2], lutall[((byte >> (pos+nbit)) & ((1 << nbit) - 1)) + (nbit << 1) - 2]);
+}
+
+
 __device__ __forceinline__ float multibitsread_gpu(int32_t word, int pos, int nbit) {
 	// Larger numbers of bits have equidistant quantization spacing	
 
@@ -46,6 +51,31 @@ __device__ __forceinline__ float multibitsread_gpu(int32_t word, int pos, int nb
 	}
 
 	return (((word >> pos) & ((1L << nbit) - 1)) - (1L << (nbit - 1))) * quant_factor;
+}
+
+
+__device__ __forceinline__ cuFloatComplex complex_multibitsread_gpu(int32_t word, int pos, int nbit) {
+	// Larger numbers of bits have equidistant quantization spacing	
+
+	long bitmax = (1L << nbit);
+
+	float quant_factor;
+	// TODO: define constants in a header maybe?
+	switch (nbit) {
+	case 4:
+		quant_factor = 1.0 / FourBit1sigma;
+		break;
+	case 8:
+		quant_factor = 1.0 / 3.3;
+		break;
+	case 16:
+		quant_factor = 1.0 / 8.0;
+		break;
+	default:
+		break;
+	}
+
+	return make_cuFloatComplex(((((word >> pos) & ((1L << nbit) - 1)) - (1L << (nbit - 1))) * quant_factor),((((word >> (pos+nbit)) & ((1L << nbit) - 1)) - (1L << (nbit - 1))) * quant_factor));
 }
 
 
@@ -223,6 +253,7 @@ __device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int s
     // Directly compute bit offset for this sample - no serial dependency
     //int bit_counter = sample * nbit * (nchan + skipped) * decimation;
 	int bit_counter = sample * nbit * (nchan * decimation + skipped);
+	
     int global_sample = ms->framesamples * ms->framenum + sample;
 
     if (bit_counter / 8 >= ms->blankzoneendvalid[0]) {
@@ -240,6 +271,37 @@ __device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int s
         }
     }
 }
+
+
+__device__ void mk5_decode_complex_sample_gpu(struct mark5_stream *ms, int sample, int skipped, cuFloatComplex **data) {
+    const unsigned char *buf = ms->payload;
+    const int nbit = ms->nbit;
+    const int nchan = ms->nchan;
+    const int decimation = ms->decimation;
+    const bool bitreadflag = (nbit == 1) || (nbit == 2);
+
+    // Directly compute bit offset for this sample - no serial dependency
+    //int bit_counter = sample * nbit * (nchan + skipped) * decimation;
+	int bit_counter = sample * 2 * nbit * (nchan * decimation + skipped);
+	//printf("ms->framesamples in mk5_decode_complex_sample_gpu: %d \n", ms->framesamples);
+    int global_sample = ms->framesamples * ms->framenum + sample;
+
+    if (bit_counter / 8 >= ms->blankzoneendvalid[0]) {
+        for (int c = 0; c < nchan; c++) {
+            data[c][global_sample] = make_cuFloatComplex(0.0f, 0.0f);
+        }
+    } else {
+        for (int c = 0; c < nchan; c++) {
+            if (bitreadflag) {
+                data[c][global_sample] = complex_bitsread_gpu(buf[bit_counter / 8], bit_counter % 8, nbit);
+            } else {
+                data[c][global_sample] = complex_multibitsread_gpu(((u_int32_t*)buf)[bit_counter / 32], bit_counter % 32, nbit);
+            }
+            bit_counter += nbit*2;
+        }
+    }
+}
+
 
 
 __device__ int validate_gpudata(const struct mark5_stream *ms) {
@@ -300,7 +362,7 @@ __device__ int mark5_stream_unpacker_next_gpu(struct mark5_stream *ms) {
 __global__ void gpu_unpack(struct mark5_stream ms, const void *packed, float **unpacked, int nframes, bool *goodframes) {
     int frame  = blockIdx.x * blockDim.x + threadIdx.x;
     int sample = blockIdx.y * blockDim.y + threadIdx.y;
-
+    
     if (frame >= nframes || sample >= ms.framesamples) return;
 
     ms.validate = *validate_gpudata;
@@ -326,4 +388,35 @@ __global__ void gpu_unpack(struct mark5_stream ms, const void *packed, float **u
     skipped = ((1 << skipped) - ms.nchan) % ms.nchan;
 
     mk5_decode_sample_gpu(&ms, sample, skipped, unpacked);
+}
+
+__global__ void gpu_unpack_complex(struct mark5_stream ms, const void *packed, cuFloatComplex **unpacked, int nframes, bool *goodframes) {
+    int frame  = blockIdx.x * blockDim.x + threadIdx.x;
+    int sample = blockIdx.y * blockDim.y + threadIdx.y;
+    //printf("ms.framesamples: %d \n", ms.framesamples);
+    if (frame >= nframes || sample >= ms.framesamples) return;
+
+    ms.validate = *validate_gpudata;
+    ms.next     = *mark5_stream_unpacker_next_gpu;
+    ms.blanker  = *blanker_vdif_gpu;
+
+    ms.frame        = (const unsigned char *)packed + frame * ms.framebytes;
+    ms.payload      = ms.frame + ms.payloadoffset;
+    ms.readposition = 0;
+    ms.framenum     = frame;
+
+    // Every thread calls blanker on its own ms copy to set blankzoneendvalid[0]
+    bool frame_valid = ms.blanker(&ms);
+
+    // Only one thread per frame writes to goodframes
+    if (sample == 0) {
+        goodframes[frame] = frame_valid;
+    }
+
+    int skipped = 0;
+    int n = ms.nchan;
+    while (n != 0) { n >>= 1; skipped++; }
+    skipped = ((1 << skipped) - ms.nchan) % ms.nchan;
+
+    mk5_decode_complex_sample_gpu(&ms, sample, skipped, unpacked);
 }
