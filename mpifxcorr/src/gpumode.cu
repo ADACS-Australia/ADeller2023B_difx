@@ -198,14 +198,20 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
                 N_pcal_bins_max = N_pcal_bins->ptr()[ii]; 
             }  
         }
-        pcal_bin_stride_length = N_pcal_bins_max*2;  // *2 to avoid buffer wraps in the long-term integration method
+        pcal_bin_stride_length = N_pcal_bins_max*2;
         pcal_offsets_hz->copyToDevice();
         N_pcal_bins->copyToDevice();
-        pcal_output_real = new GpuMemHelper<float>(numrecordedbands*pcal_bin_stride_length, cuStream);     
-        for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++) {
-            pcal_output_real->ptr()[ii] = 0.0;
+        if (usecomplex) {
+            pcal_output_complex = new GpuMemHelper<cuFloatComplex>(numrecordedbands*pcal_bin_stride_length, cuStream);
+            for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++)
+                pcal_output_complex->ptr()[ii] = make_cuFloatComplex(0.0f, 0.0f);
+            pcal_output_complex->copyToDevice();
+        } else {
+            pcal_output_real = new GpuMemHelper<float>(numrecordedbands*pcal_bin_stride_length, cuStream);
+            for (size_t ii=0; ii<numrecordedbands*pcal_bin_stride_length; ii++)
+                pcal_output_real->ptr()[ii] = 0.0;
+            pcal_output_real->copyToDevice();
         }
-        pcal_output_real->copyToDevice();
     }
 
 
@@ -291,18 +297,21 @@ GPUMode::~GPUMode() {
 
     if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) { 
         delete pcal_offsets_hz;
-        delete pcal_output_real;
         delete N_pcal_bins;
+         if (usecomplex) {
+            delete pcal_output_complex;
+        } else {
+            delete pcal_output_real;
+        }       
     }
     printf("pcal_output_real_gpu_mode \n");
     if (pcal_output_real_gpu_mode != nullptr) {
-        //delete pcal_output_real_gpu_mode;
         pcal_output_real_gpu_mode = nullptr;
     }
-    //if (pcal_output_complex_gpu_mode != nullptr) {
-        //delete pcal_output_complex_gpu_mode;
-        //pcal_output_complex_gpu_mode = nullptr;
-    //}
+    printf("freed pcal_output_real_gpu_mode \n");
+    if (pcal_output_complex_gpu_mode != nullptr) {
+        pcal_output_complex_gpu_mode = nullptr;
+    }
 
     printf("done \n");
 
@@ -320,31 +329,22 @@ GPUMode::~GPUMode() {
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
 
-if (calls > 0) {
-    cout << "GPUMode pid=" << getpid()
-    // << " tid=" << std::this_thread::get_id()
-     << " DS=" << datastreamindex
-     << " (" << calls << " calls):" << endl;
-    cout << "  copyto:      " << t_copyto      / calls << " us" << endl;
-    cout << "  unpack:      " << t_unpack      / calls << " us" << endl;
-    cout << "  rotate:      " << t_rotate      / calls << " us" << endl;
-    cout << "  fft:         " << t_fft         / calls << " us" << endl;
-    cout << "  fracrotate:  " << t_fracrotate  / calls << " us" << endl;
-    cout << "  pcal:        " << t_pcal        / calls << " us" << endl;
-    cout << "  postprocess: " << t_postprocess / calls << " us" << endl;
-    cout << "  total:       " << (double)t_total / 1e6 << " s" << endl;
-}
+    if (calls > 0) {
+        cout << "GPUMode pid=" << getpid()
+        // << " tid=" << std::this_thread::get_id()
+         << " DS=" << datastreamindex
+         << " (" << calls << " calls):" << endl;
+        cout << "  copyto:      " << t_copyto      / calls << " us" << endl;
+        cout << "  unpack:      " << t_unpack      / calls << " us" << endl;
+        cout << "  rotate:      " << t_rotate      / calls << " us" << endl;
+        cout << "  fft:         " << t_fft         / calls << " us" << endl;
+        cout << "  fracrotate:  " << t_fracrotate  / calls << " us" << endl;
+        cout << "  pcal:        " << t_pcal        / calls << " us" << endl;
+        cout << "  postprocess: " << t_postprocess / calls << " us" << endl;
+        cout << "  total:       " << (double)t_total / 1e6 << " s" << endl;
+    }
 
-//    cout << "Average unpack: " << avg_unpack / calls << endl;
-//    cout << "Average copyto: " << avg_copyto / calls << endl;
-//    cout << "Average rotate: " << avg_rotate / calls << endl;
-//    cout << "Average fft: " << avg_fft / calls << endl;
-//    cout << "Average fracrotate: " << avg_fracrotate / calls << endl;
-//    cout << "Average pcal: " << avg_pcal / calls << endl;
-//    cout << "Average postprocess: " << avg_postprocess / calls << endl;
-//    cout << "Actual time processing (seconds): " << (double) processing_time / 1000. / 1000. / 3 << endl; 
-//    duration = duration_cast<microseconds>(stop - constructor_time);
-//    cout << "GPUMode lifetime: " << duration.count() / 1000. / 1000. << endl;
+
 }
 
 __global__ void check_unpack(float** array, int nchan, int nsamp) {
@@ -466,31 +466,7 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     auto start = high_resolution_clock::now();
 
-    // --- INSTANCE-LEVEL LAZY EVENT INITIALIZATION ---
-//    static cudaEvent_t ev_start = nullptr, ev_copy1, ev_unpack, ev_copy2, ev_pcal, ev_rotate, ev_fft, ev_frac;
-//    if (ev_start == nullptr) {
-//        cudaEventCreate(&ev_start); cudaEventCreate(&ev_copy1); cudaEventCreate(&ev_unpack);
-//        cudaEventCreate(&ev_copy2); cudaEventCreate(&ev_pcal);  cudaEventCreate(&ev_rotate);
-//        cudaEventCreate(&ev_fft);   cudaEventCreate(&ev_frac);
-//    }
-//static std::mutex ev_init_mutex;
-//static cudaEvent_t ev_start = nullptr, ev_copy1 = nullptr, ev_unpack = nullptr;
-//static cudaEvent_t ev_copy2 = nullptr, ev_pcal  = nullptr, ev_rotate = nullptr;
-//static cudaEvent_t ev_fft   = nullptr, ev_frac  = nullptr;
-//
-//if (ev_start == nullptr) {
-//    std::lock_guard<std::mutex> lock(ev_init_mutex);
-//    if (ev_start == nullptr) {  // double-checked locking
-//        cudaEventCreate(&ev_start);
-//        cudaEventCreate(&ev_copy1);
-//        cudaEventCreate(&ev_unpack);
-//        cudaEventCreate(&ev_copy2);
-//        cudaEventCreate(&ev_pcal);
-//        cudaEventCreate(&ev_rotate);
-//        cudaEventCreate(&ev_fft);
-//        cudaEventCreate(&ev_frac);
-//    }
-//}
+
     if (ev_start == nullptr) {
         checkCuda(cudaEventCreate(&ev_start));
         checkCuda(cudaEventCreate(&ev_copy1));
@@ -531,13 +507,28 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     //valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
 
     // Reset pcal accumulation only once at the start of a subintegration.
-    if (!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0) &&
+     if (!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0) &&
             (datasec != pcalResetDataSec || datans != pcalResetDataNs)) {
-        checkCuda(cudaMemsetAsync(pcal_output_real->gpuPtr(), 0,
-                                  sizeof(float) * numrecordedbands * pcal_bin_stride_length, cuStream));
-            pcalResetDataSec = datasec;
-            pcalResetDataNs = datans;
+        if (usecomplex) {
+            checkCuda(cudaMemsetAsync(pcal_output_complex->gpuPtr(), 0,
+                                      sizeof(cuFloatComplex) * numrecordedbands * pcal_bin_stride_length, cuStream));
+        } else {
+            checkCuda(cudaMemsetAsync(pcal_output_real->gpuPtr(), 0,
+                                      sizeof(float) * numrecordedbands * pcal_bin_stride_length, cuStream));
+        }
+        pcalResetDataSec = datasec;
+        pcalResetDataNs = datans;
     }
+ 
+ 
+ 
+    //if (!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0) &&
+    //        (datasec != pcalResetDataSec || datans != pcalResetDataNs)) {
+    //    checkCuda(cudaMemsetAsync(pcal_output_real->gpuPtr(), 0,
+    //                              sizeof(float) * numrecordedbands * pcal_bin_stride_length, cuStream));
+    //        pcalResetDataSec = datasec;
+    //        pcalResetDataNs = datans;
+    //}
 
     // Reset the autocorrelations
     checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
@@ -590,9 +581,14 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) { 
         pcalExtraction(fftloop, numBufferedFFTs, startblock, numblocks);
-        pcal_output_real->copyToHost();
         // point pcal_output_real_gpu_mode
-        pcal_output_real_gpu_mode = pcal_output_real->ptr();
+        if (usecomplex) {
+            pcal_output_complex->copyToHost();
+            pcal_output_complex_gpu_mode = reinterpret_cast<cf32 *>(pcal_output_complex->ptr());
+        } else {
+            pcal_output_real->copyToHost();
+            pcal_output_real_gpu_mode = pcal_output_real->ptr();
+        }
     }    
     cudaEventRecord(ev_pcal, cuStream);  
 
@@ -1388,6 +1384,8 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
             fftchannels_grid++;
         }
     }
+    //  For LSB data, gLoFreqs needs to have already been corrected for the fact that we will convert to 
+    // USB in unpacking. This means than loFreq = loFreq - bandwidth.
     if (usecomplex) {
         gpu_complex_fringeRotation<<<
             dim3(numBufferedFFTs, fftchannels_grid),
@@ -1577,7 +1575,8 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
         //printf("counts[%d] = %d\n",ii,counts[ii]);
         //printf("counts_gpu[%d] = %d\n",ii,counts_gpu->ptr()[ii]);
 	}
-	counts_gpu->copyToDevice();
+	counts_gpu->copyToDevice(); // Check what these are for and if they are necessary!
+
 	gpu_resultsrotatorMultiply<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(fftchannels_block), 0, cuStream>>>
            (
                     fftd_gpu->gpuPtr(),
@@ -1599,6 +1598,9 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
 		    calccrosspolautocorrs,
 		    counts_gpu->gpuPtr()
             );
+
+    // We should zero the first channel (lowest frequency) of any LSB bands. Of both ffd_gpu and conj_fftd_gpu
+    // In future, would be more efficient to do this at visibility.cpp, just prior to writing to disk (if either band in the baseline is LSB)
 
     // Start copying the autocorrelations back to the host
     temp_autocorrelations_gpu->copyToHost();

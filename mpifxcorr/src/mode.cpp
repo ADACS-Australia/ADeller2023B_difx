@@ -859,77 +859,36 @@ void Mode::finalisepcal()
 {
   for(int i=0;i<numrecordedbands;i++)
   {
-
-    // you are here Mike 
     
-
-    
-    
+    // Grab pcal output from GPU if we are in GPU mode 
     if (config->get_use_gpu()) { 
         if (pcal_bin_stride_length <= 0) {
             csevere << startl << "invalid pcal_bin_stride_length=" << pcal_bin_stride_length << endl;
             continue;
         }
-        //if (usecomplex) {
-            //if (pcal_output_complex_gpu_mode == nullptr) {
-            //    csevere << startl << "pcal_output_complex_gpu_mode is NULL" << endl;
-            //    continue;
-            //}
-        //} else {
+        if (usecomplex) {
+            if (pcal_output_complex_gpu_mode == nullptr) {
+                csevere << startl << "pcal_output_complex_gpu_mode is NULL" << endl;
+                continue;
+            }
+        } else {
             if (pcal_output_real_gpu_mode == nullptr) {
                 csevere << startl << "pcal_output_real_gpu_mode is NULL" << endl;
                 continue;
             }
-        //}
+        }
 
-//        if (i <= 1) {
-//          const f32 *dbg = pcal_output_real_gpu_mode + (i * pcal_bin_stride_length);
-//          int nonzero_count = 0;
-//          int first_nonzero = -1;
-//          f32 max_abs = 0.0f;
-//          for (int ii = 0; ii < pcal_bin_stride_length; ii++) {
-//            f32 v = dbg[ii];
-//            f32 av = std::fabs(v);
-//            if (av > 0.0f) {
-//              nonzero_count++;
-//              if (first_nonzero < 0) {
-//                first_nonzero = ii;
-//              }
-//              if (av > max_abs) {
-//                max_abs = av;
-//              }
-//            }
-//          }
-          //printf("DEBUG finalisepcal band=%d pcal_bin_stride=%d nonzero=%d first_nonzero=%d max_abs=%.6e\n",
-          //     i, pcal_bin_stride_length, nonzero_count, first_nonzero, max_abs);
-    //    }
-       // if (usecomplex) {
-    //      extractor[i]->setPcalComplex(pcal_output_complex_gpu_mode+(i*(pcal_bin_stride_length)));
-       // } else {     
+        if (usecomplex) {
+          extractor[i]->setPcalComplex(pcal_output_complex_gpu_mode+(i*(pcal_bin_stride_length)));
+        } else {     
           extractor[i]->setPcalReal(pcal_output_real_gpu_mode+(i*(pcal_bin_stride_length)));    
-       // } 
+        } 
     }
     uint64_t samples = extractor[i]->getFinalPCal(pcalresults[i]);
-  //  if (datans == 36500000 && datastreamindex == 4 && i < 2) {
-  //    printf("DEBUG_PCAL_FINAL_BINS use_gpu=%d ds=%d band=%d datasec=%d datans=%d samples=%llu v0=(%.9f,%.9f) v1=(%.9f,%.9f) v2=(%.9f,%.9f) v3=(%.9f,%.9f)\n",
-  //         (int)config->get_use_gpu(),
-  //         datastreamindex,
-  //         i,
-  //         datasec,
-  //         datans,
-  //         (unsigned long long)samples,
-  //         pcalresults[i][0].re,
-  //         pcalresults[i][0].im,
-  //         pcalresults[i][1].re,
-  //         pcalresults[i][1].im,
-  //         pcalresults[i][2].re,
-  //         pcalresults[i][2].im,
-  //         pcalresults[i][3].re,
-  //         pcalresults[i][3].im);
-  //  }
-    if ((samples == 0) && (datasec != INVALID_SUBINT) && (datalengthbytes > 1)) {
+
+    //if ((samples == 0) && (datasec != INVALID_SUBINT) && (datalengthbytes > 1)) {
         //cdebug << startl << "finalisepcal band " << i << " samples==0 over valid subint " << datasec << "s+" << datans << "ns" << endl;
-    }
+    //}
   }
 }
 

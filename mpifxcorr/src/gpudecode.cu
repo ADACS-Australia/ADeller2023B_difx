@@ -243,6 +243,7 @@ __device__ int mk5_decode_general_gpu(struct mark5_stream *ms, int nsamp, float 
 
 // This is a rewrite of the above mk5_decode_general_gpu the decodes one sample at a time but can be 
 // run in parallel across samples. 
+// This - and the complex equivalent - will need to have an extra vector of bools for which bands are LSB
 __device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int skipped, float **data) {
     const unsigned char *buf = ms->payload;
     const int nbit = ms->nbit;
@@ -256,6 +257,7 @@ __device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int s
 	
     int global_sample = ms->framesamples * ms->framenum + sample;
 
+	// If it is an LSB band and it is an odd sample, negate the value on unpack (every second sample is multiplied by -1)
     if (bit_counter / 8 >= ms->blankzoneendvalid[0]) {
         for (int c = 0; c < nchan; c++) {
             data[c][global_sample] = 0.0f;
@@ -273,6 +275,7 @@ __device__ void mk5_decode_sample_gpu(struct mark5_stream *ms, int sample, int s
 }
 
 
+// This - and the non-complex equivalent - will need to have an extra vector of bools for which bands are LSB
 __device__ void mk5_decode_complex_sample_gpu(struct mark5_stream *ms, int sample, int skipped, cuFloatComplex **data) {
     const unsigned char *buf = ms->payload;
     const int nbit = ms->nbit;
@@ -286,6 +289,7 @@ __device__ void mk5_decode_complex_sample_gpu(struct mark5_stream *ms, int sampl
 	//printf("ms->framesamples in mk5_decode_complex_sample_gpu: %d \n", ms->framesamples);
     int global_sample = ms->framesamples * ms->framenum + sample;
 
+	// If it is an LSB band, conjugate on unpack (i.e., negate the imaginary value)
     if (bit_counter / 8 >= ms->blankzoneendvalid[0]) {
         for (int c = 0; c < nchan; c++) {
             data[c][global_sample] = make_cuFloatComplex(0.0f, 0.0f);

@@ -198,6 +198,8 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
     //      << " ms.nchan="       << mark5stream->nchan
     //      << std::endl;
     
+    // This will need to know which if any of the bands are LSB.
+    // This will presumably need to be passed in as a vector of bools, one per band, based on info in Config
     auto kernel_start = high_resolution_clock::now();
     if (usecomplex) {
       gpu_unpack_complex<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), complex_unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());

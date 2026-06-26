@@ -54,7 +54,7 @@ public:
   f32 **  unpackedarrays;
   cf32 **  unpackedcomplexarrays;
   f32 * pcal_output_real_gpu_mode = nullptr;
-  //cf32 * pcal_output_complex_gpu_mode = nullptr;
+  cf32 * pcal_output_complex_gpu_mode = nullptr;
   int pcal_bin_stride_length = 0;
   
  /**

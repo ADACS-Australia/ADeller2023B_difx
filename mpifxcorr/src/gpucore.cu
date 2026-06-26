@@ -667,8 +667,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
             double weight_sum = 0.0;
             float weight_0 = m->getDataWeight(0, 0);
             for (int s = 0; s < 8; s++) weight_sum += m->getDataWeight(0, s);
-            fprintf(stderr, "POST_FFT ds=%d fftloop=%d scanned=%zu nonzero=%d sumabs=%g first_nz=(%g,%g) weight[0]=%g weight_sum[0..7]=%g\n",
-                    j, fftloop, n, nonzero, sumabs, first_nz.re, first_nz.im, weight_0, weight_sum);
+            //fprintf(stderr, "POST_FFT ds=%d fftloop=%d scanned=%zu nonzero=%d sumabs=%g first_nz=(%g,%g) weight[0]=%g weight_sum[0..7]=%g\n",
+            //        j, fftloop, n, nonzero, sumabs, first_nz.re, first_nz.im, weight_0, weight_sum);
         }
 
         //do the baseline-based processing for this batch of FFT chunks
@@ -717,21 +717,21 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                                                                          p), fftsubloop)[xmacstart]);
 
                                // DEBUG: dump indices and operands going into the cross-multiply
-                                if (fftsubloop == 8) {
-                                    int debug_band1 = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                                    int debug_band2 = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                                    const cf32 *debug_vis1 = m1->getGpuFreqsHost(debug_band1, fftsubloop);
-                                    const cf32 *debug_vis2 = m2->getGpuConjugatedFreqsHost(debug_band2, fftsubloop);
-                                    fprintf(stderr,
-                                        "CROSSMULT  freq=%d  xmacpass=%d  baseline=%d  localfreqindex=%d  "
-                                        "polproduct=%d  subloop=%d  xmacstart=%d  |  "
-                                        "stream1_band=%d  stream2_band=%d  |  "
-                                        "vis1[first channel]=(%g, %g)  vis2_conj[first channel]=(%g, %g)\n",
-                                        f, x, j, localfreqindex, p, fftsubloop, xmacstart,
-                                        debug_band1, debug_band2,
-                                        debug_vis1[xmacstart].re, debug_vis1[xmacstart].im,
-                                        debug_vis2[xmacstart].re, debug_vis2[xmacstart].im);
-                                }
+                               // if (fftsubloop == 8) {
+                               //     int debug_band1 = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                               //     int debug_band2 = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                               //     const cf32 *debug_vis1 = m1->getGpuFreqsHost(debug_band1, fftsubloop);
+                               //     const cf32 *debug_vis2 = m2->getGpuConjugatedFreqsHost(debug_band2, fftsubloop);
+                               //     fprintf(stderr,
+                               //         "CROSSMULT  freq=%d  xmacpass=%d  baseline=%d  localfreqindex=%d  "
+                               //         "polproduct=%d  subloop=%d  xmacstart=%d  |  "
+                               //         "stream1_band=%d  stream2_band=%d  |  "
+                               //         "vis1[first channel]=(%g, %g)  vis2_conj[first channel]=(%g, %g)\n",
+                               //         f, x, j, localfreqindex, p, fftsubloop, xmacstart,
+                               //         debug_band1, debug_band2,
+                               //         debug_vis1[xmacstart].re, debug_vis1[xmacstart].im,
+                               //         debug_vis2[xmacstart].re, debug_vis2[xmacstart].im);
+                               // }
 
 
                                 //not pulsar binning, so this is nice and simple - just cross multiply accumulate

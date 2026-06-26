@@ -78,8 +78,8 @@ protected:
     GpuMemHelper<double>* grecordedfreqclockoffsetsdelta;
     GpuMemHelper<double>* grecordedfreqlooffsets;
     GpuMemHelper<int>* pcal_offsets_hz;
-    GpuMemHelper<float> *pcal_output_real;  // temporary unassembled output for the pcaloffsethz==0.0f case
-    GpuMemHelper<cuFloatComplex> *pcal_output_complex;  // temporary unassembled output for the pcaloffsethz!=0.0f case
+    GpuMemHelper<float> *pcal_output_real = nullptr;  // temporary unassembled output for the pcaloffsethz==0.0f case
+    GpuMemHelper<cuFloatComplex> *pcal_output_complex = nullptr;  // temporary unassembled output for the pcaloffsethz!=0.0f case
     GpuMemHelper<int>* N_pcal_bins;
     GpuMemHelper<int>* counts_gpu;
     cudaStream_t cuStream;
