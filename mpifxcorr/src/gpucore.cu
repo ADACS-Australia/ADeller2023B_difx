@@ -21,11 +21,19 @@ __device__ void atomicAddFloatComplex1(cuFloatComplex* a, cuFloatComplex b){
 
 /**
  * @brief Fused Cross-Multiply-Accumulate (XMAC) and Frequency Averaging Kernel
- * * Unlike the CPU `threadcrosscorrs` loop which chunks data by `xmacstridelen` 
- * for cache locality, this kernel relies on coalesced memory access. Threads 
- * are mapped to specific, final *output* channels. Each thread traverses the 
+ * * Unlike the CPU `threadcrosscorrs` loop which chunks data by `xmacstridelen`
+ * for cache locality, this kernel relies on coalesced memory access. Threads
+ * are mapped to specific, final *output* channels. Each thread traverses the
  * time-domain (FFT buffers) and the fine-frequency domain (channels to average),
  * collapsing them into a single point.
+ *
+ * The output averaged-channel dimension is spread across BOTH the block
+ * (threadIdx.x) and the grid (blockIdx.z) so that the launch produces enough
+ * blocks to fill the device, rather than the numbaselines*numpol (~handful)
+ * blocks of the previous grid-stride design. Each thread owns exactly one
+ * output channel and, since every (baseline, pol, avg_chan) maps to a unique
+ * slot in the pre-zeroed results buffer within a launch, it writes with a
+ * plain store instead of an atomic add.
  */
 __global__ void gpu_fuse_xmac_and_average(
         const cuFloatComplex* const * const gpuM1Freqs,
@@ -44,10 +52,16 @@ __global__ void gpu_fuse_xmac_and_average(
 ) {
     // gridDim.x  = numbaselines
     // gridDim.y  = numPolarisationProducts
-    // blockDim.x = up to 256 (processing the averaged spectral channels in parallel)
+    // gridDim.z  = ceil(num_averaged_channels / blockDim.x)
+    // blockDim.x = output averaged channels processed per block (e.g. 256)
 
     int baseline = blockIdx.x;
     int pol = blockIdx.y;
+
+    // Each thread owns exactly one output averaged channel, indexed across both
+    // the block and the grid's z dimension.
+    int avg_chan = blockIdx.z * blockDim.x + threadIdx.x;
+    if (avg_chan >= num_averaged_channels) return;
 
     // 1. Resolve Band Indexes
     // We pre-flattened the 2D [baseline][pol] config arrays on the host.
@@ -57,52 +71,48 @@ __global__ void gpu_fuse_xmac_and_average(
     // If the baseline doesn't participate in this frequency, it was flagged as -1.
     if (b1 < 0 || b2 < 0) return;
 
-    // 2. Grid-Stride Loop over the Output Averaged Channels
-    // By striding over output channels, adjacent threads read adjacent fine-channels
-    // from the FFT arrays, guaranteeing perfectly coalesced memory access.
-    for (int avg_chan = threadIdx.x; avg_chan < num_averaged_channels; avg_chan += blockDim.x) {
-        
-        cuFloatComplex sum = make_cuFloatComplex(0.0f, 0.0f);
+    cuFloatComplex sum = make_cuFloatComplex(0.0f, 0.0f);
 
-        // 3. Time Integration 
-        // Summation over all FFTs currently residing in the GPU buffer.
-        for (int fft = 0; fft < numBufferedFFTs; fft++) {
-            
-            // Calculate the absolute starting index for this specific FFT and Band
-            int base_idx1 = (fft * numrecordedbands + b1) * fftchannels;
-            int base_idx2 = (fft * numrecordedbands + b2) * fftchannels;
+    // 2. Time Integration
+    // Summation over all FFTs currently residing in the GPU buffer.
+    for (int fft = 0; fft < numBufferedFFTs; fft++) {
 
-            // 4. Frequency Integration
-            // Collapse 'channelstoaverage' fine channels into this single output channel.
-            for (int c = 0; c < channelstoaverage; c++) {
-                int fine_chan = avg_chan * channelstoaverage + c;
-                
-                cuFloatComplex v1 = gpuM1Freqs[baseline][base_idx1 + fine_chan];
-                // Note: v2 is pulled from conj_fftd_gpu, so it is already conjugated.
-                cuFloatComplex v2 = gpuM2Freqs[baseline][base_idx2 + fine_chan]; 
-                
-                // Cross-multiply: V1 * V2*
-                sum = cuCaddf(sum, cuCmulf(v1, v2));
-            }
+        // Calculate the absolute starting index for this specific FFT and Band
+        int base_idx1 = (fft * numrecordedbands + b1) * fftchannels;
+        int base_idx2 = (fft * numrecordedbands + b2) * fftchannels;
+
+        // 3. Frequency Integration
+        // Collapse 'channelstoaverage' fine channels into this single output channel.
+        for (int c = 0; c < channelstoaverage; c++) {
+            int fine_chan = avg_chan * channelstoaverage + c;
+
+            cuFloatComplex v1 = gpuM1Freqs[baseline][base_idx1 + fine_chan];
+            // Note: v2 is pulled from conj_fftd_gpu, so it is already conjugated.
+            cuFloatComplex v2 = gpuM2Freqs[baseline][base_idx2 + fine_chan];
+
+            // Cross-multiply: V1 * V2*
+            sum = cuCaddf(sum, cuCmulf(v1, v2));
         }
-
-        // 5. Apply Scaling
-        // Time integration in DiFX is a pure SUM, but frequency integration is a MEAN.
-        // We multiply by the reciprocal to avoid expensive division operations.
-        float scale = 1.0f / (float)channelstoaverage;
-        sum.x *= scale;
-        sum.y *= scale;
-
-        // 6. Direct Output Mapping
-        // We completely bypass the CPU's intermediate `threadcrosscorrs` array.
-        // The layout of procslots[index].results is contiguous: [Baseline][Polarisation][Channel]
-        int base_offset = coreResultBaselineOffsets[baseline];
-        int pol_offset = pol * num_averaged_channels;
-        int final_index = base_offset + pol_offset + avg_chan;
-
-        // Atomically add the fully averaged result to the global visibility array.
-        atomicAddFloatComplex1(&results_gpu[final_index], sum);
     }
+
+    // 4. Apply Scaling
+    // Time integration in DiFX is a pure SUM, but frequency integration is a MEAN.
+    // We multiply by the reciprocal to avoid expensive division operations.
+    float scale = 1.0f / (float)channelstoaverage;
+    sum.x *= scale;
+    sum.y *= scale;
+
+    // 5. Direct Output Mapping
+    // We completely bypass the CPU's intermediate `threadcrosscorrs` array.
+    // The layout of procslots[index].results is contiguous: [Baseline][Polarisation][Channel]
+    int base_offset = coreResultBaselineOffsets[baseline];
+    int pol_offset = pol * num_averaged_channels;
+    int final_index = base_offset + pol_offset + avg_chan;
+
+    // This (baseline, pol, avg_chan) triple is unique within the launch and the
+    // results buffer was pre-zeroed, so a plain store is correct and avoids the
+    // serialisation of an atomic add.
+    results_gpu[final_index] = sum;
 }
 
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)
@@ -768,8 +778,26 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
             checkCuda(cudaMemcpyAsync(d_stream2BandIndexes, h_stream2BandIndexes, numbaselines * numPolarisationProducts * sizeof(int), cudaMemcpyHostToDevice, cuStream));
 
             // 3. Launch Fused Kernel
-            dim3 blocks(numbaselines, numPolarisationProducts);
-            dim3 threads(256); // 256 output channels processed per warp-stride loop
+            // Spread the averaged-channel dimension across the grid's z axis so
+            // the launch fills the device rather than producing only
+            // numbaselines*numPolarisationProducts blocks.
+            //
+            // TODO (next perf task): promote the FFT/time dimension into the grid.
+            // This grid only has good occupancy when there are many averaged
+            // channels. In the geodesy regime (typically 1/3/6 baselines and
+            // often 1 pol) numbaselines*numPolarisationProducts is tiny and the
+            // channel count may be modest, so the device is under-occupied while
+            // each thread serially integrates over numBufferedFFTs (which is
+            // large). Add a grid dimension over FFTs (or FFT chunks), have
+            // threads accumulate partial sums, then reduce across the FFT
+            // dimension per output channel (this will need an atomic add or a
+            // two-pass/shared-memory reduction, since multiple blocks would then
+            // write the same output slot - unlike the single-store fast path
+            // below). Consider branching by regime to keep this fast path for the
+            // many-channel case.
+            dim3 threads(256); // output channels processed per block
+            dim3 blocks(numbaselines, numPolarisationProducts,
+                        (num_averaged_channels + threads.x - 1) / threads.x);
             int sampling_multiplier = (config->getDSampling(procslots[index].configindex, 0) == Configuration::COMPLEX) ? 1 : 2;
 
             gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
