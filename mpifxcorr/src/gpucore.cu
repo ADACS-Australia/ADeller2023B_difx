@@ -8,6 +8,103 @@
 
 using namespace std::chrono;
 
+// Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
+// todo: deduplicate this function
+__device__ void atomicAddFloatComplex1(cuFloatComplex* a, cuFloatComplex b){
+    // transform the addresses of real and imag. parts to double pointers
+    float *x = (float*)a;
+    float *y = x+1;
+    //use atomicAdd for double variables
+    atomicAdd(x, cuCrealf(b));
+    atomicAdd(y, cuCimagf(b));
+}
+
+/**
+ * @brief Fused Cross-Multiply-Accumulate (XMAC) and Frequency Averaging Kernel
+ * * Unlike the CPU `threadcrosscorrs` loop which chunks data by `xmacstridelen` 
+ * for cache locality, this kernel relies on coalesced memory access. Threads 
+ * are mapped to specific, final *output* channels. Each thread traverses the 
+ * time-domain (FFT buffers) and the fine-frequency domain (channels to average),
+ * collapsing them into a single point.
+ */
+__global__ void gpu_fuse_xmac_and_average(
+        const cuFloatComplex* const * const gpuM1Freqs,
+        const cuFloatComplex* const * const gpuM2Freqs,
+        const int* const stream1BandIndexes,
+        const int* const stream2BandIndexes,
+        const int* const coreResultBaselineOffsets,
+        cuFloatComplex* const results_gpu,
+        int numbaselines,
+        int numPolarisationProducts,
+        int numBufferedFFTs,
+        int num_averaged_channels,
+        int channelstoaverage,
+        int fftchannels,
+        int numrecordedbands
+) {
+    // gridDim.x  = numbaselines
+    // gridDim.y  = numPolarisationProducts
+    // blockDim.x = up to 256 (processing the averaged spectral channels in parallel)
+
+    int baseline = blockIdx.x;
+    int pol = blockIdx.y;
+
+    // 1. Resolve Band Indexes
+    // We pre-flattened the 2D [baseline][pol] config arrays on the host.
+    int b1 = stream1BandIndexes[baseline * numPolarisationProducts + pol];
+    int b2 = stream2BandIndexes[baseline * numPolarisationProducts + pol];
+
+    // If the baseline doesn't participate in this frequency, it was flagged as -1.
+    if (b1 < 0 || b2 < 0) return;
+
+    // 2. Grid-Stride Loop over the Output Averaged Channels
+    // By striding over output channels, adjacent threads read adjacent fine-channels
+    // from the FFT arrays, guaranteeing perfectly coalesced memory access.
+    for (int avg_chan = threadIdx.x; avg_chan < num_averaged_channels; avg_chan += blockDim.x) {
+        
+        cuFloatComplex sum = make_cuFloatComplex(0.0f, 0.0f);
+
+        // 3. Time Integration 
+        // Summation over all FFTs currently residing in the GPU buffer.
+        for (int fft = 0; fft < numBufferedFFTs; fft++) {
+            
+            // Calculate the absolute starting index for this specific FFT and Band
+            int base_idx1 = (fft * numrecordedbands + b1) * fftchannels;
+            int base_idx2 = (fft * numrecordedbands + b2) * fftchannels;
+
+            // 4. Frequency Integration
+            // Collapse 'channelstoaverage' fine channels into this single output channel.
+            for (int c = 0; c < channelstoaverage; c++) {
+                int fine_chan = avg_chan * channelstoaverage + c;
+                
+                cuFloatComplex v1 = gpuM1Freqs[baseline][base_idx1 + fine_chan];
+                // Note: v2 is pulled from conj_fftd_gpu, so it is already conjugated.
+                cuFloatComplex v2 = gpuM2Freqs[baseline][base_idx2 + fine_chan]; 
+                
+                // Cross-multiply: V1 * V2*
+                sum = cuCaddf(sum, cuCmulf(v1, v2));
+            }
+        }
+
+        // 5. Apply Scaling
+        // Time integration in DiFX is a pure SUM, but frequency integration is a MEAN.
+        // We multiply by the reciprocal to avoid expensive division operations.
+        float scale = 1.0f / (float)channelstoaverage;
+        sum.x *= scale;
+        sum.y *= scale;
+
+        // 6. Direct Output Mapping
+        // We completely bypass the CPU's intermediate `threadcrosscorrs` array.
+        // The layout of procslots[index].results is contiguous: [Baseline][Polarisation][Channel]
+        int base_offset = coreResultBaselineOffsets[baseline];
+        int pol_offset = pol * num_averaged_channels;
+        int final_index = base_offset + pol_offset + avg_chan;
+
+        // Atomically add the fully averaged result to the global visibility array.
+        atomicAddFloatComplex1(&results_gpu[final_index], sum);
+    }
+}
+
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)
         : Core(id, conf, dids, rcomm) {
     cudaDeviceProp prop;
@@ -18,6 +115,21 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
       cerr << "GPU DiFX must have 1 thread per Core process - had " << numprocessthreads << endl;
       exit(1);
     }
+
+    // Initialize the long-lived stream
+    checkCuda(cudaStreamCreate(&cuStream));
+
+    // Allocate the main results buffer
+    checkCuda(cudaMalloc(&results_gpu, maxcoreresultlength * sizeof(cuFloatComplex)));
+
+    // Allocate the metadata arrays needed for the fused kernel
+    checkCuda(cudaMalloc(&d_m1_ptrs, numbaselines * sizeof(cuFloatComplex*)));
+    checkCuda(cudaMalloc(&d_m2_ptrs, numbaselines * sizeof(cuFloatComplex*)));
+    checkCuda(cudaMalloc(&d_coreResultBaselineOffsets, numbaselines * sizeof(int)));
+    
+    // Allocate band index arrays (assuming max 4 polarizations as in your host arrays)
+    checkCuda(cudaMalloc(&d_stream1BandIndexes, numbaselines * 4 * sizeof(int)));
+    checkCuda(cudaMalloc(&d_stream2BandIndexes, numbaselines * 4 * sizeof(int)));
 }
 
 static unsigned long long avg_preprocess;
@@ -26,6 +138,17 @@ int core_calls;
 GPUCore::~GPUCore() {
     cout << "Average core pre: " << avg_preprocess / core_calls << endl;
     cout << "Average core post: " << avg_postprocess / core_calls << endl;
+
+    // Clean up device memory
+    checkCuda(cudaFree(results_gpu));
+    checkCuda(cudaFree(d_m1_ptrs));
+    checkCuda(cudaFree(d_m2_ptrs));
+    checkCuda(cudaFree(d_coreResultBaselineOffsets));
+    checkCuda(cudaFree(d_stream1BandIndexes));
+    checkCuda(cudaFree(d_stream2BandIndexes));
+
+    // Destroy the stream last
+    checkCuda(cudaStreamDestroy(cuStream));
 }
 
 void GPUCore::loopprocess(int threadid) {
@@ -246,17 +369,6 @@ void GPUCore::loopprocess(int threadid) {
 //    cout << "process calls: " << calls << endl;
 }
 
-// Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
-// todo: deduplicate this function
-__device__ void atomicAddFloatComplex1(cuFloatComplex* a, cuFloatComplex b){
-    // transform the addresses of real and imag. parts to double pointers
-    float *x = (float*)a;
-    float *y = x+1;
-    //use atomicAdd for double variables
-    atomicAdd(x, cuCrealf(b));
-    atomicAdd(y, cuCimagf(b));
-}
-
 __global__ void _gpu_processBaselineBased(
         cuFloatComplex** const gpuM1Freqs,
         cuFloatComplex** const gpuM2Freqs,
@@ -314,59 +426,6 @@ __global__ void _gpu_processBaselineBased(
             atomicAddFloatComplex1(&threadcrosscorrs_gpu[crosscorrIndex], cuCmulf(gpuM1Freqs[j][freqIndex], gpuM2Freqs[j][conjIndex]));
         }
     }
-}
-
-void GPUCore::processBaselineBased(
-        cuFloatComplex** gpuM1Freqs,
-        cuFloatComplex** gpuM2Freqs,
-        char* stream1BandIndexes_gpu,
-        char* stream2BandIndexes_gpu,
-        cuFloatComplex* threadcrosscorrs_gpu,
-        int xmacstridelength,
-        int numPolarisationProducts,
-        int numBufferedFFTs,
-        int xmacpasses,
-        int fftloop,
-        int startblock,
-        int numblocks,
-        int fftchannels,
-        int numrecordedbands,
-        cudaStream_t cuStream
-) {
-
-    size_t fftchannels_block;
-    size_t fftchannels_grid;
-
-    size_t divisor = cudaMaxThreadsPerBlock / numPolarisationProducts;
-    if (xmacstridelength > divisor) {
-        fftchannels_block = divisor;
-        fftchannels_grid = xmacstridelength / divisor;
-
-        if (xmacstridelength % divisor != 0) {
-            fftchannels_grid++;
-        }
-    } else {
-        fftchannels_block = xmacstridelength;
-        fftchannels_grid = 1;
-    }
-
-    _gpu_processBaselineBased<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(numPolarisationProducts,
-                                                                              fftchannels_block), 0, cuStream>>>
-            (
-                    gpuM1Freqs,
-                    gpuM2Freqs,
-                    threadcrosscorrs_gpu,
-                    stream1BandIndexes_gpu,
-                    stream2BandIndexes_gpu,
-                    xmacpasses,
-                    numbaselines,
-                    xmacstridelength,
-                    fftloop,
-                    startblock,
-                    numblocks,
-                    fftchannels,
-                    numrecordedbands
-            );
 }
 
 void
@@ -489,7 +548,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                  << maxacblocks * blockns << " ns" << endl;
     }
 
-//    cudaStream_t cuStream;
+    checkCuda(cudaStreamCreate(&cuStream));
 //    cuFloatComplex* threadcrosscorrs_gpu;
 //
 //    checkCuda(cudaStreamCreate(&cuStream));
@@ -640,157 +699,97 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 //        checkCuda(cudaStreamSynchronize(cuStream));
 
 
-        for (int j = 0; j < numdatastreams; j++) {
-            ((GPUMode *) modes[j])->fftd_gpu->copyToHost();
-            ((GPUMode *) modes[j])->conj_fftd_gpu->copyToHost();
-            ((GPUMode *) modes[j])->fftd_gpu->sync();
-            ((GPUMode *) modes[j])->conj_fftd_gpu->sync();
-        }
+        // ---------------------------------------------------------------------
+        // FUSED XMAC AND AVERAGE SETUP
+        // ---------------------------------------------------------------------
+        // Ensure the device-side results buffer is cleanly zeroed for this subint
+        checkCuda(cudaMemsetAsync(results_gpu, 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
 
-        // DEBUG: check whether post-FFT/frac-rotation results are non-zero
-        for (int j = 0; j < numdatastreams; j++) {
-            GPUMode *m = (GPUMode *) modes[j];
-            cf32 *h = (cf32 *) m->fftd_gpu->ptr();
-            size_t n = 16 * 2 * 16; // fftchannels(16) * numrecordedbands(2) * first 16 subloops
-            double sumabs = 0.0;
-            int nonzero = 0;
-            cf32 first_nz = {0.0f, 0.0f};
-            for (size_t k = 0; k < n; k++) {
-                float re = h[k].re, im = h[k].im;
-                if (re != 0.0f || im != 0.0f) {
-                    if (nonzero == 0) first_nz = h[k];
-                    nonzero++;
-                }
-                sumabs += fabs(re) + fabs(im);
-            }
-            // weights for the first 8 subloops, band 0
-            double weight_sum = 0.0;
-            float weight_0 = m->getDataWeight(0, 0);
-            for (int s = 0; s < 8; s++) weight_sum += m->getDataWeight(0, s);
-            //fprintf(stderr, "POST_FFT ds=%d fftloop=%d scanned=%zu nonzero=%d sumabs=%g first_nz=(%g,%g) weight[0]=%g weight_sum[0..7]=%g\n",
-            //        j, fftloop, n, nonzero, sumabs, first_nz.re, first_nz.im, weight_0, weight_sum);
-        }
+        // Use stack-allocated, contiguous arrays to gather DiFX config metadata quickly.
+        // Copying these to the GPU ensures the GPU kernel doesn't have to query the host.
+        const cuFloatComplex* h_m1_ptrs[numbaselines];
+        const cuFloatComplex* h_m2_ptrs[numbaselines];
+        
+        // Assuming max 4 polarizations (RR, LL, RL, LR) for safety
+        int h_stream1BandIndexes[numbaselines * 4]; 
+        int h_stream2BandIndexes[numbaselines * 4];
+        int h_coreResultBaselineOffsets[numbaselines];
 
-        //do the baseline-based processing for this batch of FFT chunks
-        auto resultindex = 0;
-        for(int f=0;f<config->getFreqTableLength();f++) {
-            //All baseline freq indices into the freq table are determined by the *first* datastream
-            //in the event of correlating USB with LSB data.  Hence all Nyquist offsets/channels etc
-            //are determined by the freq corresponding to the *first* datastream
-            auto freqchannels = config->getFNumChannels(f);
-            auto xmacpasses = config->getNumXmacStrides(procslots[index].configindex, f);
-            for (int x = 0; x < xmacpasses; x++) {
-                auto xmacstart = x * xmacstridelength;
-                int xmacstrideremain = std::min(freqchannels - xmacstart, xmacstridelength);
-                //if(xmacstrideremain <= 0)  // note: since getNumXmacStrides() is a rounded-up value, there may be {xmaclen x '0'} to be concatenated per baseline to keep consistent with Configuration-assigned offsets
-                //  break;
-                if (xmacstrideremain < 0)
-                    continue;
+        // Iterate over the output frequency table just like the CPU, but instead of 
+        // processing data, we are just mapping memory offsets.
+        for(int f=0; f < config->getFreqTableLength(); f++) {
+            if(!config->isFrequencyUsed(procslots[index].configindex, f)) continue;
 
-                //do the cross multiplication - gets messy for the pulsar binning
-                for (int j = 0; j < numbaselines; j++) {
-                    //get the localfreqindex for this frequency
-                    localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, j, f);
-                    if (localfreqindex >= 0) {
-                        //get the two modes that contribute to this baseline
-                        auto ds1index = config->getBOrderedDataStream1Index(procslots[index].configindex, j);
-                        auto ds2index = config->getBOrderedDataStream2Index(procslots[index].configindex, j);
-                        auto m1 = modes[ds1index];
-                        auto m2 = modes[ds2index];
+            int freqchannels = config->getFNumChannels(f);
+            int channelstoaverage = config->getFChannelsToAverage(f);
+            int num_averaged_channels = freqchannels / channelstoaverage;
+            
+            // Assume uniform polarization products for this simple continuum kernel
+            int numPolarisationProducts = config->getBNumPolProducts(
+                procslots[index].configindex, 0, config->getBLocalFreqIndex(procslots[index].configindex, 0, f));
 
-                        //do the baseline-based processing for this batch of FFT chunks
-                        for (int fftsubloop = 0; fftsubloop < numBufferedFFTs; fftsubloop++) {
-                            auto i = fftloop * numBufferedFFTs + fftsubloop + startblock;
-                            if (i >= startblock + numblocks)
-                                break; //may not have to fully complete last fftloop
+            // 1. Gather Metadata for all baselines for this Frequency
+            for (int j = 0; j < numbaselines; j++) {
+                int localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, j, f);
+                
+                if (localfreqindex >= 0) {
+                    int ds1index = config->getBOrderedDataStream1Index(procslots[index].configindex, j);
+                    int ds2index = config->getBOrderedDataStream2Index(procslots[index].configindex, j);
+                    
+                    // Grab the raw GPU pointers to the FFT output buffers directly from the GPUMode instances.
+                    // This prevents any unnecessary host-side copies.
+                    h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
+                    h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->conj_fftd_gpu->gpuPtr();
+                    
+                    // Fetch the pre-calculated offset for where this baseline's data belongs in the final array
+                    h_coreResultBaselineOffsets[j] = config->getCoreResultBaselineOffset(procslots[index].configindex, f, j);
 
-                            //add the desired results into the resultsbuffer, for each polarisation pair [and pulsar bin]
-                            //loop through each polarisation for this frequency
-                            for (int p = 0;
-                                 p < config->getBNumPolProducts(procslots[index].configindex, j, localfreqindex); p++) {
-                                //get the appropriate arrays to multiply
-                                auto vis1 = &(m1->getGpuFreqsHost(
-                                        config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex,
-                                                                         p), fftsubloop)[xmacstart]);
-                                auto vis2 = &(m2->getGpuConjugatedFreqsHost(
-                                        config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex,
-                                                                         p), fftsubloop)[xmacstart]);
-
-                               // DEBUG: dump indices and operands going into the cross-multiply
-                               // if (fftsubloop == 8) {
-                               //     int debug_band1 = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                               //     int debug_band2 = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                               //     const cf32 *debug_vis1 = m1->getGpuFreqsHost(debug_band1, fftsubloop);
-                               //     const cf32 *debug_vis2 = m2->getGpuConjugatedFreqsHost(debug_band2, fftsubloop);
-                               //     fprintf(stderr,
-                               //         "CROSSMULT  freq=%d  xmacpass=%d  baseline=%d  localfreqindex=%d  "
-                               //         "polproduct=%d  subloop=%d  xmacstart=%d  |  "
-                               //         "stream1_band=%d  stream2_band=%d  |  "
-                               //         "vis1[first channel]=(%g, %g)  vis2_conj[first channel]=(%g, %g)\n",
-                               //         f, x, j, localfreqindex, p, fftsubloop, xmacstart,
-                               //         debug_band1, debug_band2,
-                               //         debug_vis1[xmacstart].re, debug_vis1[xmacstart].im,
-                               //         debug_vis2[xmacstart].re, debug_vis2[xmacstart].im);
-                               // }
-
-
-                                //not pulsar binning, so this is nice and simple - just cross multiply accumulate
-                                //baselineweight gets updated later
-                                status = vectorAddProduct_cf32(vis1, vis2,
-                                                               &(scratchspace->threadcrosscorrs[resultindex +
-                                                                                                p * xmacstridelength]),
-                                                               xmacstrideremain);
-                                //std::cout << "resultindex = " << resultindex << ", p = " << p << ", xmacstridelength = " << xmacstridelength << std::endl;              
-                                //std::cout << "resultindex + p * xmacstridelength = " << resultindex + p * xmacstridelength << std::endl;
-                                if (status != vecNoErr)
-                                    csevere << startl << "Error trying to xmac baseline " << j << " frequency "
-                                            << localfreqindex << " polarisation product " << p << ", status " << status
-                                            << endl;
-                            }
-                        }//for(fftsubloops)
-                        //advance output index to concatenate the xmac slice of the next baseline-polproducts
-                        //notes: - when xmacstrideremain is shorter than xmacstridelength we will simply end up with a few padded zeroes in output array, no change in output array spacing,
-                        //       - there may be *more* channels (zero pads) than 'numchannels' of the freq; it holds that "freqtable[i].numchannels <= completestridelength[freq]*xmaclen"
-                        //       - zero padding is essentially required due Configuration::populateResultLengths() precomputed offsets into xmac output array
-                        if (procslots[index].pulsarbin && !procslots[index].scrunchoutput)
-                            resultindex += config->getBNumPolProducts(procslots[index].configindex, j, localfreqindex) *
-                                           procslots[index].numpulsarbins * xmacstridelength;
-                        else
-                            resultindex += config->getBNumPolProducts(procslots[index].configindex, j, localfreqindex) *
-                                           xmacstridelength;
+                    // Flatten the 2D [baseline][pol] band indexes into a 1D array for the GPU
+                    for (int p = 0; p < numPolarisationProducts; p++) {
+                        h_stream1BandIndexes[j * numPolarisationProducts + p] = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                        h_stream2BandIndexes[j * numPolarisationProducts + p] = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
+                    }
+                } else {
+                    // Baseline doesn't participate in this frequency; flag with -1
+                    h_coreResultBaselineOffsets[j] = -1; 
+                    for (int p = 0; p < numPolarisationProducts; p++) {
+                        h_stream1BandIndexes[j * numPolarisationProducts + p] = -1;
+                        h_stream2BandIndexes[j * numPolarisationProducts + p] = -1;
                     }
                 }
             }
+
+            // 2. Async Copy Metadata to Device
+            // These transfers are tiny (just a few ints/pointers) and very fast.
+            checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numbaselines * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
+            checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numbaselines * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
+            checkCuda(cudaMemcpyAsync(d_coreResultBaselineOffsets, h_coreResultBaselineOffsets, numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+            checkCuda(cudaMemcpyAsync(d_stream1BandIndexes, h_stream1BandIndexes, numbaselines * numPolarisationProducts * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+            checkCuda(cudaMemcpyAsync(d_stream2BandIndexes, h_stream2BandIndexes, numbaselines * numPolarisationProducts * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+
+            // 3. Launch Fused Kernel
+            dim3 blocks(numbaselines, numPolarisationProducts);
+            dim3 threads(256); // 256 output channels processed per warp-stride loop
+            int sampling_multiplier = (config->getDSampling(procslots[index].configindex, 0) == Configuration::COMPLEX) ? 1 : 2;
+
+            gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
+                d_m1_ptrs, d_m2_ptrs,
+                d_stream1BandIndexes, d_stream2BandIndexes,
+                d_coreResultBaselineOffsets,
+                results_gpu,
+                numbaselines, numPolarisationProducts, numBufferedFFTs,
+                num_averaged_channels, channelstoaverage,
+                freqchannels*sampling_multiplier, config->getDNumRecordedBands(procslots[index].configindex, 0)
+            );
         }
 
-        stop = high_resolution_clock::now();
-        duration = duration_cast<microseconds>(stop - start);
-        //cout << "baseline based processing: " << duration.count() << endl;
-
-        start = high_resolution_clock::now();
-
-        xcblockcount += numfftsprocessed;
-        if (xcblockcount == maxxcblocks) {
-            //shift/average and then lock results and copy data
-            uvshiftAndAverage(index, threadid,
-                              (startblock + xcshiftcount * maxxcblocks + ((double) maxxcblocks) / 2.0) * blockns,
-                              maxxcblocks * blockns, currentpolyco, scratchspace);
-            //reset the xcblockcount, increment xcshiftcount
-            xcblockcount = 0;
-            xcshiftcount++;
-        }
-        acblockcount += numfftsprocessed;
-        if (acblockcount == maxacblocks) {
-            //shift/average and then lock results and copy data
-            averageAndSendAutocorrs(index, threadid,
-                                    (startblock + acshiftcount * maxacblocks + ((double) maxacblocks) / 2.0) * blockns,
-                                    maxacblocks * blockns, modes, scratchspace);
-            //reset the acblockcount, increment acshiftcount, zero the autocorrelations
-            acblockcount = 0;
-            acshiftcount++;
-            for (int j = 0; j < numdatastreams; j++)
-                modes[j]->zeroAutocorrelations();
-        }
+        // ---------------------------------------------------------------------
+        // FINAL HOST TRANSFER
+        // ---------------------------------------------------------------------
+        // Instead of dragging un-averaged cross-correlations back, we do a single, 
+        // massive PCIe transfer of the final, properly formatted `results` array.
+        checkCuda(cudaMemcpyAsync(procslots[index].results, results_gpu, procslots[index].coreresultlength * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost, cuStream));
+        checkCuda(cudaStreamSynchronize(cuStream));
 
         //finally, update the baselineweight if not doing any pulsar stuff
         if (!procslots[index].pulsarbin) {
@@ -856,7 +855,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 //
 //    checkCuda(cudaFreeAsync(threadcrosscorrs_gpu, cuStream));
 //    checkCuda(cudaHostUnregister(scratchspace->threadcrosscorrs));
-//    checkCuda(cudaStreamDestroy(cuStream));
+    checkCuda(cudaStreamDestroy(cuStream));
 
     // The rest of this function uses an insignificant amount of time
     if (xcblockcount != 0) {
