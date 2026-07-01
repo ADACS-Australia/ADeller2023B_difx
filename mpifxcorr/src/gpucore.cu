@@ -132,14 +132,12 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     // Allocate the main results buffer
     checkCuda(cudaMalloc(&results_gpu, maxcoreresultlength * sizeof(cuFloatComplex)));
 
-    // Allocate the metadata arrays needed for the fused kernel
+    // Allocate the shared, frequency-independent FFT buffer pointer arrays (one
+    // entry per baseline). These are populated once per configuration by
+    // buildXmacPlans(). The per-frequency band-index/offset arrays are allocated
+    // lazily inside buildXmacPlans() and cached in xmacPlans.
     checkCuda(cudaMalloc(&d_m1_ptrs, numbaselines * sizeof(cuFloatComplex*)));
     checkCuda(cudaMalloc(&d_m2_ptrs, numbaselines * sizeof(cuFloatComplex*)));
-    checkCuda(cudaMalloc(&d_coreResultBaselineOffsets, numbaselines * sizeof(int)));
-    
-    // Allocate band index arrays (assuming max 4 polarizations as in your host arrays)
-    checkCuda(cudaMalloc(&d_stream1BandIndexes, numbaselines * 4 * sizeof(int)));
-    checkCuda(cudaMalloc(&d_stream2BandIndexes, numbaselines * 4 * sizeof(int)));
 }
 
 static unsigned long long avg_preprocess;
@@ -150,15 +148,118 @@ GPUCore::~GPUCore() {
     cout << "Average core post: " << avg_postprocess / core_calls << endl;
 
     // Clean up device memory
+    freeXmacPlans();
     checkCuda(cudaFree(results_gpu));
     checkCuda(cudaFree(d_m1_ptrs));
     checkCuda(cudaFree(d_m2_ptrs));
-    checkCuda(cudaFree(d_coreResultBaselineOffsets));
-    checkCuda(cudaFree(d_stream1BandIndexes));
-    checkCuda(cudaFree(d_stream2BandIndexes));
 
     // Destroy the stream last
     checkCuda(cudaStreamDestroy(cuStream));
+}
+
+void GPUCore::freeXmacPlans() {
+    for (auto &plan : xmacPlans) {
+        checkCuda(cudaFree(plan.d_stream1BandIndexes));
+        checkCuda(cudaFree(plan.d_stream2BandIndexes));
+        checkCuda(cudaFree(plan.d_coreResultBaselineOffsets));
+    }
+    xmacPlans.clear();
+    xmacPlanConfigIndex = -1;
+}
+
+// Precompute, once per configuration, all the DiFX config-tree metadata that the
+// fused XMAC kernel needs. This is invariant for a given configindex, so caching
+// it removes the per-subintegration host-side config walk and the redundant
+// device uploads that used to happen on every call to processgpudata().
+void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
+    // Drop any previously-cached plans (e.g. on a configuration change).
+    freeXmacPlans();
+
+    const int sampling_multiplier =
+        (config->getDSampling(configindex, 0) == Configuration::COMPLEX) ? 1 : 2;
+    const int numrecordedbands = config->getDNumRecordedBands(configindex, 0);
+
+    // The FFT buffer pointers depend only on the baseline's datastreams (not on
+    // frequency) and the GPUMode buffers never move, so they are gathered and
+    // uploaded once here and shared across all per-frequency launches.
+    const cuFloatComplex* h_m1_ptrs[numbaselines];
+    const cuFloatComplex* h_m2_ptrs[numbaselines];
+    for (int j = 0; j < numbaselines; j++) {
+        int ds1index = config->getBOrderedDataStream1Index(configindex, j);
+        int ds2index = config->getBOrderedDataStream2Index(configindex, j);
+        h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
+        h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->conj_fftd_gpu->gpuPtr();
+    }
+    checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numbaselines * sizeof(cuFloatComplex*),
+                             cudaMemcpyHostToDevice, cuStream));
+    checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numbaselines * sizeof(cuFloatComplex*),
+                             cudaMemcpyHostToDevice, cuStream));
+
+    for (int f = 0; f < config->getFreqTableLength(); f++) {
+        if (!config->isFrequencyUsed(configindex, f)) continue;
+
+        int freqchannels = config->getFNumChannels(f);
+        int channelstoaverage = config->getFChannelsToAverage(f);
+        int numPolarisationProducts = config->getBNumPolProducts(
+            configindex, 0, config->getBLocalFreqIndex(configindex, 0, f));
+
+        XmacFreqPlan plan;
+        plan.numPolarisationProducts = numPolarisationProducts;
+        plan.num_averaged_channels = freqchannels / channelstoaverage;
+        plan.channelstoaverage = channelstoaverage;
+        plan.fftchannels = freqchannels * sampling_multiplier;
+        plan.numrecordedbands = numrecordedbands;
+
+        // Gather the per-baseline band indexes and result offsets for this frequency.
+        int h_stream1BandIndexes[numbaselines * numPolarisationProducts];
+        int h_stream2BandIndexes[numbaselines * numPolarisationProducts];
+        int h_coreResultBaselineOffsets[numbaselines];
+        for (int j = 0; j < numbaselines; j++) {
+            int localfreqindex = config->getBLocalFreqIndex(configindex, j, f);
+            if (localfreqindex >= 0) {
+                h_coreResultBaselineOffsets[j] =
+                    config->getCoreResultBaselineOffset(configindex, f, j);
+                for (int p = 0; p < numPolarisationProducts; p++) {
+                    h_stream1BandIndexes[j * numPolarisationProducts + p] =
+                        config->getBDataStream1BandIndex(configindex, j, localfreqindex, p);
+                    h_stream2BandIndexes[j * numPolarisationProducts + p] =
+                        config->getBDataStream2BandIndex(configindex, j, localfreqindex, p);
+                }
+            } else {
+                // Baseline doesn't participate in this frequency; flag with -1 so
+                // the kernel early-returns for it.
+                h_coreResultBaselineOffsets[j] = -1;
+                for (int p = 0; p < numPolarisationProducts; p++) {
+                    h_stream1BandIndexes[j * numPolarisationProducts + p] = -1;
+                    h_stream2BandIndexes[j * numPolarisationProducts + p] = -1;
+                }
+            }
+        }
+
+        // Allocate persistent device arrays and upload the gathered metadata.
+        checkCuda(cudaMalloc(&plan.d_stream1BandIndexes,
+                             numbaselines * numPolarisationProducts * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2BandIndexes,
+                             numbaselines * numPolarisationProducts * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_coreResultBaselineOffsets, numbaselines * sizeof(int)));
+        checkCuda(cudaMemcpyAsync(plan.d_stream1BandIndexes, h_stream1BandIndexes,
+                                 numbaselines * numPolarisationProducts * sizeof(int),
+                                 cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_stream2BandIndexes, h_stream2BandIndexes,
+                                 numbaselines * numPolarisationProducts * sizeof(int),
+                                 cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_coreResultBaselineOffsets, h_coreResultBaselineOffsets,
+                                 numbaselines * sizeof(int),
+                                 cudaMemcpyHostToDevice, cuStream));
+
+        xmacPlans.push_back(plan);
+    }
+
+    // The uploads above source from host stack buffers that go out of scope when
+    // this function returns; synchronise so the (one-off) copies complete first.
+    checkCuda(cudaStreamSynchronize(cuStream));
+
+    xmacPlanConfigIndex = configindex;
 }
 
 void GPUCore::loopprocess(int threadid) {
@@ -715,69 +816,16 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         // Ensure the device-side results buffer is cleanly zeroed for this subint
         checkCuda(cudaMemsetAsync(results_gpu, 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
 
-        // Use stack-allocated, contiguous arrays to gather DiFX config metadata quickly.
-        // Copying these to the GPU ensures the GPU kernel doesn't have to query the host.
-        const cuFloatComplex* h_m1_ptrs[numbaselines];
-        const cuFloatComplex* h_m2_ptrs[numbaselines];
-        
-        // Assuming max 4 polarizations (RR, LL, RL, LR) for safety
-        int h_stream1BandIndexes[numbaselines * 4]; 
-        int h_stream2BandIndexes[numbaselines * 4];
-        int h_coreResultBaselineOffsets[numbaselines];
+        // The kernel launch metadata (band indexes, result offsets, channel/pol
+        // counts and the FFT buffer pointers) is invariant for a given
+        // configuration, so build/upload it once and reuse it across subints.
+        // It only needs (re)building on the first subint or a config change.
+        if (xmacPlanConfigIndex != procslots[index].configindex) {
+            buildXmacPlans(procslots[index].configindex, modes);
+        }
 
-        // Iterate over the output frequency table just like the CPU, but instead of 
-        // processing data, we are just mapping memory offsets.
-        for(int f=0; f < config->getFreqTableLength(); f++) {
-            if(!config->isFrequencyUsed(procslots[index].configindex, f)) continue;
-
-            int freqchannels = config->getFNumChannels(f);
-            int channelstoaverage = config->getFChannelsToAverage(f);
-            int num_averaged_channels = freqchannels / channelstoaverage;
-            
-            // Assume uniform polarization products for this simple continuum kernel
-            int numPolarisationProducts = config->getBNumPolProducts(
-                procslots[index].configindex, 0, config->getBLocalFreqIndex(procslots[index].configindex, 0, f));
-
-            // 1. Gather Metadata for all baselines for this Frequency
-            for (int j = 0; j < numbaselines; j++) {
-                int localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, j, f);
-                
-                if (localfreqindex >= 0) {
-                    int ds1index = config->getBOrderedDataStream1Index(procslots[index].configindex, j);
-                    int ds2index = config->getBOrderedDataStream2Index(procslots[index].configindex, j);
-                    
-                    // Grab the raw GPU pointers to the FFT output buffers directly from the GPUMode instances.
-                    // This prevents any unnecessary host-side copies.
-                    h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
-                    h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->conj_fftd_gpu->gpuPtr();
-                    
-                    // Fetch the pre-calculated offset for where this baseline's data belongs in the final array
-                    h_coreResultBaselineOffsets[j] = config->getCoreResultBaselineOffset(procslots[index].configindex, f, j);
-
-                    // Flatten the 2D [baseline][pol] band indexes into a 1D array for the GPU
-                    for (int p = 0; p < numPolarisationProducts; p++) {
-                        h_stream1BandIndexes[j * numPolarisationProducts + p] = config->getBDataStream1BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                        h_stream2BandIndexes[j * numPolarisationProducts + p] = config->getBDataStream2BandIndex(procslots[index].configindex, j, localfreqindex, p);
-                    }
-                } else {
-                    // Baseline doesn't participate in this frequency; flag with -1
-                    h_coreResultBaselineOffsets[j] = -1; 
-                    for (int p = 0; p < numPolarisationProducts; p++) {
-                        h_stream1BandIndexes[j * numPolarisationProducts + p] = -1;
-                        h_stream2BandIndexes[j * numPolarisationProducts + p] = -1;
-                    }
-                }
-            }
-
-            // 2. Async Copy Metadata to Device
-            // These transfers are tiny (just a few ints/pointers) and very fast.
-            checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numbaselines * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
-            checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numbaselines * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
-            checkCuda(cudaMemcpyAsync(d_coreResultBaselineOffsets, h_coreResultBaselineOffsets, numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
-            checkCuda(cudaMemcpyAsync(d_stream1BandIndexes, h_stream1BandIndexes, numbaselines * numPolarisationProducts * sizeof(int), cudaMemcpyHostToDevice, cuStream));
-            checkCuda(cudaMemcpyAsync(d_stream2BandIndexes, h_stream2BandIndexes, numbaselines * numPolarisationProducts * sizeof(int), cudaMemcpyHostToDevice, cuStream));
-
-            // 3. Launch Fused Kernel
+        // Launch one fused kernel per used frequency using the cached metadata.
+        for (const auto &plan : xmacPlans) {
             // Spread the averaged-channel dimension across the grid's z axis so
             // the launch fills the device rather than producing only
             // numbaselines*numPolarisationProducts blocks.
@@ -796,18 +844,17 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
             // below). Consider branching by regime to keep this fast path for the
             // many-channel case.
             dim3 threads(256); // output channels processed per block
-            dim3 blocks(numbaselines, numPolarisationProducts,
-                        (num_averaged_channels + threads.x - 1) / threads.x);
-            int sampling_multiplier = (config->getDSampling(procslots[index].configindex, 0) == Configuration::COMPLEX) ? 1 : 2;
+            dim3 blocks(numbaselines, plan.numPolarisationProducts,
+                        (plan.num_averaged_channels + threads.x - 1) / threads.x);
 
             gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
                 d_m1_ptrs, d_m2_ptrs,
-                d_stream1BandIndexes, d_stream2BandIndexes,
-                d_coreResultBaselineOffsets,
+                plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
+                plan.d_coreResultBaselineOffsets,
                 results_gpu,
-                numbaselines, numPolarisationProducts, numBufferedFFTs,
-                num_averaged_channels, channelstoaverage,
-                freqchannels*sampling_multiplier, config->getDNumRecordedBands(procslots[index].configindex, 0)
+                numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
+                plan.num_averaged_channels, plan.channelstoaverage,
+                plan.fftchannels, plan.numrecordedbands
             );
         }
 

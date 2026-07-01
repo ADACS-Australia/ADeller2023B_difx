@@ -3,7 +3,10 @@
 
 #include <cuda_runtime.h>
 #include <cuComplex.h>
+#include <vector>
 #include "core.h"
+
+class Mode;
 
 /**
  * @class GPUCore
@@ -48,40 +51,56 @@ private:
     cuFloatComplex* results_gpu;
 
     /**
-     * @brief Device pointers to the FFT output buffers for Datastream 1.
-     * In the CPU case, this is accessed dynamically via `modes[ds1index]->getFreqs()`. 
-     * Here, we copy an array of device pointers so the GPU kernel can read the 
-     * raw VRAM buffers directly without querying the host.
+     * @brief Device pointers to the FFT output buffers for Datastream 1 (one per baseline).
+     * In the CPU case, this is accessed dynamically via `modes[ds1index]->getFreqs()`.
+     * Here, we copy an array of device pointers so the GPU kernel can read the
+     * raw VRAM buffers directly without querying the host. These pointers are
+     * frequency-independent (they depend only on the baseline's datastream) and,
+     * because a GPUMode's fftd buffers are allocated once and never move, they are
+     * invariant for a given configuration - so they are populated once by
+     * buildXmacPlans() rather than every subintegration.
+     *
+     * NOTE: when the per-slot GPU buffer pool ([DEPTH] double/triple buffering)
+     * lands, these cached pointers will need to be rebuilt per slot.
      */
     const cuFloatComplex** d_m1_ptrs;
 
     /**
-     * @brief Device pointers to the conjugated FFT output buffers for Datastream 2.
-     * In the CPU case, accessed via `modes[ds2index]->getConjugatedFreqs()`.
+     * @brief Device pointers to the conjugated FFT output buffers for Datastream 2 (one per baseline).
+     * In the CPU case, accessed via `modes[ds2index]->getConjugatedFreqs()`. See d_m1_ptrs.
      */
     const cuFloatComplex** d_m2_ptrs;
 
     /**
-     * @brief Flattened array mapping a (baseline, polarisation) to a specific band in Datastream 1.
-     * Replaces the CPU's `config->getBDataStream1BandIndex(...)` lookups. 
-     * Pre-calculating this on the host prevents the GPU from needing to understand 
-     * the complex DiFX Configuration tree.
+     * @brief Cached, per-frequency launch metadata for the fused XMAC kernel.
+     *
+     * All of the DiFX Configuration lookups (band indexes, baseline result
+     * offsets, channel counts, pol-product counts) that feed a fused-kernel
+     * launch are invariant for a given configindex. Rather than re-walk the
+     * config tree and re-upload these small arrays on every subintegration, we
+     * compute them once per configuration in buildXmacPlans() and reuse them.
+     * The device arrays below are persistent (allocated in buildXmacPlans,
+     * freed in freeXmacPlans / on config change).
      */
-    int* d_stream1BandIndexes;
+    struct XmacFreqPlan {
+        int numPolarisationProducts;
+        int num_averaged_channels;
+        int channelstoaverage;
+        int fftchannels;          ///< freqchannels * sampling_multiplier
+        int numrecordedbands;
+        int* d_stream1BandIndexes;         ///< [numbaselines * numPolarisationProducts]
+        int* d_stream2BandIndexes;         ///< [numbaselines * numPolarisationProducts]
+        int* d_coreResultBaselineOffsets;  ///< [numbaselines]
+    };
+    std::vector<XmacFreqPlan> xmacPlans;
 
-    /**
-     * @brief Flattened array mapping a (baseline, polarisation) to a specific band in Datastream 2.
-     * Replaces the CPU's `config->getBDataStream2BandIndex(...)` lookups.
-     */
-    int* d_stream2BandIndexes;
+    /// The configindex the cached xmacPlans were built for (-1 = none yet).
+    int xmacPlanConfigIndex = -1;
 
-    /**
-     * @brief Pre-calculated starting offsets for each baseline in the final results array.
-     * Replaces `config->getCoreResultBaselineOffset(...)`. This is the secret to 
-     * bypassing `threadcrosscorrs`; it allows GPU threads to calculate their 
-     * final global memory address directly.
-     */
-    int* d_coreResultBaselineOffsets;
+    /// (Re)build the cached per-frequency XMAC launch metadata for a configuration.
+    void buildXmacPlans(int configindex, Mode **modes);
+    /// Free the device arrays held by the cached XMAC plans.
+    void freeXmacPlans();
 
     int cudaMaxThreadsPerBlock;
 };
