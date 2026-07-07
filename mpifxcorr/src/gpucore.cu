@@ -943,6 +943,24 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         checkCuda(cudaMemcpyAsync(procslots[index].results, results_gpu, procslots[index].coreresultlength * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost, cuStream));
         checkCuda(cudaStreamSynchronize(cuStream));
 
+        // Accumulate the autocorrelation block count and flush the modes'
+        // autocorrelations into the results buffer at the AC averaging
+        // cadence, exactly as Core::processdata does (the leftover-count
+        // flush after this loop handles the common maxacblocks > numblocks
+        // case). NOTE: this must stay after the results transfer above -
+        // that memcpy overwrites the entire results buffer (zeros in the
+        // autocorr region) and averageAndSendAutocorrs *adds* into it.
+        acblockcount += numfftsprocessed;
+        if (acblockcount == maxacblocks) {
+            averageAndSendAutocorrs(index, threadid,
+                                    (startblock + acshiftcount * maxacblocks + ((double) maxacblocks) / 2.0) * blockns,
+                                    maxacblocks * blockns, modes, scratchspace);
+            acblockcount = 0;
+            acshiftcount++;
+            for (int j = 0; j < numdatastreams; j++)
+                modes[j]->zeroAutocorrelations();
+        }
+
         //finally, update the baselineweight if not doing any pulsar stuff
         if (!procslots[index].pulsarbin) {
             for (int fftsubloop = 0; fftsubloop < numBufferedFFTs; fftsubloop++) {
