@@ -241,7 +241,7 @@ compare_modes() {
             continue
         fi
         ( set +u; . "$SETUP_SCRIPT"; set -u; \
-          diffDiFX.py -i "$input" -t "$DIFF_THRESHOLD" "$f" "$bfile" ) \
+          diffDiFX.py --diagnose -i "$input" -t "$DIFF_THRESHOLD" "$f" "$bfile" ) \
           > "$log" 2>&1
         res="$(evaluate_diff "$log")"
         case "$res" in
