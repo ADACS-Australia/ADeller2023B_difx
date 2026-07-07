@@ -128,7 +128,10 @@ prep_mode() {
     done
 
     # Generate .input/.calc/.im in a subshell using this mode's DiFX build.
-    if ( set -e; . "$setup"; cd "$jobdir"; \
+    # DiFX setup scripts routinely reference variables they haven't set yet
+    # (e.g. appending to an empty PATH-like variable), so drop nounset while
+    # sourcing them; the subshell keeps set -e for the actual commands.
+    if ( set -e; set +u; . "$setup"; set -u; cd "$jobdir"; \
          vex2difx "$v2d"; difxcalc "${expname}.calc" ) \
          > "$jobdir/prep.log" 2>&1; then
         write_sbatch "$mode" "$expname" "$jobdir" >/dev/null
@@ -228,7 +231,7 @@ compare_modes() {
             overall=ERROR
             continue
         fi
-        ( . "$SETUP_SCRIPT"; \
+        ( set +u; . "$SETUP_SCRIPT"; set -u; \
           diffDiFX.py -i "$input" -t "$DIFF_THRESHOLD" "$f" "$bfile" ) \
           > "$log" 2>&1
         res="$(evaluate_diff "$log")"
