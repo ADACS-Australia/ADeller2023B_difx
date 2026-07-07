@@ -1,10 +1,27 @@
 #include <mutex>
+#include <cstdlib>
+#include <cstdio>
 #include "cpumode.h"
 #include "alert.h"
 
 static int debug_dataweight_cpu_prints = 0;
 static int debug_dataweight_cpu_prints_invalid = 0;
 static int debug_dataweight_cpu_calls = 0;
+
+// Env-gated per-FFT-window weight tracing for CPU-vs-GPU debugging: set
+// DIFX_WEIGHT_DEBUG=<datasec> to emit one WDEBUG line per FFT window for all
+// subints with datasec >= <datasec>. The format is identical to the one in
+// GPUMode::set_weights (gpumode.cu) so the grepped logs diff directly.
+static int weightDebugFrom()
+{
+  static int from = -2;
+  if(from == -2)
+  {
+    const char* e = getenv("DIFX_WEIGHT_DEBUG");
+    from = (e != NULL) ? atoi(e) : -1;
+  }
+  return from;
+}
 
 CPUMode::CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock):
     Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, bclock)
@@ -116,6 +133,9 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
         csevere << startl << "Error trying to zero fftoutputs when data is bad!" << endl;
     }
     //cout << "Mode for DS " << datastreamindex << " is bailing out of index " << index << "/" << subloopindex << " which is scan " << currentscan << ", sec " << offsetseconds << ", ns " << offsetns << " because datalengthbytes is " << datalengthbytes << " and validflag was " << ((validflags[index/FLAGS_PER_INT] >> (index%FLAGS_PER_INT)) & 0x01) << endl;
+    if(weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+      fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=0.000000000 valid=0 reason=rejected\n",
+              datastreamindex, datasec, datans, index, -999999);
     return; //don't process crap data
   }
 
@@ -148,6 +168,9 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
       if(status != vecNoErr)
         csevere << startl << "Error trying to zero fftoutputs when data is bad!" << endl;
     }
+    if(weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+      fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=0.000000000 valid=0 reason=rejected\n",
+              datastreamindex, datasec, datans, index, nearestsample);
     return;
   }
   if(nearestsample == -1)
@@ -158,6 +181,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
   else if(nearestsample < unpackstartsamples || nearestsample > unpackstartsamples + unpacksamples - fftchannels)
     //need to unpack more data
     dataweight[subloopindex] = unpack(nearestsample, subloopindex);
+  if(weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+    fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=%.9f valid=%d reason=ok\n",
+            datastreamindex, datasec, datans, index, nearestsample, dataweight[subloopindex],
+            (dataweight[subloopindex] > 0.0) ? 1 : 0);
 
  /*
   * After DiFX-2.4, it is proposed to change the handling of lower sideband and dual sideband data, such

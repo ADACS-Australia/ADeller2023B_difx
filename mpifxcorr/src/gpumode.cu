@@ -12,6 +12,8 @@
 #include <omp.h>
 #include <thread>
 #include <mutex>
+#include <cstdlib>
+#include <cstdio>
 #include "mathutil.h"
 #include <unistd.h>
 
@@ -762,6 +764,20 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
     return true;
 }
 
+// Env-gated per-FFT-window weight tracing for CPU-vs-GPU debugging: set
+// DIFX_WEIGHT_DEBUG=<datasec> to emit one WDEBUG line per FFT window for all
+// subints with datasec >= <datasec>. The format is identical to the one in
+// CPUMode::process (cpumode.cpp) so the grepped logs diff directly.
+static int weightDebugFrom()
+{
+    static int from = -2;
+    if (from == -2) {
+        const char* e = getenv("DIFX_WEIGHT_DEBUG");
+        from = (e != NULL) ? atoi(e) : -1;
+    }
+    return from;
+}
+
 void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBufferedFFTs) {
 
     int framesamples = config->getMultiplexedFramePayloadBytes(configindex, datastreamindex)*8/(config->getDNumBits(configindex, datastreamindex)*config->getDNumRecordedBands(configindex, datastreamindex)*config->getDDecimationFactor(configindex, datastreamindex));
@@ -793,11 +809,14 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
         //std::cout << "subloopindex = " << subloopindex << ", validity_index = " << validity_index << std::endl;
     //}
     if (!is_data_valid(subloopindex, subloopindex)) {
-        
+
         // since these data weights can be retreived after this processing ends, reset them to a default of zero in case they don't get updated
         dataweight[subloopindex] = 0.0;
 
         gValidSamples->ptr()[subloopindex] = false;
+        if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+            fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=0.000000000 valid=0 reason=rejected\n",
+                    datastreamindex, datasec, datans, subloopindex, nearestSamples->ptr()[subloopindex]);
         return;
     }
     //std::cout << "Data is valid for subloopindex " << subloopindex << std::endl;
@@ -902,6 +921,11 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
             }
         }
     }
+
+    if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+        fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=%.9f valid=%d reason=ok\n",
+                datastreamindex, datasec, datans, subloopindex, nearestSamples->ptr()[subloopindex],
+                dataweight[subloopindex], gValidSamples->ptr()[subloopindex] ? 1 : 0);
 }
 
 void GPUMode::calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks) {
