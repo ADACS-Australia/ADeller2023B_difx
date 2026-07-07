@@ -189,27 +189,23 @@ GPUCore::~GPUCore() {
         cout << "Average core post: " << avg_postprocess / core_calls << endl;
     }
 
-    // Clean up device memory. This destructor runs during process cleanup,
-    // after MPI_Finalize, by which point the CUDA context may already have
-    // been torn down (cudaErrorContextIsDestroyed / cudaErrorCudartUnloading)
-    // - so teardown is best-effort: never checkCuda (which exits) here.
-    freeXmacPlans();
-    cudaFree(results_gpu);
-    cudaFree(d_m1_ptrs);
-    cudaFree(d_m2_ptrs);
-    cudaFree(d_v1_ptrs);
-    cudaFree(d_v2_ptrs);
-
-    // Destroy the stream last
-    cudaStreamDestroy(cuStream);
+    // Deliberately make NO CUDA calls here. This destructor only runs at
+    // process teardown (end of main, after MPI_Finalize), by which point the
+    // CUDA driver may already have destroyed the context via its own atexit
+    // handlers - and calls like cudaStreamDestroy on the now-stale handles
+    // don't just return an error, they can segfault inside libcuda (observed
+    // with CUDA 12.8). The process is exiting and the driver reclaims all
+    // device memory and streams itself, so freeing results_gpu, the pointer
+    // arrays, the cached XMAC plans and cuStream here would gain nothing.
 }
 
 void GPUCore::freeXmacPlans() {
-    // Best-effort (see ~GPUCore): may run after the CUDA context is gone.
+    // Only called while the CUDA context is alive (from buildXmacPlans on a
+    // configuration change) - NOT from the destructor; see ~GPUCore.
     for (auto &plan : xmacPlans) {
-        cudaFree(plan.d_stream1BandIndexes);
-        cudaFree(plan.d_stream2BandIndexes);
-        cudaFree(plan.d_coreResultBaselineOffsets);
+        checkCuda(cudaFree(plan.d_stream1BandIndexes));
+        checkCuda(cudaFree(plan.d_stream2BandIndexes));
+        checkCuda(cudaFree(plan.d_coreResultBaselineOffsets));
     }
     xmacPlans.clear();
     xmacPlanConfigIndex = -1;
