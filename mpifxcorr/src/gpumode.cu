@@ -82,6 +82,10 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     //          << " usecomplex=" << usecomplex << std::endl;
 
 
+    // Per-band capacity of the unpacked sample buffers; also the stride
+    // between bands within unpackeddata_gpu / complex_unpackeddata_gpu.
+    unpackedarrays_elem_count = unpacked_size;
+
     // What's the largest number of FFTs we can fit?
     cfg_numBufferedFFTs = (unpacked_size + fftchannels - 1) / fftchannels;
     //std::cout << "Working on " << cfg_numBufferedFFTs << " FFTs" << std::endl;
@@ -567,6 +571,32 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     packeddata_gpu->sync();
     unpack_all(framestounpack);
 
+    // The unpack kernel only decoded framestounpack frames; beyond that the
+    // unpacked buffers still hold samples from the previous subintegration.
+    // Zero the tail so an FFT window that straddles the end of the delivered
+    // data (processed with a fractional weight, see set_weights) sees zeros
+    // for its missing samples - exactly what the CPU path's unpacker leaves
+    // there. Mid-scan the buffers are full and this is a no-op.
+    {
+        int tail_framesamples = config->getMultiplexedFramePayloadBytes(configindex, datastreamindex)*8 /
+            (config->getDNumBits(configindex, datastreamindex)*config->getDNumRecordedBands(configindex, datastreamindex)*config->getDDecimationFactor(configindex, datastreamindex));
+        if (usecomplex)
+            tail_framesamples /= 2;
+        size_t loadedsamples = (size_t)framestounpack * tail_framesamples;
+        if (loadedsamples < unpackedarrays_elem_count) {
+            size_t tail = unpackedarrays_elem_count - loadedsamples;
+            for (int b = 0; b < numrecordedbands; b++) {
+                if (usecomplex) {
+                    checkCuda(cudaMemsetAsync(complex_unpackeddata_gpu->gpuPtr() + b*unpackedarrays_elem_count + loadedsamples,
+                                              0, tail * sizeof(cuFloatComplex), cuStream));
+                } else {
+                    checkCuda(cudaMemsetAsync(unpackeddata_gpu->gpuPtr() + b*unpackedarrays_elem_count + loadedsamples,
+                                              0, tail * sizeof(float), cuStream));
+                }
+            }
+        }
+    }
+
     cudaEventRecord(ev_unpack, cuStream);
    
     // ==========================================
@@ -822,32 +852,41 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
     //std::cout << "Data is valid for subloopindex " << subloopindex << std::endl;
     gValidSamples->ptr()[subloopindex] = true;
 
+    // Frames at or beyond nframes were not delivered in this subintegration:
+    // valid_frames (and the unpacked buffers) hold stale values from the
+    // previous subint there, so such frames must count as invalid. This gives
+    // an FFT window straddling the end of the delivered data the same
+    // fractional weight the CPU path's unpacker returns (its missing samples
+    // are zeroed after unpacking, also matching the CPU).
+    auto frame_ok = [&](int frame) -> float {
+        return (frame >= 0 && frame < nframes && valid_frames->ptr()[frame]) ? 1.0f : 0.0f;
+    };
+
     if (nearestSamples->ptr()[subloopindex] == -1) {
         nearestSamples->ptr()[subloopindex] = 0;
         dataweight[subloopindex] = 1.0;
         cerr << "Why is this happening?" << std::endl;      // I'm not sure what case this branch is for
         abort();
-    } else if (subloopindex + 1 == numBufferedFFTs) {
-        // We are in the last loop
-        if (nearestSamples->ptr()[subloopindex] + fftchannels > nframes * framesamples) {
-            cerr << "This FFT window is trying to cross into unloaded data" << std::endl;
-            abort();
-        } else {
-            int start_frame = nearestSamples->ptr()[subloopindex] / framesamples;
-            dataweight[subloopindex] = (float)valid_frames->ptr()[start_frame];
-        }
-    } else if (nearestSamples->ptr()[subloopindex] < unpackstartsamples || nearestSamples->ptr()[subloopindex] > unpackstartsamples + unpacksamples - fftchannels) {
+    } else if (nearestSamples->ptr()[subloopindex] < unpackstartsamples ||
+               nearestSamples->ptr()[subloopindex] > unpackstartsamples + unpacksamples - fftchannels ||
+               subloopindex + 1 == numBufferedFFTs) {
         //std::cout << "Entered standard path subloopindex = " << subloopindex << ", nearestSamples = " << nearestSamples->ptr()[subloopindex] << ", unpackstartsamples = " << unpackstartsamples << ", unpacksamples = " << unpacksamples << ", fftchannels = " << fftchannels << std::endl;
         // Standard path. TODO: above condition can be simplified I think
         int start_frame = nearestSamples->ptr()[subloopindex] / framesamples;
-        int end_frame = (nearestSamples->ptr()[subloopindex + 1] - 1) / framesamples;
+        // The last window of the batch has no successor to consult, so use
+        // its own extent to locate its final frame.
+        int end_frame;
+        if (subloopindex + 1 == numBufferedFFTs)
+            end_frame = (nearestSamples->ptr()[subloopindex] + fftchannels - 1) / framesamples;
+        else
+            end_frame = (nearestSamples->ptr()[subloopindex + 1] - 1) / framesamples;
         if (start_frame == end_frame) {
             // This FFT window does not cross a frame boundary
-            dataweight[subloopindex] = valid_frames->ptr()[start_frame] * 1.0;
+            dataweight[subloopindex] = frame_ok(start_frame);
         } else if (start_frame + 1 == end_frame) {
             // Crosses frame boundary: set weight proportional to occupancy in each frame
             float frac_first_frame = (float)(end_frame * framesamples - nearestSamples->ptr()[subloopindex]) / (float)fftchannels;
-            dataweight[subloopindex] = (frac_first_frame) * valid_frames->ptr()[start_frame] + (1 - frac_first_frame) * valid_frames->ptr()[end_frame];
+            dataweight[subloopindex] = (frac_first_frame) * frame_ok(start_frame) + (1 - frac_first_frame) * frame_ok(end_frame);
         } else {
             cerr << "FFT window somehow spans more than two frames. This is suspicious to me but maybe allowed?" << std::endl;
             abort();
