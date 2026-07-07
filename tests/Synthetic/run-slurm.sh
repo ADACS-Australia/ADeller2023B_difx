@@ -174,7 +174,16 @@ echo "Waiting for all jobs to complete ..."
 i=0
 while [ "$i" -lt "${#job_pids[@]}" ]; do
     wait "${job_pids[$i]}"
-    state_set "rc~${job_keys[$i]}" "$?"
+    rc=$?
+    state_set "rc~${job_keys[$i]}" "$rc"
+    scen="${job_keys[$i]%%~*}"
+    mode="${job_keys[$i]##*~}"
+    if [ "$rc" -eq 0 ]; then
+        echo "  [$scen/$mode] job completed"
+    else
+        echo "  [$scen/$mode] job FAILED (sbatch --wait rc=$rc):" \
+             "check $WORKDIR/$scen/$mode/sbatch.out and ${mode}.mpilog" >&2
+    fi
     i=$((i + 1))
 done
 echo
@@ -250,11 +259,13 @@ for scen in "${SCENARIOS[@]}"; do
         # If either job errored/failed to produce output, the comparison errors.
         if [ "$(state_get "rc~$scen~$a")" != 0 ] || [ "$(state_get "rc~$scen~$b")" != 0 ]; then
             res=ERROR
+            note=" (a correlation job exited nonzero; diff not attempted)"
         else
             res="$(compare_modes "$scen" "$a" "$b")"
+            note=""
         fi
         state_set "result~$scen~$cmp" "$res"
-        echo "  [$scen] $cmp -> $res"
+        echo "  [$scen] $cmp -> $res$note"
     done
 done
 echo

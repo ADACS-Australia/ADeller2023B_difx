@@ -46,6 +46,11 @@ public:
     [[nodiscard]] const cf32* getGpuConjugatedFreqsHost(int outputband, int subloopindex) const override {
         return (const cf32*) &conj_fftd_gpu->ptr()[(subloopindex * fftchannels * numrecordedbands) + (outputband * fftchannels)];
     }
+    /// Device-side per-FFT validity flags. Invalid FFT windows have stale
+    /// (never zeroed) spectra in fftd_gpu/conj_fftd_gpu - the mode kernels
+    /// skip them - so consumers (the XMAC kernel) must exclude them; the CPU
+    /// path instead zeroes such spectra so they contribute nothing.
+    [[nodiscard]] const bool* getGpuValidSamples() const { return gValidSamples->gpuPtr(); }
 
     GpuMemHelper<cuFloatComplex> *fftd_gpu;
     GpuMemHelper<cuFloatComplex> *conj_fftd_gpu;

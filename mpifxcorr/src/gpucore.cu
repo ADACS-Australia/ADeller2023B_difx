@@ -30,14 +30,24 @@ __device__ void atomicAddFloatComplex1(cuFloatComplex* a, cuFloatComplex b){
  * The output averaged-channel dimension is spread across BOTH the block
  * (threadIdx.x) and the grid (blockIdx.z) so that the launch produces enough
  * blocks to fill the device, rather than the numbaselines*numpol (~handful)
- * blocks of the previous grid-stride design. Each thread owns exactly one
- * output channel and, since every (baseline, pol, avg_chan) maps to a unique
- * slot in the pre-zeroed results buffer within a launch, it writes with a
- * plain store instead of an atomic add.
+ * blocks of the previous grid-stride design.
+ *
+ * When baselines*pols*channels alone cannot fill the device (the geodesy
+ * regime: 1-6 baselines, often 1 pol, modest channel counts), the FFT/time
+ * dimension is also split across blockIdx.z: the host divides the
+ * numBufferedFFTs integration into chunks of fftsPerChunk FFTs, and each block
+ * accumulates a partial sum over its chunk. With a single chunk every
+ * (baseline, pol, avg_chan) maps to a unique slot in the pre-zeroed results
+ * buffer, so the thread writes its total with a plain store; with multiple
+ * chunks the partial sums are combined with an atomic add into the pre-zeroed
+ * slot (the extra atomic traffic is one add per chunk, only taken when the
+ * grid would otherwise be too small to occupy the device anyway).
  */
 __global__ void gpu_fuse_xmac_and_average(
         const cuFloatComplex* const * const gpuM1Freqs,
         const cuFloatComplex* const * const gpuM2Freqs,
+        const bool* const * const gpuM1Valid,
+        const bool* const * const gpuM2Valid,
         const int* const stream1BandIndexes,
         const int* const stream2BandIndexes,
         const int* const coreResultBaselineOffsets,
@@ -45,6 +55,7 @@ __global__ void gpu_fuse_xmac_and_average(
         int numbaselines,
         int numPolarisationProducts,
         int numBufferedFFTs,
+        int fftsPerChunk,
         int num_averaged_channels,
         int channelstoaverage,
         int fftchannels,
@@ -52,16 +63,27 @@ __global__ void gpu_fuse_xmac_and_average(
 ) {
     // gridDim.x  = numbaselines
     // gridDim.y  = numPolarisationProducts
-    // gridDim.z  = ceil(num_averaged_channels / blockDim.x)
-    // blockDim.x = output averaged channels processed per block (e.g. 256)
+    // gridDim.z  = numChanBlocks * numFftChunks, where
+    //              numChanBlocks = ceil(num_averaged_channels / blockDim.x)
+    //              numFftChunks  = ceil(numBufferedFFTs / fftsPerChunk)
+    // blockDim.x = output averaged channels processed per block (<= 256)
 
     int baseline = blockIdx.x;
     int pol = blockIdx.y;
 
-    // Each thread owns exactly one output averaged channel, indexed across both
-    // the block and the grid's z dimension.
-    int avg_chan = blockIdx.z * blockDim.x + threadIdx.x;
+    // Unpack the combined (FFT chunk, channel block) z index.
+    int numChanBlocks = (num_averaged_channels + blockDim.x - 1) / blockDim.x;
+    int fftChunk = blockIdx.z / numChanBlocks;
+    int chanBlock = blockIdx.z % numChanBlocks;
+
+    // Each thread owns exactly one output averaged channel within its FFT chunk.
+    int avg_chan = chanBlock * blockDim.x + threadIdx.x;
     if (avg_chan >= num_averaged_channels) return;
+
+    // The range of buffered FFTs this block integrates over.
+    int fft_begin = fftChunk * fftsPerChunk;
+    int fft_end = fft_begin + fftsPerChunk;
+    if (fft_end > numBufferedFFTs) fft_end = numBufferedFFTs;
 
     // 1. Resolve Band Indexes
     // We pre-flattened the 2D [baseline][pol] config arrays on the host.
@@ -73,9 +95,18 @@ __global__ void gpu_fuse_xmac_and_average(
 
     cuFloatComplex sum = make_cuFloatComplex(0.0f, 0.0f);
 
+    const bool* valid1 = gpuM1Valid[baseline];
+    const bool* valid2 = gpuM2Valid[baseline];
+
     // 2. Time Integration
-    // Summation over all FFTs currently residing in the GPU buffer.
-    for (int fft = 0; fft < numBufferedFFTs; fft++) {
+    // Summation over this block's chunk of the FFTs residing in the GPU buffer.
+    for (int fft = fft_begin; fft < fft_end; fft++) {
+
+        // Skip FFT windows that were invalid on either datastream: the mode
+        // kernels leave their spectra stale/uninitialised in the FFT buffers.
+        // The CPU path zeroes such spectra, so skipping matches it exactly
+        // (zero contribution, and the data weight already excludes them).
+        if (!valid1[fft] || !valid2[fft]) continue;
 
         // Calculate the absolute starting index for this specific FFT and Band
         int base_idx1 = (fft * numrecordedbands + b1) * fftchannels;
@@ -109,10 +140,16 @@ __global__ void gpu_fuse_xmac_and_average(
     int pol_offset = pol * num_averaged_channels;
     int final_index = base_offset + pol_offset + avg_chan;
 
-    // This (baseline, pol, avg_chan) triple is unique within the launch and the
-    // results buffer was pre-zeroed, so a plain store is correct and avoids the
-    // serialisation of an atomic add.
-    results_gpu[final_index] = sum;
+    if (fftsPerChunk >= numBufferedFFTs) {
+        // Single FFT chunk: this (baseline, pol, avg_chan) triple is unique
+        // within the launch and the results buffer was pre-zeroed, so a plain
+        // store is correct and avoids the serialisation of an atomic add.
+        results_gpu[final_index] = sum;
+    } else {
+        // Multiple FFT chunks contribute partial sums to the same pre-zeroed
+        // output slot; combine them atomically.
+        atomicAddFloatComplex1(&results_gpu[final_index], sum);
+    }
 }
 
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)
@@ -121,6 +158,7 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     checkCuda(cudaGetDeviceProperties(&prop, 0));
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
+    cudaMultiProcessorCount = prop.multiProcessorCount;
     if(numprocessthreads > 1) {
       cerr << "GPU DiFX must have 1 thread per Core process - had " << numprocessthreads << endl;
       exit(1);
@@ -138,30 +176,40 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     // lazily inside buildXmacPlans() and cached in xmacPlans.
     checkCuda(cudaMalloc(&d_m1_ptrs, numbaselines * sizeof(cuFloatComplex*)));
     checkCuda(cudaMalloc(&d_m2_ptrs, numbaselines * sizeof(cuFloatComplex*)));
+    checkCuda(cudaMalloc(&d_v1_ptrs, numbaselines * sizeof(bool*)));
+    checkCuda(cudaMalloc(&d_v2_ptrs, numbaselines * sizeof(bool*)));
 }
 
 static unsigned long long avg_preprocess;
 static unsigned long long avg_postprocess;
 int core_calls;
 GPUCore::~GPUCore() {
-    cout << "Average core pre: " << avg_preprocess / core_calls << endl;
-    cout << "Average core post: " << avg_postprocess / core_calls << endl;
+    if (core_calls > 0) {
+        cout << "Average core pre: " << avg_preprocess / core_calls << endl;
+        cout << "Average core post: " << avg_postprocess / core_calls << endl;
+    }
 
-    // Clean up device memory
+    // Clean up device memory. This destructor runs during process cleanup,
+    // after MPI_Finalize, by which point the CUDA context may already have
+    // been torn down (cudaErrorContextIsDestroyed / cudaErrorCudartUnloading)
+    // - so teardown is best-effort: never checkCuda (which exits) here.
     freeXmacPlans();
-    checkCuda(cudaFree(results_gpu));
-    checkCuda(cudaFree(d_m1_ptrs));
-    checkCuda(cudaFree(d_m2_ptrs));
+    cudaFree(results_gpu);
+    cudaFree(d_m1_ptrs);
+    cudaFree(d_m2_ptrs);
+    cudaFree(d_v1_ptrs);
+    cudaFree(d_v2_ptrs);
 
     // Destroy the stream last
-    checkCuda(cudaStreamDestroy(cuStream));
+    cudaStreamDestroy(cuStream);
 }
 
 void GPUCore::freeXmacPlans() {
+    // Best-effort (see ~GPUCore): may run after the CUDA context is gone.
     for (auto &plan : xmacPlans) {
-        checkCuda(cudaFree(plan.d_stream1BandIndexes));
-        checkCuda(cudaFree(plan.d_stream2BandIndexes));
-        checkCuda(cudaFree(plan.d_coreResultBaselineOffsets));
+        cudaFree(plan.d_stream1BandIndexes);
+        cudaFree(plan.d_stream2BandIndexes);
+        cudaFree(plan.d_coreResultBaselineOffsets);
     }
     xmacPlans.clear();
     xmacPlanConfigIndex = -1;
@@ -184,15 +232,23 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
     // uploaded once here and shared across all per-frequency launches.
     const cuFloatComplex* h_m1_ptrs[numbaselines];
     const cuFloatComplex* h_m2_ptrs[numbaselines];
+    const bool* h_v1_ptrs[numbaselines];
+    const bool* h_v2_ptrs[numbaselines];
     for (int j = 0; j < numbaselines; j++) {
         int ds1index = config->getBOrderedDataStream1Index(configindex, j);
         int ds2index = config->getBOrderedDataStream2Index(configindex, j);
         h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
         h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->conj_fftd_gpu->gpuPtr();
+        h_v1_ptrs[j] = ((GPUMode*)modes[ds1index])->getGpuValidSamples();
+        h_v2_ptrs[j] = ((GPUMode*)modes[ds2index])->getGpuValidSamples();
     }
     checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numbaselines * sizeof(cuFloatComplex*),
                              cudaMemcpyHostToDevice, cuStream));
     checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numbaselines * sizeof(cuFloatComplex*),
+                             cudaMemcpyHostToDevice, cuStream));
+    checkCuda(cudaMemcpyAsync(d_v1_ptrs, h_v1_ptrs, numbaselines * sizeof(bool*),
+                             cudaMemcpyHostToDevice, cuStream));
+    checkCuda(cudaMemcpyAsync(d_v2_ptrs, h_v2_ptrs, numbaselines * sizeof(bool*),
                              cudaMemcpyHostToDevice, cuStream));
 
     for (int f = 0; f < config->getFreqTableLength(); f++) {
@@ -828,31 +884,56 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         for (const auto &plan : xmacPlans) {
             // Spread the averaged-channel dimension across the grid's z axis so
             // the launch fills the device rather than producing only
-            // numbaselines*numPolarisationProducts blocks.
-            //
-            // TODO (next perf task): promote the FFT/time dimension into the grid.
-            // This grid only has good occupancy when there are many averaged
-            // channels. In the geodesy regime (typically 1/3/6 baselines and
-            // often 1 pol) numbaselines*numPolarisationProducts is tiny and the
-            // channel count may be modest, so the device is under-occupied while
-            // each thread serially integrates over numBufferedFFTs (which is
-            // large). Add a grid dimension over FFTs (or FFT chunks), have
-            // threads accumulate partial sums, then reduce across the FFT
-            // dimension per output channel (this will need an atomic add or a
-            // two-pass/shared-memory reduction, since multiple blocks would then
-            // write the same output slot - unlike the single-store fast path
-            // below). Consider branching by regime to keep this fast path for the
-            // many-channel case.
-            dim3 threads(256); // output channels processed per block
+            // numbaselines*numPolarisationProducts blocks. Shrink the block when
+            // there are fewer channels than the default so idle threads don't
+            // hold SM slots (down to one warp).
+            int threadsPerBlock = 256;
+            if (plan.num_averaged_channels < threadsPerBlock)
+                threadsPerBlock = ((plan.num_averaged_channels + 31) / 32) * 32;
+            int numChanBlocks =
+                (plan.num_averaged_channels + threadsPerBlock - 1) / threadsPerBlock;
+
+            // If baselines*pols*channels alone can't occupy the device (the
+            // geodesy regime: 1-6 baselines, often 1 pol, modest channel
+            // counts), also split the FFT/time integration across the grid, in
+            // chunks of fftsPerChunk FFTs whose partial sums the kernel combines
+            // with an atomic add. Otherwise keep a single chunk, which preserves
+            // the plain-store (no atomics) fast path for the many-channel case.
+            const long long launchThreads =
+                (long long)numbaselines * plan.numPolarisationProducts *
+                numChanBlocks * threadsPerBlock;
+            const long long targetThreads = (long long)cudaMultiProcessorCount * 2048;
+            int numFftChunks = 1;
+            if (launchThreads < targetThreads) {
+                numFftChunks = (int)((targetThreads + launchThreads - 1) / launchThreads);
+                if (numFftChunks > numBufferedFFTs)
+                    numFftChunks = numBufferedFFTs;
+                // Respect the 65535 gridDim.z hardware limit.
+                if (numFftChunks > 65535 / numChanBlocks)
+                    numFftChunks = 65535 / numChanBlocks;
+                if (numFftChunks < 1)
+                    numFftChunks = 1;
+            }
+            int fftsPerChunk = (numBufferedFFTs + numFftChunks - 1) / numFftChunks;
+            if (fftsPerChunk < 1) // degenerate numBufferedFFTs == 0 slot
+                fftsPerChunk = 1;
+            // Recompute so the grid has no empty trailing chunks.
+            numFftChunks = (numBufferedFFTs + fftsPerChunk - 1) / fftsPerChunk;
+            if (numFftChunks < 1)
+                numFftChunks = 1;
+
+            dim3 threads(threadsPerBlock);
             dim3 blocks(numbaselines, plan.numPolarisationProducts,
-                        (plan.num_averaged_channels + threads.x - 1) / threads.x);
+                        numChanBlocks * numFftChunks);
 
             gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
                 d_m1_ptrs, d_m2_ptrs,
+                d_v1_ptrs, d_v2_ptrs,
                 plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
                 plan.d_coreResultBaselineOffsets,
                 results_gpu,
                 numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
+                fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
                 plan.fftchannels, plan.numrecordedbands
             );
@@ -933,11 +1014,14 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
     checkCuda(cudaStreamDestroy(cuStream));
 
     // The rest of this function uses an insignificant amount of time
-    if (xcblockcount != 0) {
-        uvshiftAndAverage(index, threadid,
-                          (startblock + xcshiftcount * maxxcblocks + ((double) xcblockcount) / 2.0) * blockns,
-                          xcblockcount * blockns, currentpolyco, scratchspace);
-    }
+    //
+    // NOTE: unlike Core::processdata we must NOT call uvshiftAndAverage here.
+    // The fused XMAC kernel has already written the final averaged cross
+    // correlations directly into procslots[index].results, and nothing on the
+    // GPU path fills scratchspace->threadcrosscorrs - so the CPU averaging
+    // would add uninitialised memory on top of the correct visibilities.
+    // (This also means multiple phase centres / pulsar binning, which rely on
+    // uvshiftAndAverage, are not supported on the GPU path.)
     if (acblockcount != 0) {
         averageAndSendAutocorrs(index, threadid,
                                 (startblock + acshiftcount * maxacblocks + ((double) acblockcount) / 2.0) * blockns,

@@ -72,6 +72,16 @@ private:
     const cuFloatComplex** d_m2_ptrs;
 
     /**
+     * @brief Device pointers to the per-FFT validity flags of each baseline's
+     * two datastreams (one entry per baseline, like d_m1_ptrs/d_m2_ptrs).
+     * Invalid FFT windows hold stale spectra in the modes' FFT buffers, so the
+     * fused XMAC kernel skips any FFT flagged invalid on either datastream
+     * (the CPU path zeroes such spectra, making their contribution zero).
+     */
+    const bool** d_v1_ptrs;
+    const bool** d_v2_ptrs;
+
+    /**
      * @brief Cached, per-frequency launch metadata for the fused XMAC kernel.
      *
      * All of the DiFX Configuration lookups (band indexes, baseline result
@@ -103,6 +113,8 @@ private:
     void freeXmacPlans();
 
     int cudaMaxThreadsPerBlock;
+    /// SM count of the device, used to size the fused-XMAC launch grid.
+    int cudaMultiProcessorCount;
 };
 
 #endif
