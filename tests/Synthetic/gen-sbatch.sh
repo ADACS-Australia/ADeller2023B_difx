@@ -66,6 +66,13 @@ write_sbatch() {
         echo "export DIFX_MESSAGE_GROUP=\`hostname -i\`"
         echo "export DIFX_BINARY_GROUP=\`hostname -i\`"
         echo ""
+        # Bake debug variables into the job script: sbatch environment export
+        # cannot be relied on (sites configure --export=NONE), and the srun'd
+        # tasks must see these.
+        if [ -n "${DIFX_WEIGHT_DEBUG:-}" ]; then
+            echo "export DIFX_WEIGHT_DEBUG=${DIFX_WEIGHT_DEBUG}"
+            echo ""
+        fi
         echo "cd ${jobdir}"
         echo "date"
         echo ""
