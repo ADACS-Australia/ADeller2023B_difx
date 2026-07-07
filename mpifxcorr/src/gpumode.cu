@@ -494,13 +494,29 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         //std::cout << "datalengthbytes: " << datalengthbytes << " getMultiplexedFrameBytes: " << config->getMultiplexedFrameBytes(configindex, datastreamindex) << std::endl;
         assert(datalengthbytes % config->getMultiplexedFrameBytes(configindex, datastreamindex) == 0);     // Buffer contains fraction of a frame :(. This shouldn't happen!
         
-    } else { 
+    } else {
 
       // set everything to zero and return
         checkCuda(cudaMemsetAsync(fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
 	    checkCuda(cudaMemsetAsync(conj_fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
+
+        // We return before set_weights() runs, so explicitly invalidate every
+        // FFT window and zero its data weight - otherwise stale values from
+        // the previous subintegration survive, and GPUCore's baseline-weight
+        // accumulation (and the XMAC kernel's validity flags) would count a
+        // subint that contains no data. The CPU path sets dataweight = 0 for
+        // every FFT of such a subint (Mode::process validity branch).
+        for (int i = 0; i < cfg_numBufferedFFTs; i++) {
+            dataweight[i] = 0.0;
+            if (perbandweights) {
+                for (int b = 0; b < numrecordedbands; b++)
+                    perbandweights[i][b] = 0.0;
+            }
+            gValidSamples->ptr()[i] = false;
+        }
+        gValidSamples->copyToDevice();
+
         checkCuda(cudaStreamSynchronize(cuStream));
-        // Below copy operations are redundant 
 	    return numBufferedFFTs;
     }
 
