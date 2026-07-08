@@ -1008,6 +1008,12 @@ Mode* Configuration::getMode(int configindex, int datastreamindex, const bool us
         framesamples /= 2;
       }
       if(usegpu) {
+        //the GPU unpack kernels (gpudecode.cu) assume VDIF frames throughout,
+        //including reading the vdif_header invalid bit for per-frame validity
+        if(stream.format != VDIF && stream.format != VDIFL && stream.format != INTERLACEDVDIF) {
+          cfatal << startl << "GPU processing currently supports only VDIF-family formats (VDIF/VDIFL/INTERLACEDVDIF), not format " << stream.format << " - bailing out" << endl;
+          return NULL;
+        }
         return new Mk5_GPUMode(this, configindex, datastreamindex, streamrecbandchan, streamchanstoaverage, conf.blockspersend, guardsamples, stream.numrecordedfreqs, streamrecbandwidth, stream.recordedfreqclockoffsets, stream.recordedfreqclockoffsetsdelta, stream.recordedfreqphaseoffset, stream.recordedfreqlooffsets, stream.numrecordedbands, stream.numzoombands, stream.numbits, stream.sampling, stream.tcomplex, stream.filterbank, stream.filterbank, conf.fringerotationorder, conf.arraystridelen[datastreamindex], conf.writeautocorrs, framebytes, framesamples, stream.format);
       } else {
         return new Mk5_CPUMode(this, configindex, datastreamindex, streamrecbandchan, streamchanstoaverage, conf.blockspersend, guardsamples, stream.numrecordedfreqs, streamrecbandwidth, stream.recordedfreqclockoffsets, stream.recordedfreqclockoffsetsdelta, stream.recordedfreqphaseoffset, stream.recordedfreqlooffsets, stream.numrecordedbands, stream.numzoombands, stream.numbits, stream.sampling, stream.tcomplex, stream.filterbank, stream.filterbank, conf.fringerotationorder, conf.arraystridelen[datastreamindex], conf.writeautocorrs, framebytes, framesamples, stream.format);

@@ -1,5 +1,6 @@
 #include <mark5access.h>
 #include <mark5access/mark5_stream.h>
+#include <vdifio.h>
 #include "gpudecode.cuh"
 #include <iostream>
 #include <bitset>
@@ -95,12 +96,35 @@ __device__ int blanker_vdif_gpu(struct mark5_stream *ms)
 
 	nword = ms->databytes/8;
 
-	/* only 1 zone for VDIF data.  a packet is either good or bad. 
+	/* only 1 zone for VDIF data.  a packet is either good or bad.
 	 *
-	 * To be good, it cannot have fill pattern at beginning or end 
+	 * To be good, it cannot have fill pattern at beginning or end
 	 */
 
 	ms->blankzonestartvalid[0] = 0;
+
+	/* Check the VDIF header invalid bit.  On the CPU path this lives in
+	 * mark5_format_vdif_validate() (called per frame from
+	 * mark5_stream_next_frame(), which blanks the whole frame on failure);
+	 * the GPU unpacker stubs validate out, so the check belongs here.
+	 * vdifmux fabricates exactly such frames - invalid bit set, arbitrary
+	 * payload rather than fill pattern - wherever input data was missing,
+	 * e.g. past the end of the recording, so without this the GPU decodes
+	 * and correlates junk that the CPU correctly blanks.
+	 * This reads the vdifio vdif_header bitfield directly rather than
+	 * calling getVDIFFrameInvalid(), which is a host-only static inline.
+	 *
+	 * FIXME: hard-coding vdif_header is only safe because the GPU path is
+	 * restricted to VDIF-family formats (enforced in Configuration::getMode).
+	 * If/when the GPU branch grows CODIF (or other) support, the frame
+	 * validity test must be made format-aware - a per-format validate hook
+	 * like the CPU's mark5_format_*_validate(), selected at setup time,
+	 * with formats that carry no per-frame validity flag skipping the test. */
+	if(ms->frame && ((const vdif_header *)ms->frame)->invalid)
+	{
+		ms->blankzoneendvalid[0] = 0;
+		return 0;
+	}
 
 	/* Check for fill pattern */
 	if(data[0] == MARK5_FILL_WORD64 || data[nword-1] == MARK5_FILL_WORD64)
