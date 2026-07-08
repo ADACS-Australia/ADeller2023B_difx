@@ -24,6 +24,20 @@ const int MAX_INDICIES = 10;
 
 static int weightDebugFrom();   // defined above set_weights, also used by process_gpu
 
+// Env-gated per-window spectral tracing (DIFX_SPEC_DEBUG=<datasec>), the GPU
+// twin of the SPECDEBUG lines in CPUMode::process (cpumode.cpp) - identical
+// format, so sorted grepped logs diff directly and any CPU-vs-GPU divergence
+// localizes to a stage (unpack / fringe rotation+FFT / frac correction).
+static int specDebugFrom()
+{
+    static int from = -2;
+    if (from == -2) {
+        const char* e = getenv("DIFX_SPEC_DEBUG");
+        from = (e != NULL) ? atoi(e) : -1;
+    }
+    return from;
+}
+
 __global__ void gpu_allocate_unpacked(float** arrays, float* data, int nchan, int dlen) {
     // Use arrays to make data into a flattened 2D array
     for (int i = 0; i < nchan; i++) {
@@ -682,6 +696,43 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     fractionalRotation(fftloop, numBufferedFFTs, startblock, numblocks, calccrosspolautocorrs, counts);
     cudaEventRecord(ev_frac, cuStream);
     cudaEventSynchronize(ev_frac);
+
+    // GPU twin of the CPU path's SPECDEBUG tracing (see specDebugFrom above).
+    // All device work for this batch is complete at this point, so small
+    // synchronous copies of the traced windows are safe.
+    if (specDebugFrom() >= 0 && datasec >= specDebugFrom()) {
+        for (int sub = 0; sub < numBufferedFFTs; sub++) {
+            int idx = fftloop * numBufferedFFTs + startblock + sub;
+            if (idx % 128 != 5 || idx >= startblock + numblocks)
+                continue;
+            if (!gValidSamples->ptr()[sub])
+                continue;
+            int off = gSampleIndexes->ptr()[sub];
+            if (off < 0 || (size_t)off + 4 > unpackedarrays_elem_count)
+                continue;
+            for (int b = 0; b < numrecordedbands; b++) {
+                float ur[4], ui[4];
+                cuFloatComplex spec[4];
+                if (usecomplex) {
+                    cuFloatComplex unp[4];
+                    checkCuda(cudaMemcpy(unp, complex_unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off,
+                                         4*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+                    for (int k = 0; k < 4; k++) { ur[k] = unp[k].x; ui[k] = unp[k].y; }
+                } else {
+                    float unp[4];
+                    checkCuda(cudaMemcpy(unp, unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off,
+                                         4*sizeof(float), cudaMemcpyDeviceToHost));
+                    for (int k = 0; k < 4; k++) { ur[k] = unp[k]; ui[k] = 0.0f; }
+                }
+                checkCuda(cudaMemcpy(spec, fftd_gpu->gpuPtr() + (size_t)sub*fftchannels*numrecordedbands + (size_t)b*fftchannels,
+                                     4*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+                fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
+                        datastreamindex, datasec, datans, idx, b, nearestSamples->ptr()[sub],
+                        ur[0], ui[0], ur[1], ui[1], ur[2], ui[2], ur[3], ui[3],
+                        spec[0].x, spec[0].y, spec[1].x, spec[1].y, spec[2].x, spec[2].y, spec[3].x, spec[3].y);
+            }
+        }
+    }
     
     float ms_copy1 = 0, ms_unpack = 0, ms_copy2 = 0, ms_pcal = 0, ms_rotate = 0, ms_fft = 0, ms_frac = 0;
 

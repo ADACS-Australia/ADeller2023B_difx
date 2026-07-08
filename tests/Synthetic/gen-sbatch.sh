@@ -73,6 +73,10 @@ write_sbatch() {
             echo "export DIFX_WEIGHT_DEBUG=${DIFX_WEIGHT_DEBUG}"
             echo ""
         fi
+        if [ -n "${DIFX_SPEC_DEBUG:-}" ]; then
+            echo "export DIFX_SPEC_DEBUG=${DIFX_SPEC_DEBUG}"
+            echo ""
+        fi
         echo "cd ${jobdir}"
         echo "date"
         echo ""

@@ -23,6 +23,24 @@ static int weightDebugFrom()
   return from;
 }
 
+// Env-gated per-window spectral tracing for CPU-vs-GPU debugging: set
+// DIFX_SPEC_DEBUG=<datasec> to emit, for every 128th FFT window of subints
+// with datasec >= <datasec>, one SPECDEBUG line per band holding the first 4
+// unpacked samples and the first 4 fully-processed (post fringe rotation,
+// FFT and fractional-sample correction) spectral channels. The format is
+// identical to the one in GPUMode::process_gpu (gpumode.cu), so sorted
+// grepped logs diff directly and any divergence localizes to a stage.
+static int specDebugFrom()
+{
+  static int from = -2;
+  if(from == -2)
+  {
+    const char* e = getenv("DIFX_SPEC_DEBUG");
+    from = (e != NULL) ? atoi(e) : -1;
+  }
+  return from;
+}
+
 CPUMode::CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock):
     Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, bclock)
 {
@@ -835,6 +853,29 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
         status = vectorConj_cf32(fftoutputs[j][subloopindex], conjfftoutputs[j][subloopindex], recordedbandchannels);
         if(status != vecNoErr)
           csevere << startl << "Error in conjugate!!!" << status << endl;
+
+        if(specDebugFrom() >= 0 && datasec >= specDebugFrom() && (index % 128) == 5)
+        {
+          float ur[4], ui[4];
+          for(int k = 0; k < 4; k++)
+          {
+            if(usecomplex)
+            {
+              ur[k] = unpackedcomplexarrays[j][nearestsample - unpackstartsamples + k].re;
+              ui[k] = unpackedcomplexarrays[j][nearestsample - unpackstartsamples + k].im;
+            }
+            else
+            {
+              ur[k] = unpackedarrays[j][nearestsample - unpackstartsamples + k];
+              ui[k] = 0.0f;
+            }
+          }
+          const cf32* sp = fftoutputs[j][subloopindex];
+          fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
+                  datastreamindex, datasec, datans, index, j, nearestsample,
+                  ur[0], ui[0], ur[1], ui[1], ur[2], ui[2], ur[3], ui[3],
+                  sp[0].re, sp[0].im, sp[1].re, sp[1].im, sp[2].re, sp[2].im, sp[3].re, sp[3].im);
+        }
 
 	if (!linear2circular) {
 	  //do the autocorrelation (skipping Nyquist channel)
