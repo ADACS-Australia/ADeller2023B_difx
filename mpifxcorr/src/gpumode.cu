@@ -22,6 +22,8 @@ using namespace std::chrono;
 
 const int MAX_INDICIES = 10;
 
+static int weightDebugFrom();   // defined above set_weights, also used by process_gpu
+
 __global__ void gpu_allocate_unpacked(float** arrays, float* data, int nchan, int dlen) {
     // Use arrays to make data into a flattened 2D array
     for (int i = 0; i < nchan; i++) {
@@ -567,6 +569,22 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // 2. UNPACK
     // ==========================================
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
+
+    // Env-gated (DIFX_WEIGHT_DEBUG, same threshold as WDEBUG) dump of the
+    // trailing frame headers of the delivered buffer: shows exactly what sits
+    // past the end of a recording (real frames, zero padding, fill pattern,
+    // or invalid-bit frames) as seen by the unpack kernel's validity checks.
+    if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom()) {
+        int dbg_framebytes = config->getMultiplexedFrameBytes(configindex, datastreamindex);
+        int dbg_first = framestounpack > 6 ? framestounpack - 6 : 0;
+        for (int f = dbg_first; f < framestounpack; f++) {
+            const unsigned int *hdr = (const unsigned int *)((const unsigned char *)packeddata_gpu->ptr() + (size_t)f * dbg_framebytes);
+            fprintf(stderr, "HDRDEBUG ds=%d datasec=%d datans=%d frame=%d/%d hdr=%08x %08x %08x %08x invalid=%u flen8=%u\n",
+                    datastreamindex, datasec, datans, f, framestounpack,
+                    hdr[0], hdr[1], hdr[2], hdr[3],
+                    (hdr[0] >> 31) & 0x1, hdr[2] & 0xFFFFFF);
+        }
+    }
 
     packeddata_gpu->sync();
     unpack_all(framestounpack);

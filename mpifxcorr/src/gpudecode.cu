@@ -103,16 +103,21 @@ __device__ int blanker_vdif_gpu(struct mark5_stream *ms)
 
 	ms->blankzonestartvalid[0] = 0;
 
-	/* Check the VDIF header invalid bit.  On the CPU path this lives in
-	 * mark5_format_vdif_validate() (called per frame from
-	 * mark5_stream_next_frame(), which blanks the whole frame on failure);
-	 * the GPU unpacker stubs validate out, so the check belongs here.
-	 * vdifmux fabricates exactly such frames - invalid bit set, arbitrary
-	 * payload rather than fill pattern - wherever input data was missing,
-	 * e.g. past the end of the recording, so without this the GPU decodes
-	 * and correlates junk that the CPU correctly blanks.
-	 * This reads the vdifio vdif_header bitfield directly rather than
-	 * calling getVDIFFrameInvalid(), which is a host-only static inline.
+	/* Reject frames that fail the VDIF header sanity checks.  On the CPU
+	 * path these live in mark5_format_vdif_validate() (called per frame
+	 * from mark5_stream_next_frame(), which blanks the whole frame on
+	 * failure); the GPU unpacker stubs validate out, so they belong here.
+	 * As validate runs in the unpacker context (ms->mjd == 0, so its
+	 * frame-time consistency test is inert), exactly two checks are live:
+	 *  - Data Frame Length of zero ("overly unusual header"): catches
+	 *    zero-padding, e.g. a send buffer tail past the end of the
+	 *    recording that no real frame was ever written into.
+	 *  - The invalid bit: set by vdifmux on frames it fabricates for
+	 *    missing input data, and by recorders for known-bad frames.
+	 * Without these the GPU decodes and correlates junk that the CPU
+	 * correctly blanks.  This reads the vdifio vdif_header bitfields
+	 * directly rather than calling getVDIFFrameInvalid()/
+	 * getVDIFFrameBytes(), which are host-only static inlines.
 	 *
 	 * FIXME: hard-coding vdif_header is only safe because the GPU path is
 	 * restricted to VDIF-family formats (enforced in Configuration::getMode).
@@ -120,10 +125,14 @@ __device__ int blanker_vdif_gpu(struct mark5_stream *ms)
 	 * validity test must be made format-aware - a per-format validate hook
 	 * like the CPU's mark5_format_*_validate(), selected at setup time,
 	 * with formats that carry no per-frame validity flag skipping the test. */
-	if(ms->frame && ((const vdif_header *)ms->frame)->invalid)
+	if(ms->frame)
 	{
-		ms->blankzoneendvalid[0] = 0;
-		return 0;
+		const vdif_header *vh = (const vdif_header *)ms->frame;
+		if(vh->invalid || vh->framelength8 == 0)
+		{
+			ms->blankzoneendvalid[0] = 0;
+			return 0;
+		}
 	}
 
 	/* Check for fill pattern */
