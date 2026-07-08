@@ -998,7 +998,6 @@ Mode* Configuration::getMode(int configindex, int datastreamindex, const bool us
     case INTERLACEDVDIF:
       framesamples = getFramePayloadBytes(configindex, datastreamindex)*8/(getDNumBits(configindex, datastreamindex)*getDNumRecordedBands(configindex, datastreamindex)*streamdecimationfactor);
       framebytes = getFrameBytes(configindex, datastreamindex);
-      if (stream.sampling==COMPLEX) framesamples /=2;
       if(stream.format == INTERLACEDVDIF) { //separate frames for each subband - change numsamples, framebytes to the muxed version
         framesamples = getMultiplexedFramePayloadBytes(configindex, datastreamindex)*8/(getDNumBits(configindex, datastreamindex)*getDNumRecordedBands(configindex, datastreamindex)*streamdecimationfactor);
         framebytes = getMultiplexedFrameBytes(configindex, datastreamindex);
