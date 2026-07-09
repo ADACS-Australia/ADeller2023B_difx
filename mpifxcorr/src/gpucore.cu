@@ -168,8 +168,16 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
       exit(1);
     }
 
-    // Initialize the long-lived stream
+    // Initialize the long-lived stream and share it with every GPUMode this
+    // Core will construct, so all station processing and the XMAC form a
+    // single in-order queue. This must happen before any Mode is built (Modes
+    // are constructed later, in loopprocess -> updateconfig -> getMode).
     checkCuda(cudaStreamCreate(&cuStream));
+    GPUMode::setSharedComputeStream(cuStream);
+
+    // Fail fast if this job cannot fit in device memory, before the large
+    // per-Mode buffers start being allocated inside loopprocess.
+    checkDeviceMemory();
 
     // Allocate the main results buffer
     checkCuda(cudaMalloc(&results_gpu, maxcoreresultlength * sizeof(cuFloatComplex)));
@@ -182,6 +190,60 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     checkCuda(cudaMalloc(&d_m2_ptrs, numbaselines * sizeof(cuFloatComplex*)));
     checkCuda(cudaMalloc(&d_v1_ptrs, numbaselines * sizeof(bool*)));
     checkCuda(cudaMalloc(&d_v2_ptrs, numbaselines * sizeof(bool*)));
+}
+
+void GPUCore::checkDeviceMemory() {
+    // Peak device usage is dominated by the per-datastream GPUMode buffers.
+    // These are allocated for whichever config a scan uses, and a Core holds
+    // one Mode per datastream at a time, so the worst case is the config whose
+    // datastreams sum to the most memory. Take the max over configs.
+    size_t maxConfigBytes = 0;
+    for (int c = 0; c < config->getNumConfigs(); c++) {
+        size_t configBytes = 0;
+        for (int d = 0; d < numdatastreams; d++)
+            configBytes += GPUMode::estimateDeviceBytes(config, c, d);
+        if (configBytes > maxConfigBytes)
+            maxConfigBytes = configBytes;
+    }
+
+    // This Core's own persistent device allocations: the results buffer plus
+    // the per-baseline pointer/validity arrays. The cached XMAC plan arrays
+    // are a few ints per baseline per frequency - negligible, but fold in a
+    // small allowance so the estimate errs high rather than low.
+    size_t coreBytes = (size_t)maxcoreresultlength * sizeof(cuFloatComplex);
+    coreBytes += (size_t)numbaselines * (2 * sizeof(cuFloatComplex*) + 2 * sizeof(bool*));
+    coreBytes += (size_t)numbaselines * config->getFreqTableLength() * 16 * sizeof(int);
+
+    const size_t required = maxConfigBytes + coreBytes;
+
+    size_t freeBytes = 0, totalBytes = 0;
+    checkCuda(cudaMemGetInfo(&freeBytes, &totalBytes));
+
+    // Keep a headroom margin: cuFFT/cuBLAS scratch, allocator fragmentation and
+    // driver overhead all consume device memory beyond our own buffers.
+    // CAVEAT: if several Core ranks share one physical GPU, each sees only the
+    // free memory at its own construction time, not siblings' future
+    // allocations - so this is a fail-fast guard against a clearly-too-big job,
+    // not a guarantee that a marginal one will fit.
+    const double SAFETY = 0.90;
+    const size_t usable = (size_t)(freeBytes * SAFETY);
+
+    const double MB = 1024.0 * 1024.0;
+    cinfo << startl << "GPU Core " << mpiid << " estimated device memory need "
+          << required / MB << " MB (modes " << maxConfigBytes / MB << " MB + core "
+          << coreBytes / MB << " MB); device reports " << freeBytes / MB << " MB free of "
+          << totalBytes / MB << " MB, usable after " << (int)((1.0 - SAFETY) * 100)
+          << "% headroom " << usable / MB << " MB" << endl;
+
+    if (required > usable) {
+        cfatal << startl << "GPU Core " << mpiid << " needs an estimated " << required / MB
+               << " MB of device memory but only " << usable / MB
+               << " MB is usable (of " << freeBytes / MB << " MB free) - this job will not fit"
+               << " on the GPU. Reduce the number of channels/bands, the subint length"
+               << " (NUM CHANNELS / BLOCKS PER SEND), or the datastreams per Core, or use a"
+               << " GPU with more memory. Aborting before allocation." << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 }
 
 static unsigned long long avg_preprocess;
@@ -741,7 +803,11 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                  << maxacblocks * blockns << " ns" << endl;
     }
 
-    checkCuda(cudaStreamCreate(&cuStream));
+    // Use the Core's persistent stream (created in the constructor and shared
+    // with the GPUModes) rather than creating and destroying a stream every
+    // subint. Because the modes enqueue their station processing on this same
+    // stream, the XMAC launches below are naturally ordered after the FFT
+    // output they consume - no cross-stream synchronisation needed.
 //    cuFloatComplex* threadcrosscorrs_gpu;
 //
 //    checkCuda(cudaStreamCreate(&cuStream));
@@ -1056,7 +1122,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 //
 //    checkCuda(cudaFreeAsync(threadcrosscorrs_gpu, cuStream));
 //    checkCuda(cudaHostUnregister(scratchspace->threadcrosscorrs));
-    checkCuda(cudaStreamDestroy(cuStream));
+    // cuStream is the Core's persistent stream now; it is NOT destroyed here
+    // (nor in ~GPUCore - see the no-CUDA-calls-at-teardown note there).
 
     // The rest of this function uses an insignificant amount of time
     //

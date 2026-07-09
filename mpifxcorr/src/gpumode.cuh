@@ -23,6 +23,26 @@ public:
 
     ~GPUMode() override;
 
+    /**
+     * Install the compute stream that all subsequently constructed GPUModes
+     * will enqueue their work on. GPUCore calls this with its own stream
+     * before any Mode is constructed, so station processing, the XMAC and
+     * the transfers form a single in-order queue - the explicit ordering
+     * that the procslots pipelining work builds on. If no stream has been
+     * installed a GPUMode creates (and owns) a private one.
+     */
+    static void setSharedComputeStream(cudaStream_t stream) { sharedComputeStream = stream; }
+
+    /**
+     * Estimate the total device memory (bytes) a GPUMode for this
+     * config/datastream will allocate, using only Configuration lookups -
+     * callable before any Mode exists. Mirrors the constructor's device
+     * allocations plus the cuFFT plan work area; used by GPUCore's start-up
+     * VRAM budget check so an oversized job fails immediately with a clear
+     * message instead of partway through buffer allocation.
+     */
+    static size_t estimateDeviceBytes(Configuration *config, int configindex, int dsindex);
+
     int process_gpu(int fftloop, int numBufferedFFTs, int startblock,
                     int numblocks) override;  //frac sample error is in microseconds
 
@@ -88,6 +108,10 @@ protected:
     GpuMemHelper<int>* N_pcal_bins;
     GpuMemHelper<int>* counts_gpu;
     cudaStream_t cuStream;
+    /// The stream installed by setSharedComputeStream (GPUCore's), or nullptr.
+    static cudaStream_t sharedComputeStream;
+    /// True when cuStream is a private stream this mode must destroy.
+    bool ownsStream;
 
     // precalc
     GpuMemHelper<int> *nearestSamples;

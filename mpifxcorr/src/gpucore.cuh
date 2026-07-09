@@ -120,6 +120,17 @@ private:
     /// Free the device arrays held by the cached XMAC plans.
     void freeXmacPlans();
 
+    /**
+     * Start-up VRAM budget check. Estimates the peak device memory this Core
+     * will need (all datastreams' GPUModes for the most demanding config, plus
+     * this Core's own results/pointer buffers) via GPUMode::estimateDeviceBytes
+     * and compares it against what the device reports free, applying a safety
+     * margin. cfatal + MPI_Abort if it will not fit, so an oversized job fails
+     * in the first second with a clear required-vs-available message instead of
+     * a mid-run allocation failure. Must run before any GPUMode is constructed.
+     */
+    void checkDeviceMemory();
+
     int cudaMaxThreadsPerBlock;
     /// SM count of the device, used to size the fused-XMAC launch grid.
     int cudaMultiProcessorCount;

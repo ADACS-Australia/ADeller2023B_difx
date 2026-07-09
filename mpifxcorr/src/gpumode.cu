@@ -22,6 +22,8 @@ using namespace std::chrono;
 
 const int MAX_INDICIES = 10;
 
+cudaStream_t GPUMode::sharedComputeStream = nullptr;
+
 static int weightDebugFrom();   // defined above set_weights, also used by process_gpu
 
 // Env-gated per-window spectral tracing (DIFX_SPEC_DEBUG=<datasec>), the GPU
@@ -115,7 +117,16 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     cudaDeviceProp prop;
     checkCuda(cudaGetDeviceProperties( &prop, 0));
 
-    checkCuda(cudaStreamCreate(&cuStream));
+    // Use the compute stream GPUCore installed so all modes' station
+    // processing and the XMAC share one in-order queue; fall back to a
+    // private stream only if none was installed (standalone use).
+    if (sharedComputeStream != nullptr) {
+        cuStream = sharedComputeStream;
+        ownsStream = false;
+    } else {
+        checkCuda(cudaStreamCreate(&cuStream));
+        ownsStream = true;
+    }
 
 
 
@@ -269,6 +280,15 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     // precalc
     nearestSamples = new GpuMemHelper<int>(cfg_numBufferedFFTs, cuStream);
     checkCuda(cudaStreamSynchronize(cuStream));
+
+    // Cross-check the start-up VRAM estimator against what was actually
+    // tallied (the tally covers only the large buffers, so it must never
+    // exceed the estimate - if it does, estimateDeviceBytes is stale).
+    size_t estimate = estimateDeviceBytes(config, confindex, dsindex);
+    if (estimatedbytes_gpu > estimate)
+        cwarn << startl << "GPUMode::estimateDeviceBytes (" << estimate
+              << " bytes) is smaller than the allocated-buffer tally (" << estimatedbytes_gpu
+              << " bytes) for datastream " << dsindex << " - the estimator is out of date" << endl;
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
     //cout << "GPUMode(): " << duration.count() << endl;
@@ -346,7 +366,10 @@ GPUMode::~GPUMode() {
 
 
     checkCufft(cufftDestroy(fft_plan));
-    checkCuda(cudaStreamDestroy(cuStream));
+    // Never destroy the shared compute stream - GPUCore owns it, and modes
+    // are destroyed/recreated mid-run on configuration changes.
+    if (ownsStream)
+        checkCuda(cudaStreamDestroy(cuStream));
 
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
@@ -367,6 +390,76 @@ GPUMode::~GPUMode() {
     }
 
 
+}
+
+size_t GPUMode::estimateDeviceBytes(Configuration *config, int configindex, int dsindex)
+{
+    // Mirrors the constructor's device allocations (GpuMemHelper device
+    // buffers plus the cuFFT plan work area) using only Configuration
+    // lookups. If the constructor gains/loses allocations this must be
+    // updated to match - the constructor cross-checks its actual tally
+    // against this estimate and warns on divergence.
+    const int nbands = config->getDNumRecordedBands(configindex, dsindex);
+    const int nfreqs = config->getDNumRecordedFreqs(configindex, dsindex);
+    const int nbits = config->getDNumBits(configindex, dsindex);
+    const bool complexsampled = (config->getDSampling(configindex, dsindex) == Configuration::COMPLEX);
+    const int freqindex = config->getDRecordedFreqIndex(configindex, dsindex, 0);
+    const int recordedbandchan = config->getFNumChannels(freqindex);
+    int fftchannels = recordedbandchan * 2;
+    if (complexsampled)
+        fftchannels /= 2;
+
+    const size_t maxdatabytes = config->getMaxDataBytes();
+    const int framebytes = config->getMultiplexedFrameBytes(configindex, dsindex);
+    if (framebytes <= 0 || nbands <= 0 || fftchannels <= 0)
+        return 0; // not a format the GPU path can run; getMode's gate reports it
+    const size_t maxframes = maxdatabytes / framebytes;
+    size_t unpacked_size = maxframes * config->getMultiplexedFramePayloadBytes(configindex, dsindex) * 8 /
+                           (nbits * nbands);
+    if (complexsampled)
+        unpacked_size /= 2;
+    const size_t nFFTs = (unpacked_size + fftchannels - 1) / fftchannels; // = cfg_numBufferedFFTs
+
+    size_t bytes = 0;
+    bytes += maxdatabytes;                                                          // packeddata_gpu
+    bytes += 3 * (size_t)fftchannels * nFFTs * nbands * sizeof(cuFloatComplex);     // fringe rotated + fftd + conj_fftd
+    const int acwidth = config->writeAutoCorrs(configindex) ? 2 : 1;
+    bytes += (size_t)acwidth * nbands * recordedbandchan * sizeof(cuFloatComplex);  // temp_autocorrelations_gpu
+    bytes += (size_t)nbands * unpacked_size *
+             (complexsampled ? sizeof(cuFloatComplex) : sizeof(float));             // unpacked data
+    bytes += nbands * sizeof(void*);                                                // unpacked pointer array
+    bytes += nFFTs * (2 * sizeof(int) + sizeof(bool) + sizeof(float));              // gSampleIndexes+nearestSamples+gValidSamples+gFracSampleError
+    bytes += 3 * sizeof(double);                                                    // gInterpolator
+    bytes += (size_t)nbands * 4 * sizeof(double);                                   // gLoFreqs + 3 clock/lo offset arrays
+    bytes += (size_t)nfreqs * sizeof(int);                                          // counts_gpu
+    bytes += maxframes * sizeof(bool);                                              // valid_frames
+    bytes += (size_t)MAX_INDICIES * nfreqs * sizeof(unsigned int);                  // indices
+
+    if (config->getDPhaseCalIntervalMHz(configindex, dsindex) > 0) {
+        // mirror the constructor's N_pcal_bins_max / pcal_bin_stride_length
+        double bandwidth_hz = 1e6 * config->getFreqTableBandwidth(freqindex);
+        double fs_hz = 2 * bandwidth_hz;
+        int N_pcal_bins_max = 0;
+        for (int b = 0; b < nbands; b++) {
+            int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, dsindex, b);
+            int offset_hz = config->getDRecordedFreqPCalOffsetsHz(configindex, dsindex, localfreqindex);
+            int nbins = (int)(fs_hz / gcd(fs_hz, (double)offset_hz));
+            if (nbins > N_pcal_bins_max)
+                N_pcal_bins_max = nbins;
+        }
+        const size_t stride = (size_t)N_pcal_bins_max * 2;
+        bytes += 2 * (size_t)nbands * sizeof(int);                                  // pcal_offsets_hz + N_pcal_bins
+        bytes += (size_t)nbands * stride *
+                 (complexsampled ? sizeof(cuFloatComplex) : sizeof(float));         // pcal_output
+    }
+
+    // cuFFT C2C plan work area, worst case (same shape as the constructor's
+    // cufftPlanMany: rank-1 length-fftchannels batched over bands*windows)
+    size_t fftwork = 0;
+    if (cufftEstimate1d(fftchannels, CUFFT_C2C, nbands * (int)nFFTs, &fftwork) == CUFFT_SUCCESS)
+        bytes += fftwork;
+
+    return bytes;
 }
 
 __global__ void check_unpack(float** array, int nchan, int nsamp) {
