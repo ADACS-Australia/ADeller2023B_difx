@@ -708,27 +708,41 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
             if (!gValidSamples->ptr()[sub])
                 continue;
             int off = gSampleIndexes->ptr()[sub];
-            if (off < 0 || (size_t)off + 4 > unpackedarrays_elem_count)
+            if (off < 0 || (size_t)off + 516 > unpackedarrays_elem_count)
                 continue;
             for (int b = 0; b < numrecordedbands; b++) {
-                float ur[4], ui[4];
-                cuFloatComplex spec[4];
+                // The mid-window fields (unp2/rot, offsets 510-515) bracket the
+                // single-corrupted-sample-at-offset-512 signature seen in the
+                // complex-complex test: spec differences of the form d*(-1)^k.
+                float ur[4], ui[4], u2r[6], u2i[6];
+                cuFloatComplex rot[6], spec[4];
                 if (usecomplex) {
-                    cuFloatComplex unp[4];
+                    cuFloatComplex unp[4], unp2[6];
                     checkCuda(cudaMemcpy(unp, complex_unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off,
                                          4*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
+                    checkCuda(cudaMemcpy(unp2, complex_unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off + 510,
+                                         6*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
                     for (int k = 0; k < 4; k++) { ur[k] = unp[k].x; ui[k] = unp[k].y; }
+                    for (int k = 0; k < 6; k++) { u2r[k] = unp2[k].x; u2i[k] = unp2[k].y; }
                 } else {
-                    float unp[4];
+                    float unp[4], unp2[6];
                     checkCuda(cudaMemcpy(unp, unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off,
                                          4*sizeof(float), cudaMemcpyDeviceToHost));
+                    checkCuda(cudaMemcpy(unp2, unpackeddata_gpu->gpuPtr() + (size_t)b*unpackedarrays_elem_count + off + 510,
+                                         6*sizeof(float), cudaMemcpyDeviceToHost));
                     for (int k = 0; k < 4; k++) { ur[k] = unp[k]; ui[k] = 0.0f; }
+                    for (int k = 0; k < 6; k++) { u2r[k] = unp2[k]; u2i[k] = 0.0f; }
                 }
+                checkCuda(cudaMemcpy(rot, complex_fringe_rotated_gpu->gpuPtr() + (size_t)sub*fftchannels*numrecordedbands + (size_t)b*fftchannels + 510,
+                                     6*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
                 checkCuda(cudaMemcpy(spec, fftd_gpu->gpuPtr() + (size_t)sub*fftchannels*numrecordedbands + (size_t)b*fftchannels,
                                      4*sizeof(cuFloatComplex), cudaMemcpyDeviceToHost));
-                fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
+                fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f unp2=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f rot=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
                         datastreamindex, datasec, datans, idx, b, nearestSamples->ptr()[sub],
                         ur[0], ui[0], ur[1], ui[1], ur[2], ui[2], ur[3], ui[3],
+                        u2r[0], u2i[0], u2r[1], u2i[1], u2r[2], u2i[2], u2r[3], u2i[3], u2r[4], u2i[4], u2r[5], u2i[5],
+                        rot[0].x, rot[0].y, rot[1].x, rot[1].y, rot[2].x, rot[2].y,
+                        rot[3].x, rot[3].y, rot[4].x, rot[4].y, rot[5].x, rot[5].y,
                         spec[0].x, spec[0].y, spec[1].x, spec[1].y, spec[2].x, spec[2].y, spec[3].x, spec[3].y);
             }
         }

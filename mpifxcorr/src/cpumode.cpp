@@ -856,7 +856,10 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
 
         if(specDebugFrom() >= 0 && datasec >= specDebugFrom() && (index % 128) == 5)
         {
-          float ur[4], ui[4];
+          // The mid-window fields (unp2/rot, offsets 510-515) bracket the
+          // single-corrupted-sample-at-offset-512 signature seen in the
+          // complex-complex test: spec differences of the form d*(-1)^k.
+          float ur[4], ui[4], u2r[6], u2i[6];
           for(int k = 0; k < 4; k++)
           {
             if(usecomplex)
@@ -870,10 +873,27 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
               ui[k] = 0.0f;
             }
           }
+          for(int k = 0; k < 6; k++)
+          {
+            if(usecomplex)
+            {
+              u2r[k] = unpackedcomplexarrays[j][nearestsample - unpackstartsamples + 510 + k].re;
+              u2i[k] = unpackedcomplexarrays[j][nearestsample - unpackstartsamples + 510 + k].im;
+            }
+            else
+            {
+              u2r[k] = unpackedarrays[j][nearestsample - unpackstartsamples + 510 + k];
+              u2i[k] = 0.0f;
+            }
+          }
+          const cf32* rp = complexunpacked;   // fringe-rotated FFT input, still intact (out-of-place FFT)
           const cf32* sp = fftoutputs[j][subloopindex];
-          fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
+          fprintf(stderr, "SPECDEBUG ds=%d datasec=%d datans=%d index=%d band=%d nearest=%d unp=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f unp2=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f rot=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f spec=%.6f,%.6f;%.6f,%.6f;%.6f,%.6f;%.6f,%.6f\n",
                   datastreamindex, datasec, datans, index, j, nearestsample,
                   ur[0], ui[0], ur[1], ui[1], ur[2], ui[2], ur[3], ui[3],
+                  u2r[0], u2i[0], u2r[1], u2i[1], u2r[2], u2i[2], u2r[3], u2i[3], u2r[4], u2i[4], u2r[5], u2i[5],
+                  rp[510].re, rp[510].im, rp[511].re, rp[511].im, rp[512].re, rp[512].im,
+                  rp[513].re, rp[513].im, rp[514].re, rp[514].im, rp[515].re, rp[515].im,
                   sp[0].re, sp[0].im, sp[1].re, sp[1].im, sp[2].re, sp[2].im, sp[3].re, sp[3].im);
         }
 
