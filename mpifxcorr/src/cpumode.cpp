@@ -41,6 +41,41 @@ static int specDebugFrom()
   return from;
 }
 
+// HDRDEBUG (gated by DIFX_WEIGHT_DEBUG, same as the GPU twin in gpumode.cu):
+// dump the delivered buffer's VDIF frame-class transitions (real / all-zero /
+// fill-pattern / invalid-bit) once per subint. The delivered tail past the
+// true end of data is unspecified buffer content and can differ from run to
+// run, so each run's log needs its own dump. Only meaningful for VDIF-family
+// formats (assumes a 32-byte non-legacy header).
+static void dumpFrameClasses(const unsigned char* buf, int databytes, int framebytes,
+                             int dsindex, int datasec, int datans)
+{
+  static const char* names[4] = {"zero", "invalidbit", "fill", "real"};
+  int prevclass = -1;
+
+  if(databytes <= 1 || framebytes <= 0)
+    return;
+  int nframes = databytes / framebytes;
+  for(int f = 0; f < nframes; f++)
+  {
+    const unsigned int* hdr = (const unsigned int*)(buf + (size_t)f*framebytes);
+    const unsigned int* pay = hdr + 8;
+    int cls;
+    if(hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0)
+      cls = 0;
+    else if((hdr[0] >> 31) & 0x1)
+      cls = 1;
+    else if(pay[0] == 0x11223344 || (hdr[2] & 0xFFFFFF) == 0)
+      cls = 2;
+    else
+      cls = 3;
+    if(cls != prevclass || f == nframes-1)
+      fprintf(stderr, "HDRDEBUG ds=%d datasec=%d datans=%d frame=%d/%d hdr=%08x %08x %08x %08x pay0=%08x class=%s\n",
+              dsindex, datasec, datans, f, nframes, hdr[0], hdr[1], hdr[2], hdr[3], pay[0], names[cls]);
+    prevclass = cls;
+  }
+}
+
 CPUMode::CPUMode(Configuration * conf, int confindex, int dsindex, int recordedbandchan, int chanstoavg, int bpersend, int gsamples, int nrecordedfreqs, double recordedbw, double * recordedfreqclkoffs, double * recordedfreqclkoffsdelta, double * recordedfreqphaseoffs, double * recordedfreqlooffs, int nrecordedbands, int nzoombands, int nbits, Configuration::datasampling sampling, Configuration::complextype tcomplex, int unpacksamp, bool fbank, bool linear2circular, int fringerotorder, int arraystridelen, bool cacorrs, double bclock):
     Mode(conf, confindex, dsindex, recordedbandchan, chanstoavg, bpersend, gsamples, nrecordedfreqs, recordedbw, recordedfreqclkoffs, recordedfreqclkoffsdelta, recordedfreqphaseoffs, recordedfreqlooffs, nrecordedbands, nzoombands, nbits, sampling, tcomplex, unpacksamp, fbank, linear2circular, fringerotorder, arraystridelen, cacorrs, bclock)
 {
@@ -97,6 +132,11 @@ void CPUMode::process(int index, int subloopindex)  //frac sample error is in mi
   int indices[10];
   bool looff, isfraclooffset;
   //cout << "For Mode of datastream " << datastreamindex << ", index " << index << ", validflags is " << validflags[index/FLAGS_PER_INT] << ", after shift you get " << ((validflags[index/FLAGS_PER_INT] >> (index%FLAGS_PER_INT)) & 0x01) << endl;
+
+  if(weightDebugFrom() >= 0 && datasec >= weightDebugFrom() && index == 0)
+    dumpFrameClasses((const unsigned char*)data, datalengthbytes,
+                     config->getMultiplexedFrameBytes(configindex, datastreamindex),
+                     datastreamindex, datasec, datans);
 
   //since these data weights can be retreived after this processing ends, reset them to a default of zero in case they don't get updated
   dataweight[subloopindex] = 0.0;

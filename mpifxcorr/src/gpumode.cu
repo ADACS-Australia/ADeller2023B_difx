@@ -584,19 +584,32 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // ==========================================
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
 
-    // Env-gated (DIFX_WEIGHT_DEBUG, same threshold as WDEBUG) dump of the
-    // trailing frame headers of the delivered buffer: shows exactly what sits
-    // past the end of a recording (real frames, zero padding, fill pattern,
-    // or invalid-bit frames) as seen by the unpack kernel's validity checks.
+    // HDRDEBUG (gated by DIFX_WEIGHT_DEBUG, same as the CPU twin in
+    // cpumode.cpp): dump the delivered buffer's VDIF frame-class transitions
+    // (real / all-zero / fill-pattern / invalid-bit) once per subint. The
+    // delivered tail past the true end of data is unspecified buffer content
+    // and can differ from run to run, so each run's log needs its own dump.
     if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom()) {
+        static const char* dbg_names[4] = {"zero", "invalidbit", "fill", "real"};
         int dbg_framebytes = config->getMultiplexedFrameBytes(configindex, datastreamindex);
-        int dbg_first = framestounpack > 6 ? framestounpack - 6 : 0;
-        for (int f = dbg_first; f < framestounpack; f++) {
+        int prevclass = -1;
+        for (int f = 0; f < framestounpack; f++) {
             const unsigned int *hdr = (const unsigned int *)((const unsigned char *)packeddata_gpu->ptr() + (size_t)f * dbg_framebytes);
-            fprintf(stderr, "HDRDEBUG ds=%d datasec=%d datans=%d frame=%d/%d hdr=%08x %08x %08x %08x invalid=%u flen8=%u\n",
-                    datastreamindex, datasec, datans, f, framestounpack,
-                    hdr[0], hdr[1], hdr[2], hdr[3],
-                    (hdr[0] >> 31) & 0x1, hdr[2] & 0xFFFFFF);
+            const unsigned int *pay = hdr + 8;
+            int cls;
+            if (hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0)
+                cls = 0;
+            else if ((hdr[0] >> 31) & 0x1)
+                cls = 1;
+            else if (pay[0] == 0x11223344 || (hdr[2] & 0xFFFFFF) == 0)
+                cls = 2;
+            else
+                cls = 3;
+            if (cls != prevclass || f == framestounpack - 1)
+                fprintf(stderr, "HDRDEBUG ds=%d datasec=%d datans=%d frame=%d/%d hdr=%08x %08x %08x %08x pay0=%08x class=%s\n",
+                        datastreamindex, datasec, datans, f, framestounpack,
+                        hdr[0], hdr[1], hdr[2], hdr[3], pay[0], dbg_names[cls]);
+            prevclass = cls;
         }
     }
 
