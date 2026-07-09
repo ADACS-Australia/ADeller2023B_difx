@@ -96,11 +96,19 @@ private:
         int numPolarisationProducts;
         int num_averaged_channels;
         int channelstoaverage;
-        int fftchannels;          ///< freqchannels * sampling_multiplier
-        int numrecordedbands;
         int* d_stream1BandIndexes;         ///< [numbaselines * numPolarisationProducts]
         int* d_stream2BandIndexes;         ///< [numbaselines * numPolarisationProducts]
         int* d_coreResultBaselineOffsets;  ///< [numbaselines]
+        /* Per-baseline, per-stream FFT buffer strides. A GPUMode's fftd buffer
+         * is laid out [window][band][fftchannels], where fftchannels =
+         * freqchannels * (1 for complex sampling, 2 for real) and the band
+         * count are properties of THAT datastream - so on a mixed baseline
+         * (e.g. real x complex) the two streams' strides differ and each side
+         * must be indexed with its own. */
+        int* d_stream1BandStride;          ///< [numbaselines] = that stream's fftchannels
+        int* d_stream1WindowStride;        ///< [numbaselines] = fftchannels * numrecordedbands
+        int* d_stream2BandStride;          ///< [numbaselines]
+        int* d_stream2WindowStride;        ///< [numbaselines]
     };
     std::vector<XmacFreqPlan> xmacPlans;
 

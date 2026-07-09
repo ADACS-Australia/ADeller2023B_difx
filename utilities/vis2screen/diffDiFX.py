@@ -38,9 +38,10 @@ parser.add_option("-d", "--diagnose", dest="diagnose", action="store_true", defa
                        "records (distinguishes amplitude scaling / phase rotation / corruption)")
 parser.add_option("-w", "--weighttolerance", dest="weighttolerance", metavar="WEIGHTTOL",
                   default="1e-6",
-                  help="Treat header weights as equal if their relative difference is " + \
-                       "within WEIGHTTOL (weights are float32 accumulations, so the last " + \
-                       "few bits legitimately depend on summation order) [default %default]")
+                  help="Treat the weight/u/v/w header fields as equal if their relative " + \
+                       "difference is within WEIGHTTOL (they are floating-point " + \
+                       "accumulations/averages, so the last few bits legitimately depend " + \
+                       "on summation order) [default %default]")
 parser.add_option("-i", "--inputfile", dest="inputfile", default="",
                   help="An input file to use as guide for number of channels for each freq") 
 (options, args) = parser.parse_args()
@@ -63,7 +64,7 @@ diagnose       = options.diagnose
 matchheaders   = options.matchheaders
 inputfile      = options.inputfile
 weighttolerance = float(options.weighttolerance)
-weightfieldindex = headerfieldnames.index("weight")
+floattolerantfields = [headerfieldnames.index(n) for n in ("weight", "u", "v", "w")]
 
 if skiprecords < 0:
     parser.error("You can't skip a negative number of records!!")
@@ -136,10 +137,10 @@ while not len(nextheader[0]) == 0 and not len(nextheader[1]) == 0:
     for j in range(len(nextheader[0])):
         if j >= len(headerfieldnames):
             continue   # raw header bytes; any real difference shows in the named fields
-        if j == weightfieldindex:
-            w1 = nextheader[0][j]
-            w2 = nextheader[1][j]
-            if abs(w2 - w1) <= weighttolerance * max(abs(w1), abs(w2)):
+        if j in floattolerantfields:
+            v1 = nextheader[0][j]
+            v2 = nextheader[1][j]
+            if abs(v2 - v1) <= weighttolerance * max(abs(v1), abs(v2)):
                 continue
         if nextheader[0][j] != nextheader[1][j]:
             if not headerdiffers:

@@ -58,8 +58,10 @@ __global__ void gpu_fuse_xmac_and_average(
         int fftsPerChunk,
         int num_averaged_channels,
         int channelstoaverage,
-        int fftchannels,
-        int numrecordedbands
+        const int* const stream1BandStride,
+        const int* const stream1WindowStride,
+        const int* const stream2BandStride,
+        const int* const stream2WindowStride
 ) {
     // gridDim.x  = numbaselines
     // gridDim.y  = numPolarisationProducts
@@ -108,9 +110,11 @@ __global__ void gpu_fuse_xmac_and_average(
         // (zero contribution, and the data weight already excludes them).
         if (!valid1[fft] || !valid2[fft]) continue;
 
-        // Calculate the absolute starting index for this specific FFT and Band
-        int base_idx1 = (fft * numrecordedbands + b1) * fftchannels;
-        int base_idx2 = (fft * numrecordedbands + b2) * fftchannels;
+        // Calculate the absolute starting index for this specific FFT and Band,
+        // using each stream's OWN buffer strides (they differ on mixed
+        // real x complex baselines).
+        int base_idx1 = fft * stream1WindowStride[baseline] + b1 * stream1BandStride[baseline];
+        int base_idx2 = fft * stream2WindowStride[baseline] + b2 * stream2BandStride[baseline];
 
         // 3. Frequency Integration
         // Collapse 'channelstoaverage' fine channels into this single output channel.
@@ -206,6 +210,10 @@ void GPUCore::freeXmacPlans() {
         checkCuda(cudaFree(plan.d_stream1BandIndexes));
         checkCuda(cudaFree(plan.d_stream2BandIndexes));
         checkCuda(cudaFree(plan.d_coreResultBaselineOffsets));
+        checkCuda(cudaFree(plan.d_stream1BandStride));
+        checkCuda(cudaFree(plan.d_stream1WindowStride));
+        checkCuda(cudaFree(plan.d_stream2BandStride));
+        checkCuda(cudaFree(plan.d_stream2WindowStride));
     }
     xmacPlans.clear();
     xmacPlanConfigIndex = -1;
@@ -218,10 +226,6 @@ void GPUCore::freeXmacPlans() {
 void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
     // Drop any previously-cached plans (e.g. on a configuration change).
     freeXmacPlans();
-
-    const int sampling_multiplier =
-        (config->getDSampling(configindex, 0) == Configuration::COMPLEX) ? 1 : 2;
-    const int numrecordedbands = config->getDNumRecordedBands(configindex, 0);
 
     // The FFT buffer pointers depend only on the baseline's datastreams (not on
     // frequency) and the GPUMode buffers never move, so they are gathered and
@@ -259,14 +263,28 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         plan.numPolarisationProducts = numPolarisationProducts;
         plan.num_averaged_channels = freqchannels / channelstoaverage;
         plan.channelstoaverage = channelstoaverage;
-        plan.fftchannels = freqchannels * sampling_multiplier;
-        plan.numrecordedbands = numrecordedbands;
 
         // Gather the per-baseline band indexes and result offsets for this frequency.
         int h_stream1BandIndexes[numbaselines * numPolarisationProducts];
         int h_stream2BandIndexes[numbaselines * numPolarisationProducts];
         int h_coreResultBaselineOffsets[numbaselines];
+        // Per-baseline, per-stream buffer strides: each side's GPUMode fftd
+        // buffer geometry follows THAT datastream's sampling type and band
+        // count, so a mixed (e.g. real x complex) baseline has different
+        // strides on its two sides.
+        int h_s1BandStride[numbaselines];
+        int h_s1WindowStride[numbaselines];
+        int h_s2BandStride[numbaselines];
+        int h_s2WindowStride[numbaselines];
         for (int j = 0; j < numbaselines; j++) {
+            int ds1index = config->getBOrderedDataStream1Index(configindex, j);
+            int ds2index = config->getBOrderedDataStream2Index(configindex, j);
+            int mult1 = (config->getDSampling(configindex, ds1index) == Configuration::COMPLEX) ? 1 : 2;
+            int mult2 = (config->getDSampling(configindex, ds2index) == Configuration::COMPLEX) ? 1 : 2;
+            h_s1BandStride[j] = freqchannels * mult1;
+            h_s1WindowStride[j] = h_s1BandStride[j] * config->getDNumRecordedBands(configindex, ds1index);
+            h_s2BandStride[j] = freqchannels * mult2;
+            h_s2WindowStride[j] = h_s2BandStride[j] * config->getDNumRecordedBands(configindex, ds2index);
             int localfreqindex = config->getBLocalFreqIndex(configindex, j, f);
             if (localfreqindex >= 0) {
                 h_coreResultBaselineOffsets[j] =
@@ -294,6 +312,10 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         checkCuda(cudaMalloc(&plan.d_stream2BandIndexes,
                              numbaselines * numPolarisationProducts * sizeof(int)));
         checkCuda(cudaMalloc(&plan.d_coreResultBaselineOffsets, numbaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1BandStride, numbaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1WindowStride, numbaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2BandStride, numbaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2WindowStride, numbaselines * sizeof(int)));
         checkCuda(cudaMemcpyAsync(plan.d_stream1BandIndexes, h_stream1BandIndexes,
                                  numbaselines * numPolarisationProducts * sizeof(int),
                                  cudaMemcpyHostToDevice, cuStream));
@@ -303,6 +325,14 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         checkCuda(cudaMemcpyAsync(plan.d_coreResultBaselineOffsets, h_coreResultBaselineOffsets,
                                  numbaselines * sizeof(int),
                                  cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_stream1BandStride, h_s1BandStride,
+                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_stream1WindowStride, h_s1WindowStride,
+                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_stream2BandStride, h_s2BandStride,
+                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_stream2WindowStride, h_s2WindowStride,
+                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
 
         xmacPlans.push_back(plan);
     }
@@ -931,7 +961,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                 numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
                 fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
-                plan.fftchannels, plan.numrecordedbands
+                plan.d_stream1BandStride, plan.d_stream1WindowStride,
+                plan.d_stream2BandStride, plan.d_stream2WindowStride
             );
         }
 
