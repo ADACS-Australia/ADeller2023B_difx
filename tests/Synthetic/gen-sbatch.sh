@@ -25,9 +25,10 @@
 # wrapped).  Requires `nsys` to be on PATH inside the job (via the sourced setup
 # script or a `module load nsight-systems`).
 USE_NSYS="${USE_NSYS:-0}"
-# Flags passed to `nsys profile`.  Override in the environment to taste (e.g.
-# add --sample=cpu for host sampling, or --duration=<sec> to cap the capture).
-NSYS_ARGS="${NSYS_ARGS:---trace=cuda,nvtx,osrt --cuda-memory-usage=true}"
+# Flags passed to `nsys profile`.  Override in the environment to taste, e.g.
+# add --sample=cpu for host-thread hotspots, --cuda-memory-usage=true for a VRAM
+# footprint track, or --duration=<sec> to cap the capture.
+NSYS_ARGS="${NSYS_ARGS:---trace=cuda,nvtx,osrt}"
 # ---------------------------------------------------------------------------
 
 # write_sbatch <mode:cpu|gpu|reference> <expname> <jobdir>
