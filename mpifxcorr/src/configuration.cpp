@@ -2579,6 +2579,10 @@ bool Configuration::populateResultLengths()
           }
         }//if(freq is output)
       }
+      //the cross-correlation block (all baselines' visibilities) is now complete; record its
+      //length so the GPU path can transfer back just this leading region (the XMAC output) and
+      //add the trailing weight/autocorrelation/pcal sections on the host separately
+      configs[c].coreresultxcorrslength = coreresultindex;
       for(int i=0;i<freqtablelength;i++) //then append the baseline weights
       {
         if(isFrequencyUsed(c,i))

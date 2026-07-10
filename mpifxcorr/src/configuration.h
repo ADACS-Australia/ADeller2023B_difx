@@ -129,6 +129,12 @@ public:
   inline int getNumBufferedFFTs(int configindex) const { return configs[configindex].numbufferedffts; }
   inline int getThreadResultLength(int configindex) const { return configs[configindex].threadresultlength; }
   inline int getCoreResultLength(int configindex) const { return configs[configindex].coreresultlength; }
+  /// Length (in cf32 elements) of the leading cross-correlation block of the core results array
+  /// (all baselines' visibilities), i.e. everything before the baseline-weight/autocorrelation/
+  /// pcal sections. This is exactly the region the GPU XMAC kernel writes, so the GPU path can
+  /// transfer just this prefix back to the host and add the (host-computed) trailing sections
+  /// separately.
+  inline int getCoreResultXcorrsLength(int configindex) const { return configs[configindex].coreresultxcorrslength; }
   inline long long getMaxThreadResultLength() const { return maxthreadresultlength; }
   inline long long getMaxCoreResultLength() const { return maxcoreresultlength; }
   inline int getMaxNumBufferedFFTs() const { return maxnumbufferedffts; }
@@ -830,6 +836,7 @@ private:
     int minpostavfreqchannels;
     int threadresultlength;
     int coreresultlength;
+    int coreresultxcorrslength; //length of the leading cross-correlation block (all baselines' visibilities) of the core results
     bool scrunchoutput;
     int numphasecentres;
     bool anyusbxlsb;

@@ -5,6 +5,8 @@
 #include <thread>
 //#include <iostream>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 
 using namespace std::chrono;
 
@@ -168,19 +170,43 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
       exit(1);
     }
 
-    // Initialize the long-lived stream and share it with every GPUMode this
-    // Core will construct, so all station processing and the XMAC form a
-    // single in-order queue. This must happen before any Mode is built (Modes
-    // are constructed later, in loopprocess -> updateconfig -> getMode).
+    // Initialize the compute stream and share it with every GPUMode this Core
+    // will construct, so all station processing and the XMAC form a single
+    // in-order queue. This must happen before any Mode is built (Modes are
+    // constructed later, in loopprocess -> updateconfig -> getMode).
     checkCuda(cudaStreamCreate(&cuStream));
     GPUMode::setSharedComputeStream(cuStream);
+    // Separate stream for the visibility transfer back to the host, so it can
+    // run concurrently with the next subintegration's compute on cuStream.
+    checkCuda(cudaStreamCreate(&d2hStream));
+
+    // Pipelining is on by default; DIFX_GPU_PIPELINE=0 forces the synchronous
+    // (complete-immediately) path for A/B comparison.
+    pipeline = true;
+    {
+        const char *e = getenv("DIFX_GPU_PIPELINE");
+        if (e != NULL && atoi(e) == 0)
+            pipeline = false;
+    }
+    if (mpiid == numdatastreams + fxcorr::FIRSTTELESCOPEID)
+        cinfo << startl << "GPU Core visibility-transfer pipelining is "
+              << (pipeline ? "ENABLED" : "disabled") << endl;
 
     // Fail fast if this job cannot fit in device memory, before the large
     // per-Mode buffers start being allocated inside loopprocess.
     checkDeviceMemory();
 
-    // Allocate the main results buffer
-    checkCuda(cudaMalloc(&results_gpu, maxcoreresultlength * sizeof(cuFloatComplex)));
+    // Allocate one results buffer and one completion event per procslot, so the
+    // deferred device->host copy of one subint does not collide with the next
+    // subint's XMAC writes.
+    results_gpu.resize(RECEIVE_RING_LENGTH);
+    results_host.resize(RECEIVE_RING_LENGTH);
+    d2hDone.resize(RECEIVE_RING_LENGTH);
+    for (int i = 0; i < RECEIVE_RING_LENGTH; i++) {
+        checkCuda(cudaMalloc(&results_gpu[i], maxcoreresultlength * sizeof(cuFloatComplex)));
+        checkCuda(cudaMallocHost(&results_host[i], maxcoreresultlength * sizeof(cuFloatComplex)));
+        checkCuda(cudaEventCreateWithFlags(&d2hDone[i], cudaEventDisableTiming));
+    }
 
     // Allocate the shared, frequency-independent FFT buffer pointer arrays (one
     // entry per baseline). These are populated once per configuration by
@@ -206,11 +232,11 @@ void GPUCore::checkDeviceMemory() {
             maxConfigBytes = configBytes;
     }
 
-    // This Core's own persistent device allocations: the results buffer plus
-    // the per-baseline pointer/validity arrays. The cached XMAC plan arrays
-    // are a few ints per baseline per frequency - negligible, but fold in a
-    // small allowance so the estimate errs high rather than low.
-    size_t coreBytes = (size_t)maxcoreresultlength * sizeof(cuFloatComplex);
+    // This Core's own persistent device allocations: the results buffers (one
+    // per procslot) plus the per-baseline pointer/validity arrays. The cached
+    // XMAC plan arrays are a few ints per baseline per frequency - negligible,
+    // but fold in a small allowance so the estimate errs high rather than low.
+    size_t coreBytes = (size_t)RECEIVE_RING_LENGTH * maxcoreresultlength * sizeof(cuFloatComplex);
     coreBytes += (size_t)numbaselines * (2 * sizeof(cuFloatComplex*) + 2 * sizeof(bool*));
     coreBytes += (size_t)numbaselines * config->getFreqTableLength() * 16 * sizeof(int);
 
@@ -513,7 +539,11 @@ void GPUCore::loopprocess(int threadid) {
         cinfo << startl << "Core " << mpiid << " PROCESSTHREAD " << threadid + 1 << "/" << numprocessthreads
               << " is about to start processing" << endl;
 
-    //while valid, process data
+    //while valid, process data.
+    // inflight = procslot index of a subint whose visibility transfer has been
+    // issued but not yet awaited (pipelining), or -1. The process thread holds
+    // the slot locks for both inflight and the slot currently being issued.
+    int inflight = -1;
     while (procslots[(numprocessed) % RECEIVE_RING_LENGTH].keepprocessing) {
         currentslot = &(procslots[numprocessed % RECEIVE_RING_LENGTH]);
         if (pulsarbin) {
@@ -551,12 +581,45 @@ void GPUCore::loopprocess(int threadid) {
             dumpingsta = nowdumpingsta;
         }
 
-        //process our section of responsibility for this time range
-        processgpudata(numprocessed++ % RECEIVE_RING_LENGTH, threadid, startblock, numblocks, modes, currentpolyco,
-                       scratchspace);
+        //issue this subint's GPU work (this does NOT wait for the visibility
+        //transfer back to the host - that is awaited later, in completegpudata)
+        int index = numprocessed % RECEIVE_RING_LENGTH;
+        issuegpudata(index, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+
+        if (pipeline) {
+            //Retain this slot's lock, complete the PREVIOUS in-flight subint (its
+            //transfer has had this subint's issue to overlap with) and release it,
+            //then grab the next slot's lock so the manager thread stays ahead. The
+            //process thread thus holds at most two slot locks at once.
+            if (inflight >= 0) {
+                completegpudata(inflight);
+                perr = pthread_mutex_unlock(&(procslots[inflight].slotlocks[threadid]));
+                if (perr != 0)
+                    csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                            << " error trying unlock mutex " << inflight << endl;
+            }
+            perr = pthread_mutex_lock(&(procslots[(index + 1) % RECEIVE_RING_LENGTH].slotlocks[threadid]));
+            if (perr != 0)
+                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                        << " error trying lock mutex " << (index + 1) % RECEIVE_RING_LENGTH << endl;
+            inflight = index;
+        } else {
+            //Synchronous fallback (DIFX_GPU_PIPELINE=0): complete immediately, then
+            //hand off the lock exactly as the pre-pipelining code did.
+            completegpudata(index);
+            perr = pthread_mutex_lock(&(procslots[(index + 1) % RECEIVE_RING_LENGTH].slotlocks[threadid]));
+            if (perr != 0)
+                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                        << " error trying lock mutex " << (index + 1) % RECEIVE_RING_LENGTH << endl;
+            perr = pthread_mutex_unlock(&(procslots[index].slotlocks[threadid]));
+            if (perr != 0)
+                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                        << " error trying unlock mutex " << index << endl;
+        }
 
         if (threadid == 0)
             numcomplete++;
+        numprocessed++;
 
         currentslot = &(procslots[numprocessed % RECEIVE_RING_LENGTH]);
         //if the configuration changes from this segment to the next, change our setup accordingly
@@ -575,8 +638,18 @@ void GPUCore::loopprocess(int threadid) {
         }
     }
 
-    //fallen out of loop, so must be finished.  Unlock held mutex
+    //fallen out of loop, so must be finished.
 //  cinfo << startl << "PROCESS " << mpiid << "/" << threadid << " process thread about to free resources and exit" << endl;
+    //Drain the last still-in-flight subint's visibility transfer and release its
+    //slot lock (pipelined path only; the synchronous path leaves inflight == -1).
+    if (pipeline && inflight >= 0) {
+        completegpudata(inflight);
+        perr = pthread_mutex_unlock(&(procslots[inflight].slotlocks[threadid]));
+        if (perr != 0)
+            csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex "
+                    << inflight << endl;
+    }
+    //Unlock the slot lock we still hold (the terminator slot we grabbed ahead).
     perr = pthread_mutex_unlock(&(procslots[numprocessed % RECEIVE_RING_LENGTH].slotlocks[threadid]));
     if (perr != 0)
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex "
@@ -684,8 +757,8 @@ __global__ void _gpu_processBaselineBased(
 }
 
 void
-GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
-                        threadscratchspace *scratchspace) {
+GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
+                      threadscratchspace *scratchspace) {
     ++core_calls;
 
     auto start = high_resolution_clock::now();
@@ -961,8 +1034,8 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         // ---------------------------------------------------------------------
         // FUSED XMAC AND AVERAGE SETUP
         // ---------------------------------------------------------------------
-        // Ensure the device-side results buffer is cleanly zeroed for this subint
-        checkCuda(cudaMemsetAsync(results_gpu, 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
+        // Ensure this slot's device-side results buffer is cleanly zeroed for this subint
+        checkCuda(cudaMemsetAsync(results_gpu[index], 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
 
         // The kernel launch metadata (band indexes, result offsets, channel/pol
         // counts and the FFT buffer pointers) is invariant for a given
@@ -1023,7 +1096,7 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
                 d_v1_ptrs, d_v2_ptrs,
                 plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
                 plan.d_coreResultBaselineOffsets,
-                results_gpu,
+                results_gpu[index],
                 numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
                 fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
@@ -1033,12 +1106,26 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
         }
 
         // ---------------------------------------------------------------------
-        // FINAL HOST TRANSFER
+        // FINAL HOST TRANSFER (deferred / overlapped)
         // ---------------------------------------------------------------------
-        // Instead of dragging un-averaged cross-correlations back, we do a single, 
-        // massive PCIe transfer of the final, properly formatted `results` array.
-        checkCuda(cudaMemcpyAsync(procslots[index].results, results_gpu, procslots[index].coreresultlength * sizeof(cuFloatComplex), cudaMemcpyDeviceToHost, cuStream));
+        // Drain the compute stream so all of this subint's device work - the
+        // modes' autocorrelation/pcal copies AND the XMAC into results_gpu[index]
+        // - is complete before we read any of it.
         checkCuda(cudaStreamSynchronize(cuStream));
+
+        // Transfer ONLY the leading visibility block back to the host, into this
+        // slot's pinned staging buffer, on the dedicated d2h stream - so the copy
+        // is genuinely asynchronous and overlaps both the host-side tail
+        // accumulation immediately below and the NEXT subint's compute. The
+        // trailing baseline-weight/autocorrelation/pcal sections are added on the
+        // host directly into procslots[index].results (which the main thread zeroed
+        // before handing us this slot). completegpudata(index) awaits d2hDone[index]
+        // and then copies the staged visibilities across into procslots.
+        int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
+        checkCuda(cudaMemcpyAsync(results_host[index], results_gpu[index],
+                                  xcorrslength * sizeof(cuFloatComplex),
+                                  cudaMemcpyDeviceToHost, d2hStream));
+        checkCuda(cudaEventRecord(d2hDone[index], d2hStream));
 
         // Accumulate the autocorrelation block count and flush the modes'
         // autocorrelations into the results buffer at the AC averaging
@@ -1196,22 +1283,27 @@ GPUCore::processgpudata(int index, int threadid, int startblock, int numblocks, 
 //end the cutout of processing in "Neutered DiFX"
 #endif
 
-    //grab the next slot lock
-    perr = pthread_mutex_lock(&(procslots[(index + 1) % RECEIVE_RING_LENGTH].slotlocks[threadid]));
-    if (perr != 0)
-        csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying lock mutex "
-                << (index + 1) % RECEIVE_RING_LENGTH << endl;
-
-    //unlock the one we had
-    perr = pthread_mutex_unlock(&(procslots[index].slotlocks[threadid]));
-    if (perr != 0)
-        csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex " << index
-                << endl;
+    // NOTE: the slot lock handoff is NOT done here any more - loopprocess owns
+    // it, because with visibility-transfer pipelining the lock on this slot must
+    // be retained until completegpudata() has awaited the deferred device->host
+    // copy issued above.
 
     stop = high_resolution_clock::now();
     duration = duration_cast<microseconds>(stop - start);
 
     avg_postprocess += duration.count();
     //std::cout << "At the bottom of Core" << std::endl;
+}
+
+void GPUCore::completegpudata(int index) {
+    // Wait for this slot's visibility device->host copy (issued on d2hStream at
+    // the end of issuegpudata) to land in the pinned staging buffer, then copy
+    // the visibilities across into procslots[index].results. The trailing
+    // weight/autocorrelation/pcal sections there were already filled on the host
+    // in issuegpudata and are left untouched. After this the slot's results are
+    // complete and it may be released to the manager for sending.
+    checkCuda(cudaEventSynchronize(d2hDone[index]));
+    int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
+    memcpy(procslots[index].results, results_host[index], xcorrslength * sizeof(cuFloatComplex));
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

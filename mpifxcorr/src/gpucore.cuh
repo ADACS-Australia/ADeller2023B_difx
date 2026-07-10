@@ -28,8 +28,25 @@ public:
 
     virtual void loopprocess(int threadid);
 
-    void processgpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
-                        threadscratchspace *scratchspace);
+    /**
+     * Issue all of subint `index`'s GPU work: station processing, the fused XMAC
+     * into results_gpu[index], and an asynchronous device->host copy of just the
+     * visibility prefix onto d2hStream (recording d2hDone[index]). The host-side
+     * trailing sections (baseline weights, autocorrelations, pcal) are added into
+     * the pre-zeroed procslots[index].results here too, since they occupy a region
+     * disjoint from the visibility copy. Does NOT wait for the visibility copy, so
+     * it can overlap the next subint's compute. The slot lock is retained until
+     * completegpudata(index) runs.
+     */
+    void issuegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
+                      threadscratchspace *scratchspace);
+
+    /**
+     * Complete subint `index`: wait for its visibility device->host copy
+     * (d2hDone[index]) to land, after which procslots[index].results is fully valid
+     * and the slot may be released to the manager.
+     */
+    void completegpudata(int index);
 
 protected:
     virtual Mode *getMode(const int configindex, const int datastreamindex) {
@@ -40,15 +57,40 @@ private:
     // -------------------------------------------------------------------------
     // GPU Memory Pointers & Streams
     // -------------------------------------------------------------------------
+    /// Compute stream: all station processing (GPUMode) and the XMAC enqueue here,
+    /// in order, so the XMAC naturally follows the FFT output it consumes.
     cudaStream_t cuStream;
-    
-    /** * @brief The final, device-side visibility buffer.
-     * Replaces the CPU's `scratchspace->threadcrosscorrs`. This array is mapped 
-     * exactly to the CPU's `procslots[index].results` layout, allowing us to do 
-     * a single, massive PCIe transfer at the very end of processing.
-     * Size: `maxcoreresultlength * sizeof(cuFloatComplex)`.
+    /// Device-to-host stream: the visibility transfer back to the host runs here so
+    /// it can overlap the NEXT subintegration's compute on cuStream.
+    cudaStream_t d2hStream;
+
+    /** * @brief The final, device-side visibility buffers - one per procslot.
+     * Replaces the CPU's `scratchspace->threadcrosscorrs`. Each is mapped exactly
+     * to the CPU's `procslots[index].results` layout. There is one buffer per
+     * procslot (indexed by the procslots ring index) so that the deferred,
+     * overlapped device->host copy of subint N reads a stable buffer while subint
+     * N+1's XMAC writes its own. Size each: `maxcoreresultlength * sizeof(cuFloatComplex)`.
      */
-    cuFloatComplex* results_gpu;
+    std::vector<cuFloatComplex*> results_gpu;
+
+    /// Per-procslot PINNED host staging buffers for the visibility transfer. The
+    /// device->host copy must land in page-locked memory to be truly asynchronous
+    /// (cudaMemcpyAsync to pageable memory is effectively synchronous and would
+    /// defeat the overlap); procslots[].results is pageable, so we stage into
+    /// these and completegpudata() copies the landed prefix across on the host.
+    std::vector<cuFloatComplex*> results_host;
+
+    /// Per-procslot event marking completion of that slot's visibility device->host
+    /// copy on d2hStream. completegpudata() waits on it before the slot is released
+    /// for the manager send.
+    std::vector<cudaEvent_t> d2hDone;
+
+    /// When true (default; disable with DIFX_GPU_PIPELINE=0), subint N's visibility
+    /// transfer is left in flight while subint N+1 is issued, and only awaited just
+    /// before slot N is released - overlapping the transfer with N+1's compute. When
+    /// false, each subint is completed immediately after it is issued (no overlap),
+    /// reproducing the pre-pipelining behaviour for A/B comparison.
+    bool pipeline;
 
     /**
      * @brief Device pointers to the FFT output buffers for Datastream 1 (one per baseline).
