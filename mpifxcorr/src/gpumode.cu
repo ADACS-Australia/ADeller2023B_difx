@@ -598,9 +598,13 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // Copy packed data to device, needed to refactor this since we moved packed data allocation to the constructor.
     cudaEventRecord(ev_start, cuStream);
 
+    // Host stage (pageable procslots databuffer -> pinned) then async H2D. The
+    // host memcpy dominates this range; the H2D itself is small.
+    DIFX_NVTX_PUSH("h2d_stage");
     memcpy(packeddata_gpu->ptr(), data, datalengthbytes);
     checkCuda(cudaMemcpyAsync(packeddata_gpu->gpuPtr(), packeddata_gpu->ptr(),
                               datalengthbytes, cudaMemcpyHostToDevice, cuStream));
+    DIFX_NVTX_POP();
 
     // Figure out how many frames in the packed data
     int framestounpack = datalengthbytes / config->getMultiplexedFrameBytes(configindex, datastreamindex);
@@ -675,7 +679,10 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // ==========================================
     // 2. UNPACK
     // ==========================================
+    // Host-side per-FFT-window delay-polynomial evaluation (nearestSamples etc.).
+    DIFX_NVTX_PUSH("calculatePre_cpu");
     calculatePre_cpu(fftloop, numBufferedFFTs, startblock, numblocks);
+    DIFX_NVTX_POP();
 
     // HDRDEBUG (gated by DIFX_WEIGHT_DEBUG, same as the CPU twin in
     // cpumode.cpp): dump the delivered buffer's VDIF frame-class transitions
@@ -748,9 +755,13 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // Sync before reading nearestSamples->ptr() to avoid reading stale data from previous iteration.
     nearestSamples->sync();
 
+    // Host-side per-FFT-window weight/validity calculation (reads valid_frames
+    // back from the device via nearestSamples->sync() above).
+    DIFX_NVTX_PUSH("set_weights");
     for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
         set_weights(fftwin, framestounpack, counts, numBufferedFFTs);
     }
+    DIFX_NVTX_POP();
 
     // Indices are now calculated, so we can copy them to the gpu
     indices->copyToDevice();

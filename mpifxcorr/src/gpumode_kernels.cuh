@@ -5,6 +5,36 @@
 #include <cuComplex.h>
 #include <cufft.h>
 
+// ---------------------------------------------------------------------------
+// Lightweight NVTX instrumentation.
+//
+// Marks host-side phases (staging copies, the per-FFT-window CPU loops, XMAC
+// launch, host result accumulation, transfer waits) so they show up as named
+// ranges on an Nsight Systems timeline captured with --trace=nvtx.  NVTX v3 is
+// header-only, so this adds no link dependency.  Calls are near-zero cost when
+// no profiler is attached; define DIFX_DISABLE_NVTX to compile them out
+// entirely.
+//
+//   DIFX_NVTX_RANGE("name")  - scoped range: active until end of the enclosing block
+//   DIFX_NVTX_PUSH("name") / DIFX_NVTX_POP()  - explicit range around a statement span
+// ---------------------------------------------------------------------------
+#ifndef DIFX_DISABLE_NVTX
+#include <nvtx3/nvToolsExt.h>
+struct DifxNvtxRange {
+    DifxNvtxRange(const char *name) { nvtxRangePushA(name); }
+    ~DifxNvtxRange() { nvtxRangePop(); }
+};
+#define DIFX_NVTX_CONCAT2(a, b) a##b
+#define DIFX_NVTX_CONCAT(a, b) DIFX_NVTX_CONCAT2(a, b)
+#define DIFX_NVTX_RANGE(name) DifxNvtxRange DIFX_NVTX_CONCAT(_difx_nvtx_range_, __COUNTER__)(name)
+#define DIFX_NVTX_PUSH(name) nvtxRangePushA(name)
+#define DIFX_NVTX_POP() nvtxRangePop()
+#else
+#define DIFX_NVTX_RANGE(name) do {} while (0)
+#define DIFX_NVTX_PUSH(name) do {} while (0)
+#define DIFX_NVTX_POP() do {} while (0)
+#endif
+
 #define NOT_SUPPORTED(x) { std::cerr << "Whoops, we don't support this on the GPU: " << x << std::endl; exit(1); }
 
 #define checkCuda(err) __checkCuda(err, (char *)__FILE__, __LINE__)

@@ -923,6 +923,9 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         // do the station-based processing for this batch of FFT chunks.
         vector<std::thread> streamThreads;
 
+        // Per-datastream station processing, run sequentially on the shared
+        // compute stream (each process_gpu drains before the next).
+        DIFX_NVTX_PUSH("station_processing");
         for (int j = 0; j < numdatastreams; j++) {
             //std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
           //  if (procslots[index].datalengthbytes[j] > 1) {
@@ -938,6 +941,7 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         for (auto &t: streamThreads) {
             t.join();
         }
+        DIFX_NVTX_POP(); // station_processing
 
         stop = high_resolution_clock::now();
         duration = duration_cast<microseconds>(stop - start);
@@ -1034,6 +1038,7 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         // ---------------------------------------------------------------------
         // FUSED XMAC AND AVERAGE SETUP
         // ---------------------------------------------------------------------
+        DIFX_NVTX_PUSH("xmac_launch");
         // Ensure this slot's device-side results buffer is cleanly zeroed for this subint
         checkCuda(cudaMemsetAsync(results_gpu[index], 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
 
@@ -1112,6 +1117,7 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         // modes' autocorrelation/pcal copies AND the XMAC into results_gpu[index]
         // - is complete before we read any of it.
         checkCuda(cudaStreamSynchronize(cuStream));
+        DIFX_NVTX_POP(); // xmac_launch (includes the wait for XMAC/compute to finish)
 
         // Transfer ONLY the leading visibility block back to the host, into this
         // slot's pinned staging buffer, on the dedicated d2h stream - so the copy
@@ -1127,6 +1133,9 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
                                   cudaMemcpyDeviceToHost, d2hStream));
         checkCuda(cudaEventRecord(d2hDone[index], d2hStream));
 
+        // Host-side accumulation into procslots results (autocorrelations and
+        // baseline weights), overlapping the visibility D2H issued above.
+        DIFX_NVTX_PUSH("host_accumulate");
         // Accumulate the autocorrelation block count and flush the modes'
         // autocorrelations into the results buffer at the AC averaging
         // cadence, exactly as Core::processdata does (the leftover-count
@@ -1190,13 +1199,15 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
             }
         }
 
+        DIFX_NVTX_POP(); // host_accumulate
+
         stop = high_resolution_clock::now();
         duration = duration_cast<microseconds>(stop - start);
         //cout << "baseline weight: " << duration.count() << endl;
     }
-   
 
-    //std::cout << "Ended fft loop" << std::endl; 
+
+    //std::cout << "Ended fft loop" << std::endl;
     start = high_resolution_clock::now();
 
 //    checkCuda(cudaHostUnregister(stream1BandIndexes));
@@ -1221,6 +1232,7 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
     // would add uninitialised memory on top of the correct visibilities.
     // (This also means multiple phase centres / pulsar binning, which rely on
     // uvshiftAndAverage, are not supported on the GPU path.)
+    DIFX_NVTX_PUSH("host_finalize");
     if (acblockcount != 0) {
         averageAndSendAutocorrs(index, threadid,
                                 (startblock + acshiftcount * maxacblocks + ((double) acblockcount) / 2.0) * blockns,
@@ -1279,6 +1291,7 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
 
     //copy the PCal results
     copyPCalTones(index, threadid, modes);
+    DIFX_NVTX_POP(); // host_finalize
 
 //end the cutout of processing in "Neutered DiFX"
 #endif
@@ -1302,6 +1315,7 @@ void GPUCore::completegpudata(int index) {
     // weight/autocorrelation/pcal sections there were already filled on the host
     // in issuegpudata and are left untouched. After this the slot's results are
     // complete and it may be released to the manager for sending.
+    DIFX_NVTX_RANGE("complete_d2h_wait");
     checkCuda(cudaEventSynchronize(d2hDone[index]));
     int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
     memcpy(procslots[index].results, results_host[index], xcorrslength * sizeof(cuFloatComplex));
