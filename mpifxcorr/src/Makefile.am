@@ -131,7 +131,8 @@ libfxcorr_a_SOURCES = \
 	visibility.cpp \
 	model.cpp \
 	datamuxer.cpp \
-	alert.cpp
+	alert.cpp \
+    $(cuda_files)
 
 neuteredmpifxcorr_SOURCES = \
 	mpifxcorr.cpp \
@@ -169,4 +170,4 @@ sysutil_test_SOURCES = \
 sysutil_test_CXXFLAGS = -g -I$(top_srcdir)/src/ -I $(AM_CXXFLAGS)
 
 .cu.o:
-	nvcc -I.. -I. -g -O2 -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include   -DIPP9   -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include  -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include -Xcompiler -fopenmp -I/fred/oz168/mdutka/difx_mike_branch_2026_06_18/include -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -ccbin $(CXX) -g -O2 $(DEFAULT_INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(mathcflags) $(M5ACCESS_CFLAGS) -Xcompiler -fopenmp -c -o $@ $<

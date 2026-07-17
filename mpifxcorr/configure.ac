@@ -144,8 +144,9 @@ dnl **********************************************************
 dnl **** Check for CUDA                                   ****
 dnl **********************************************************
 
-NVCC=nvcc
-NVCCFLAGS=
+AC_ARG_VAR([NVCC],[CUDA compiler command (default: nvcc)])
+AC_ARG_VAR([NVCCFLAGS],[extra flags for nvcc, e.g. -arch=sm_75])
+NVCC=${NVCC:-nvcc}
 AC_CHECK_PROG([with_cuda],[$NVCC],[yes],[no])
 
 AC_ARG_ENABLE(cuda,
@@ -161,8 +162,19 @@ AS_IF([test "x$with_cuda" == "xyes"],[
 	AC_SUBST(NVCC)
 	AC_SUBST(NVCCFLAGS)
 	dnl This needs to go into the linker command, because in the end mpicc
-	dnl (rather than nvcc) will be called to link everything together
+	dnl (rather than nvcc) will be called to link everything together.
+	dnl Derive the CUDA lib dir from nvcc's location, since the toolkit's
+	dnl lib64 is typically not in the default linker search path.
+	AC_PATH_PROG([NVCC_FULLPATH],[$NVCC])
+	cuda_prefix=`dirname \`dirname "$NVCC_FULLPATH"\``
 	CUDA_LIBS="-lcudart -lcufft"
+	AS_IF([test -d "${cuda_prefix}/lib64"],[
+		CUDA_LIBS="-L${cuda_prefix}/lib64 -Wl,-rpath,${cuda_prefix}/lib64 ${CUDA_LIBS}"
+	])
+	dnl Plain C++ files also include CUDA headers (e.g. cuComplex.h via mode.h)
+	AS_IF([test -d "${cuda_prefix}/include"],[
+		CPPFLAGS="${CPPFLAGS} -I${cuda_prefix}/include"
+	])
 	AC_DEFINE([USE_CUDA], [1], [Compile CUDA-based GPU acceleration.])
 	AC_MSG_NOTICE([GPU support through CUDA will be **enabled** on this build])
 ],[
