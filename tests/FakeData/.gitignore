@@ -1,0 +1,7 @@
+benchsimreal_1.*
+benchsimreal.joblist
+*.difx/
+difxlog*.txt
+*.nsys-rep
+*.sqlite
+*.qdstrm
