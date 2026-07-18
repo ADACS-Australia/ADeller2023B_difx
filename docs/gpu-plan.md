@@ -16,11 +16,11 @@ work. Lever A (pinned input buffers, direct H2D) landed 2026-07-18 for
 
 ## Work queue (ordered)
 
-1. **Multi-subband, N>2-station Synthetic scenario.** The correctness
-   net is currently 2-station single-subband, which does not exercise
-   the multi-datastream/multi-band slot machinery that the next item
-   rewrites. Generate extra VDIF stations (new seeds) via createData.sh,
-   add a vex/v2d pair, wire into run-local.sh / run-slurm.sh.
+1. ~~**Multi-subband, N>2-station Synthetic scenario.**~~ DONE
+   2026-07-18: the `multi` scenario — 5 stations x 4 subbands
+   (test-multi.vex/v2d, 4-channel VDIF from generateVDIF) — PASSes
+   CPU-vs-GPU in both pipeline modes and is wired into run-local.sh and
+   run-slurm.sh (rank counts now sized per scenario).
 2. **De-serialize the per-datastream loop** (the main event). Overlap
    datastream j+1's input H2D and host-side work with datastream j's
    GPU compute, and overlap `host_accumulate` with the next subint.

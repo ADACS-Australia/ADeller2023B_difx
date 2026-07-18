@@ -19,7 +19,8 @@
 #   WORKDIR        job/output directory  (default: <this dir>/local-runs)
 #   SETUP_SCRIPT   DiFX setup script     (default: <repo root>/setup.bash)
 #   DIFF_THRESHOLD diffDiFX.py threshold (default: 0.0005)
-#   NTASKS         MPI ranks per job     (default: 4)
+#   NTASKS         MPI ranks per job     (default: ACTIVE DATASTREAMS + 2,
+#                  read from each scenario's .input)
 #
 # Scenarios listed in GPU_UNSUPPORTED below are SKIPped on the GPU legs
 # (GPUMode NOT_SUPPORTED("lower sideband")); remove entries as GPU support
@@ -33,7 +34,7 @@ cd "$SYNTHDIR"
 : "${WORKDIR:=$SYNTHDIR/local-runs}"
 : "${SETUP_SCRIPT:=$SYNTHDIR/../../setup.bash}"
 : "${DIFF_THRESHOLD:=0.0005}"
-: "${NTASKS:=4}"
+: "${NTASKS:=}"
 
 # Per-run state as files (mirrors run-slurm.sh; keys use '~' separators).
 STATE="$(mktemp -d "${TMPDIR:-/tmp}/difx-local-test.XXXXXX")"
@@ -44,7 +45,7 @@ state_has() { [ -f "$STATE/$1" ]; }
 
 ######## Scenarios and modes #################################################
 
-ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex)
+ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi)
 
 # Scenarios the GPU path rejects by design (lower sideband not implemented).
 GPU_UNSUPPORTED=(lsb lsb-complex usb-dsb lsb-dsb)
@@ -137,10 +138,17 @@ run_mode() {
         gpu1) usegpu="--usegpu"; pipeline=1 ;;
     esac
 
+    # 1 manager + N datastreams + 1 core, unless NTASKS overrides
+    local np="$NTASKS"
+    if [ -z "$np" ]; then
+        np=$(awk '/^ACTIVE DATASTREAMS/{print $3+2}' "$jobdir/${expname}.input")
+    fi
+
     rm -rf "$jobdir/${expname}.difx"
     ( set +u; . "$SETUP_SCRIPT"; set -u; cd "$jobdir"; \
       [ -n "$pipeline" ] && export DIFX_GPU_PIPELINE=$pipeline; \
-      mpirun -machinefile "$SYNTHDIR/machines" -np "$NTASKS" \
+      mpirun --oversubscribe --mca mpi_yield_when_idle 1 \
+          -machinefile "$SYNTHDIR/machines" -np "$np" \
           mpifxcorr "${expname}.input" --nocommandthread $usegpu ) \
       > "$jobdir/${mode}.mpilog" 2>&1
 }

@@ -23,6 +23,7 @@ set -u
 SYNTHDIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SYNTHDIR"
 
+TMPDIR=$SYNTHDIR
 # Per-run state is kept as files under a temp dir (rather than bash-4
 # associative arrays) so this works on older bash too.  Keys use '~' as a
 # separator, which never appears in scenario/mode names.
@@ -61,13 +62,15 @@ fi
 : "${GPU_GRES:=gpu:1}"
 : "${REFERENCE_SETUP_SCRIPT:=}"
 : "${DIFF_THRESHOLD:=0.0005}"
-: "${CPU_NTASKS:=4}";       : "${CPU_TIME:=10:00}";       : "${CPU_MEM_PER_CPU:=3000}"
-: "${GPU_NTASKS:=4}";       : "${GPU_TIME:=10:00}";       : "${GPU_MEM_PER_CPU:=4000}"
-: "${REFERENCE_NTASKS:=4}"; : "${REFERENCE_TIME:=10:00}"; : "${REFERENCE_MEM_PER_CPU:=3000}"
+: "${CPU_NTASKS:=7}";       : "${CPU_TIME:=10:00}";       : "${CPU_MEM_PER_CPU:=3000}"
+: "${GPU_NTASKS:=7}";       : "${GPU_TIME:=10:00}";       : "${GPU_MEM_PER_CPU:=4000}"
+: "${REFERENCE_NTASKS:=7}"; : "${REFERENCE_TIME:=10:00}"; : "${REFERENCE_MEM_PER_CPU:=3000}"
 
 ######## Scenarios and modes #################################################
 
-ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex)
+# NOTE: the multi scenario (5 stations) needs ntasks >= 7 - check
+# CPU_NTASKS/GPU_NTASKS in your slurm.conf (defaults below now allow it).
+ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi)
 
 if [ "$#" -gt 0 ]; then
     SCENARIOS=("$@")

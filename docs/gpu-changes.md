@@ -110,7 +110,20 @@ Core thread alternates host work and GPU work. Groundwork and levers:
   Desktop benchmark: 269 s → 259 s (~4%); the cluster fraction was
   larger. Verified 6/6 Synthetic PASS in both pipeline modes.
 
-## 6. Desktop bring-up (2026-07-17/18)
+## 6. Multi-station, multi-subband correctness coverage
+
+Until 2026-07-18 every correctness scenario was 2 stations with a single
+subband, so the multi-datastream / multi-band machinery (the XMAC plans,
+the per-datastream loops that the de-serialization work rewrites) was
+never exercised by the safety net. The `multi` scenario adds 5 stations
+(the two original test sites plus Parkes/Hobart/Ceduna-like southern
+sites) each recording 4 x 4 MHz USB subbands as 4-channel VDIF
+(`generateVDIF -C 4`, distinct seeds/tones per station). First run: PASS
+CPU-vs-GPU in both pipeline modes, 1440 records compared at ~4e-7
+relative difference. The local and SLURM harnesses now size their MPI
+rank counts per scenario instead of assuming 4.
+
+## 7. Desktop bring-up (2026-07-17/18)
 
 Development moved from Mac + SLURM cluster to a local RTX 2070 desktop
 (Fedora 43, CUDA 13.2, OpenMPI 5): the mpifxcorr `.cu.o` build rule and
