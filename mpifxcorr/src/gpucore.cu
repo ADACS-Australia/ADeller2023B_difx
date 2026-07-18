@@ -1176,6 +1176,15 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         checkCuda(cudaStreamSynchronize(cuStream));
         DIFX_NVTX_POP(); // xmac_launch (includes the wait for XMAC/compute to finish)
 
+        // Land the device-computed per-window weights and autocorr mirrors on
+        // the host (no-op on the host-weights fallback path) - the drain above
+        // guarantees their async D2H copies have completed. Must precede the
+        // averageAndSendAutocorrs/baseline-weight consumers below. Correct
+        // only while numfftloops == 1 (guaranteed above): finishWeights sums
+        // all cfg_numBufferedFFTs windows, i.e. the whole subint per call.
+        for (int j = 0; j < numdatastreams; j++)
+            ((GPUMode *) modes[j])->finishWeights();
+
         // Transfer ONLY the leading visibility block back to the host, into this
         // slot's pinned staging buffer, on the dedicated d2h stream - so the copy
         // is genuinely asynchronous and overlaps both the host-side tail

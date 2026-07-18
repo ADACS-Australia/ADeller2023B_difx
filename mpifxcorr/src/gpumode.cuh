@@ -34,6 +34,26 @@ public:
     static void setSharedComputeStream(cudaStream_t stream) { sharedComputeStream = stream; }
 
     /**
+     * True (default) when per-window weights/validity/sample indexes are
+     * computed on the device by the gpu_set_weights kernel, eliminating the
+     * valid_frames D2H round-trip and the per-datastream stream drains.
+     * DIFX_GPU_WEIGHTS_HOST=1 restores the host set_weights path (which also
+     * carries the full-fidelity WDEBUG output).
+     */
+    static bool useGpuWeights();
+
+    /**
+     * Land the device-computed per-window weights on the host and run the
+     * (interim, see docs/gpu-deserialization-design.md) host accumulations
+     * that consume them: Mode::dataweight[] for the baseline-weight loops
+     * and the per-band autocorrelation weights. Must be called after the
+     * end-of-subint compute-stream drain (GPUCore does, before
+     * host_accumulate). No-op when this subint's weights were computed on
+     * the host (fallback path or invalid subint).
+     */
+    void finishWeights();
+
+    /**
      * Declare whether the Core receive buffers (procslots[].databuffer[]) that
      * setData() hands to process_gpu are page-locked (cudaHostRegister'd).
      * GPUCore calls this once, before any Mode is constructed, after
@@ -106,6 +126,18 @@ protected:
 
     GpuMemHelper<int> *gSampleIndexes;
     GpuMemHelper<bool> *gValidSamples;
+    /// This subint's validity bit-words (host-born, uploaded per subint for
+    /// the gpu_set_weights kernel; FLAGS_PER_INT bits per word).
+    GpuMemHelper<unsigned int> *gValidFlags;
+    /// Per-window data weights, computed on the device by gpu_set_weights
+    /// and copied back asynchronously for the interim host consumers.
+    GpuMemHelper<float> *gDataWeights;
+    /// Per-freq matching-band count for the indices band map - pure
+    /// configuration, built once at construction (see also indices).
+    int *countsStatic;
+    /// True while the current subint's weights live only on the device
+    /// (i.e. gpu_set_weights ran and finishWeights() has not yet run).
+    bool weightsOnDevice;
     GpuMemHelper<double> *gInterpolator;
     GpuMemHelper<float> *gFracSampleError;
     GpuMemHelper<double> *gLoFreqs;

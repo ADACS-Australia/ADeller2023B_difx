@@ -30,8 +30,13 @@ work. Lever A (pinned input buffers, direct H2D) landed 2026-07-18 for
    Candidate within the same effort: reduce `fringeRotation`'s
    double-precision arithmetic (66% of GPU time on GeForce, ~25% on
    data-centre cards) if accuracy analysis allows.
-3. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
-4. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
+3. **perbandweights on GPU** — currently unused on the GPU path but
+   should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
+   handling (identified in the de-serialization design review). Shape
+   the device weights kernel (item 2, Increment 1) so per-(window, band)
+   weights are a natural extension.
+4. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
+5. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
    `blanker_vdif_gpu`) + widen the `getMode` format gate. MUST add the
    `datalengthbytes <= getMaxDataBytes` clamp in `process_gpu` first:
    non-VDIF datastreams keep the base class's guard-scaled sendbytes,
@@ -80,6 +85,14 @@ will ease the eventual merge and put GPU code where it belongs:
 
 ## Longer-term / opportunistic
 
+- **Subints larger than GPU memory**: today a subint's full set of FFT
+  windows must fit on the device, so large station counts or data rates
+  force short subints — at the cost of a higher visibility rate from the
+  Cores back to the manager. Broaden GPUMode/GPUCore to slice a subint
+  into chunks of FFT windows processed a subset at a time (the dormant
+  fftloops machinery is the natural seam). Interacts with the VRAM
+  budget check, cfg_numBufferedFFTs sizing, and the numfftloops == 1
+  assumptions documented in de-serialization Increment 1.
 - **Tensor cores for the XMAC**: the cross-multiply-accumulate is a
   complex GEMM at heart, a natural tensor-core target (Turing: FP16
   multiply / FP32 accumulate; data-centre cards add TF32/FP64 paths).

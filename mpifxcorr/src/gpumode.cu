@@ -25,7 +25,82 @@ const int MAX_INDICIES = 10;
 cudaStream_t GPUMode::sharedComputeStream = nullptr;
 bool GPUMode::inputBuffersPinned = false;
 
-static int weightDebugFrom();   // defined above set_weights, also used by process_gpu
+static int weightDebugFrom();   // defined above set_weights
+
+bool GPUMode::useGpuWeights() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DIFX_GPU_WEIGHTS_HOST");
+        cached = (e != NULL && atoi(e) != 0) ? 0 : 1;
+    }
+    return cached == 1;
+}
+
+void GPUMode::finishWeights() {
+    if (!weightsOnDevice)
+        return;             // host path or invalid subint: host arrays already correct
+    weightsOnDevice = false;
+
+    // GPUCore has drained the compute stream, so the async D2H of the
+    // device-computed weights (and of the autocorr accumulators, enqueued
+    // in fractionalRotation) have landed in the pinned halves.
+    memcpy(dataweight, gDataWeights->ptr(), cfg_numBufferedFFTs * sizeof(f32));
+
+    // Host mirror of the device autocorrelation accumulators (was section 8
+    // of process_gpu on the host-weights path).
+    for (int i = 0; i < autocorrwidth; i++) {
+        for (int j = 0; j < numrecordedbands; j++) {
+            vectorCopy_cf32(
+                    reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
+                    autocorrelations[i][j],
+                    recordedbandchannels
+            );
+        }
+    }
+
+    // Per-band autocorrelation weight accumulation (was the tail of the host
+    // set_weights loop; zero-weight windows contribute nothing, so summing
+    // unconditionally over all windows gives identical totals). Becomes a
+    // device reduction in Increment 2 (docs/gpu-deserialization-design.md).
+    // NOTE: assumes perbandweights is not in use on the GPU path (true today;
+    // the host tail has a perbandweights branch this does not replicate - see
+    // gpu-plan.md work item on GPU perbandweights support).
+    if (perbandweights) {
+        cfatal << startl << "GPUMode::finishWeights: perbandweights is set but not supported on the device-weights path" << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    for (int w = 0; w < cfg_numBufferedFFTs; w++) {
+        const f32 dw = dataweight[w];
+        for (int i = 0; i < numrecordedfreqs; i++) {
+            const int count = countsStatic[i];
+            for (int k = 0; k < count; k++)
+                weights[0][indices->ptr()[(i * MAX_INDICIES) + k]] += dw;
+            if (count > 1) {
+                weights[1][indices->ptr()[(i * MAX_INDICIES)]] += dw;
+                weights[1][indices->ptr()[(i * MAX_INDICIES) + 1]] += dw;
+            }
+        }
+    }
+
+    // WDEBUG parity output for the device path: reconstruct the host path's
+    // per-window lines (validity inputs are all host-known).
+    if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom()) {
+        const bool subintValid = (datalengthbytes > 1) && (offsetseconds != INVALID_SUBINT);
+        for (int w = 0; w < cfg_numBufferedFFTs; w++) {
+            const bool flagged_ok =
+                ((static_cast<unsigned int>(validflags[w / FLAGS_PER_INT]) >> (w % FLAGS_PER_INT)) & 0x01) != 0;
+            const int ns = nearestSamples->ptr()[w];
+            if (!subintValid || !flagged_ok) {
+                fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=0.000000000 valid=0 reason=rejected\n",
+                        datastreamindex, datasec, datans, w, ns);
+            } else {
+                fprintf(stderr, "WDEBUG ds=%d datasec=%d datans=%d index=%d nearest=%d weight=%.9f valid=%d reason=ok\n",
+                        datastreamindex, datasec, datans, w, ns,
+                        dataweight[w], dataweight[w] > 0.0f ? 1 : 0);
+            }
+        }
+    }
+}
 
 // Env-gated per-window spectral tracing (DIFX_SPEC_DEBUG=<datasec>), the GPU
 // twin of the SPECDEBUG lines in CPUMode::process (cpumode.cpp) - identical
@@ -47,6 +122,64 @@ __global__ void gpu_allocate_unpacked(float** arrays, float* data, int nchan, in
         arrays[i] = data + i * dlen;
         //printf("Channel %i starts at %p\n", i, arrays[i]);
     }
+}
+
+// Device twin of the host set_weights() window loop: one thread per FFT
+// window computes the window's data weight from the frame validity the
+// unpack/blanker kernels just produced - entirely on-device, so there is
+// no valid_frames D2H, no host loop, and no re-upload of the results.
+// Deliberate simplifications vs the host path (agreed in
+// docs/gpu-deserialization-design.md): unpackstartsamples is always 0 so
+// sampleIndexes[w] is nearestSamples[w] directly; nearestSamples == -1
+// (the calculatePre sentinel) marks the window invalid instead of
+// aborting; and a window spanning more than two frames gets weight 0.
+__global__ void gpu_set_weights(const int *nearest, const bool *validFrames,
+                                const unsigned int *validFlagWords,
+                                float *dataweight, bool *validSamples,
+                                int *sampleIndexes,
+                                int numWindows, int nframes,
+                                int framesamples, int fftchannels,
+                                bool subintValid) {
+    const int w = blockIdx.x * blockDim.x + threadIdx.x;
+    if (w >= numWindows)
+        return;
+
+    const int ns = nearest[w];
+    sampleIndexes[w] = ns;
+
+    const bool flagged_ok =
+        ((validFlagWords[w / FLAGS_PER_INT] >> (w % FLAGS_PER_INT)) & 1u) != 0u;
+    if (!subintValid || !flagged_ok || ns < 0) {
+        dataweight[w] = 0.0f;
+        validSamples[w] = false;
+        return;
+    }
+
+    // Frames at or beyond nframes were not delivered this subintegration
+    // (their buffers hold stale contents), so they count as invalid -
+    // identical to the host path's frame_ok().
+    const int start_frame = ns / framesamples;
+    const int end_frame = (w + 1 == numWindows)
+        ? (ns + fftchannels - 1) / framesamples
+        : (nearest[w + 1] - 1) / framesamples;
+
+    const float ok_start =
+        (start_frame >= 0 && start_frame < nframes && validFrames[start_frame]) ? 1.0f : 0.0f;
+    float weight;
+    if (start_frame == end_frame) {
+        weight = ok_start;
+    } else if (start_frame + 1 == end_frame) {
+        const float ok_end =
+            (end_frame < nframes && validFrames[end_frame]) ? 1.0f : 0.0f;
+        const float frac_first =
+            (float)(end_frame * framesamples - ns) / (float)fftchannels;
+        weight = frac_first * ok_start + (1.0f - frac_first) * ok_end;
+    } else {
+        weight = 0.0f;
+    }
+
+    dataweight[w] = weight;
+    validSamples[w] = weight > 0.0f;
 }
 
 __global__ void gpu_allocate_unpacked_complex(cuFloatComplex** arrays, cuFloatComplex* data, int nchan, int dlen) {
@@ -202,6 +335,23 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     for (auto i = 0; i < (MAX_INDICIES * numrecordedfreqs); i++) {
         indices->ptr()[i] = 0xffffffff;
     }
+    // The per-freq matching-band map (and its counts) are pure configuration:
+    // build and upload them once here instead of rebuilding them for every
+    // FFT window in the host set_weights loop (which still refreshes its own
+    // copy when the DIFX_GPU_WEIGHTS_HOST fallback is active).
+    countsStatic = new int[numrecordedfreqs]();
+    for (int i = 0; i < numrecordedfreqs; i++) {
+        int count = 0;
+        for (int j = 0; j < numrecordedbands; j++) {
+            if (config->matchingRecordedBand(configindex, datastreamindex, i, j))
+                indices->ptr()[(i * MAX_INDICIES) + count++] = j;
+        }
+        countsStatic[i] = count;
+    }
+    indices->copyToDevice();
+    gValidFlags = new GpuMemHelper<unsigned int>(cfg_numBufferedFFTs / FLAGS_PER_INT + 1, cuStream);
+    gDataWeights = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
+    weightsOnDevice = false;
     grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
     grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedbands, cuStream);
     grecordedfreqlooffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
@@ -335,6 +485,9 @@ GPUMode::~GPUMode() {
 
     delete gSampleIndexes;
     delete gValidSamples;
+    delete gValidFlags;
+    delete gDataWeights;
+    delete[] countsStatic;
     delete gInterpolator;
     delete gFracSampleError;
 
@@ -654,6 +807,10 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         }
         gValidSamples->copyToDevice();
 
+        // Host arrays are authoritative for this subint (all zero) - make
+        // sure finishWeights() does not overwrite them from the device.
+        weightsOnDevice = false;
+
         checkCuda(cudaStreamSynchronize(cuStream));
 	    return numBufferedFFTs;
     }
@@ -734,7 +891,11 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         }
     }
 
-    packeddata_gpu->sync();
+    // Historic drain with no data dependency (the unpack kernels are
+    // stream-ordered after the input H2D); kept only on the host-weights
+    // fallback path so DIFX_GPU_WEIGHTS_HOST=1 reproduces old behaviour.
+    if (!useGpuWeights())
+        packeddata_gpu->sync();
     unpack_all(framestounpack);
 
     // The unpack kernel only decoded framestounpack frames; beyond that the
@@ -769,27 +930,67 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // 3. COPY TO (Weights & Indices)
     // ==========================================
     int counts[numrecordedfreqs] = {0};
-    // Set up the FFT window indices and weights
-    // Ideally this will move to the GPU but it's a bit tricky. Isn't *too* time intensive anyway I think
-    
-    // CRITICAL: nearestSamples->copyToDevice() in calculatePre_cpu() is async.
-    // Sync before reading nearestSamples->ptr() to avoid reading stale data from previous iteration.
-    nearestSamples->sync();
 
-    // Host-side per-FFT-window weight/validity calculation (reads valid_frames
-    // back from the device via nearestSamples->sync() above).
-    DIFX_NVTX_PUSH("set_weights");
-    for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
-        set_weights(fftwin, framestounpack, counts, numBufferedFFTs);
+    if (useGpuWeights()) {
+        // Device-side weights (default): upload this subint's validity
+        // bit-words (host-born, tiny) and compute weight/validity/sample
+        // index per window in place on the device - no drain, no
+        // valid_frames round trip, no result re-upload. The host copy of
+        // dataweight[] still needed by the interim host accumulations is
+        // brought back asynchronously here and landed by finishWeights()
+        // after GPUCore's end-of-subint drain.
+        DIFX_NVTX_PUSH("set_weights");
+        const int nflagwords = cfg_numBufferedFFTs / FLAGS_PER_INT + 1;
+        const int srcwords = (flaglength < nflagwords) ? flaglength : nflagwords;
+        memcpy(gValidFlags->ptr(), validflags, srcwords * sizeof(unsigned int));
+        if (srcwords < nflagwords)
+            memset(gValidFlags->ptr() + srcwords, 0,
+                   (nflagwords - srcwords) * sizeof(unsigned int));
+        gValidFlags->copyToDevice();
+
+        int framesamples = config->getMultiplexedFramePayloadBytes(configindex, datastreamindex)*8 /
+            (config->getDNumBits(configindex, datastreamindex)*config->getDNumRecordedBands(configindex, datastreamindex)*config->getDDecimationFactor(configindex, datastreamindex));
+        if (usecomplex)
+            framesamples /= 2;
+        const bool subintValid =
+            (datalengthbytes > 1) && (offsetseconds != INVALID_SUBINT);
+
+        const int tpb = 128;
+        gpu_set_weights<<<(numBufferedFFTs + tpb - 1) / tpb, tpb, 0, cuStream>>>(
+            nearestSamples->gpuPtr(), valid_frames->gpuPtr(),
+            gValidFlags->gpuPtr(),
+            gDataWeights->gpuPtr(), gValidSamples->gpuPtr(),
+            gSampleIndexes->gpuPtr(),
+            numBufferedFFTs, framestounpack, framesamples, fftchannels,
+            subintValid);
+        checkCuda(cudaMemcpyAsync(gDataWeights->ptr(), gDataWeights->gpuPtr(),
+                                  cfg_numBufferedFFTs * sizeof(float),
+                                  cudaMemcpyDeviceToHost, cuStream));
+        weightsOnDevice = true;
+        memcpy(counts, countsStatic, numrecordedfreqs * sizeof(int));
+        DIFX_NVTX_POP();
+    } else {
+        // Host fallback (DIFX_GPU_WEIGHTS_HOST=1): the original round-trip
+        // path - drain so valid_frames is host-visible, loop over windows
+        // on the host, upload the results.
+        // CRITICAL: nearestSamples->copyToDevice() in calculatePre_cpu() is async.
+        // Sync before reading nearestSamples->ptr() to avoid reading stale data.
+        nearestSamples->sync();
+
+        DIFX_NVTX_PUSH("set_weights");
+        for (int fftwin = 0; fftwin < numBufferedFFTs; fftwin++) {
+            set_weights(fftwin, framestounpack, counts, numBufferedFFTs);
+        }
+        DIFX_NVTX_POP();
+
+        // Indices are now calculated, so we can copy them to the gpu
+        indices->copyToDevice();
+
+        // We need to copy the sample indexes to the gpu
+        gSampleIndexes->copyToDevice();
+        gValidSamples->copyToDevice();
+        weightsOnDevice = false;
     }
-    DIFX_NVTX_POP();
-
-    // Indices are now calculated, so we can copy them to the gpu
-    indices->copyToDevice();
-
-    // We need to copy the sample indexes to the gpu
-    gSampleIndexes->copyToDevice();
-    gValidSamples->copyToDevice();
 
     cudaEventRecord(ev_copy2, cuStream);
 
@@ -833,7 +1034,19 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // do the frac sample correct (+ phase shifting if applicable, + fringe rotate if its post-f) 
     fractionalRotation(fftloop, numBufferedFFTs, startblock, numblocks, calccrosspolautocorrs, counts);
     cudaEventRecord(ev_frac, cuStream);
-    cudaEventSynchronize(ev_frac);
+    // The per-datastream end drain exists for the host-weights path (and
+    // for the event-timer readbacks below). On the device-weights path the
+    // stream runs free - GPUCore's end-of-subint drain is the only barrier.
+    if (!useGpuWeights()) {
+        cudaEventSynchronize(ev_frac);
+    } else if (specDebugFrom() >= 0 && datasec >= specDebugFrom()) {
+        // SPECDEBUG (debug-only) reads device buffers synchronously and the
+        // host halves of the validity/index arrays - afford it a drain and
+        // the extra copies.
+        gValidSamples->copyToHost();
+        gSampleIndexes->copyToHost();
+        checkCuda(cudaStreamSynchronize(cuStream));
+    }
 
     // GPU twin of the CPU path's SPECDEBUG tracing (see specDebugFrom above).
     // All device work for this batch is complete at this point, so small
@@ -886,49 +1099,52 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         }
     }
     
-    float ms_copy1 = 0, ms_unpack = 0, ms_copy2 = 0, ms_pcal = 0, ms_rotate = 0, ms_fft = 0, ms_frac = 0;
+    if (!useGpuWeights()) {
+        // Event-timer readbacks require the events to have completed, which
+        // only the host-weights path's end drain guarantees; on the device
+        // path NVTX/nsys is the profiling tool.
+        float ms_copy1 = 0, ms_unpack = 0, ms_copy2 = 0, ms_pcal = 0, ms_rotate = 0, ms_fft = 0, ms_frac = 0;
 
-    cudaEventElapsedTime(&ms_copy1, ev_start, ev_copy1);
-    cudaEventElapsedTime(&ms_unpack, ev_copy1, ev_unpack);
-    cudaEventElapsedTime(&ms_copy2, ev_unpack, ev_copy2);
-    cudaEventElapsedTime(&ms_pcal, ev_copy2, ev_pcal);
-    cudaEventElapsedTime(&ms_rotate, ev_pcal, ev_rotate);
-    cudaEventElapsedTime(&ms_fft, ev_rotate, ev_fft);
-    cudaEventElapsedTime(&ms_frac, ev_fft, ev_frac);
+        cudaEventElapsedTime(&ms_copy1, ev_start, ev_copy1);
+        cudaEventElapsedTime(&ms_unpack, ev_copy1, ev_unpack);
+        cudaEventElapsedTime(&ms_copy2, ev_unpack, ev_copy2);
+        cudaEventElapsedTime(&ms_pcal, ev_copy2, ev_pcal);
+        cudaEventElapsedTime(&ms_rotate, ev_pcal, ev_rotate);
+        cudaEventElapsedTime(&ms_fft, ev_rotate, ev_fft);
+        cudaEventElapsedTime(&ms_frac, ev_fft, ev_frac);
 
-    // Filter out garbage/negative thread-clash timings BEFORE casting to long long
-    t_copyto += (long long)((std::max(0.0f, ms_copy1) + std::max(0.0f, ms_copy2)) * 1000.0f);
-    t_unpack += (long long)(std::max(0.0f, ms_unpack) * 1000.0f);
-    t_pcal   += (long long)(std::max(0.0f, ms_pcal) * 1000.0f);
-    t_rotate += (long long)(std::max(0.0f, ms_rotate) * 1000.0f);
-    t_fft    += (long long)(std::max(0.0f, ms_fft) * 1000.0f);
-    t_fracrotate += (long long)(std::max(0.0f, ms_frac) * 1000.0f);
+        // Filter out garbage/negative thread-clash timings BEFORE casting to long long
+        t_copyto += (long long)((std::max(0.0f, ms_copy1) + std::max(0.0f, ms_copy2)) * 1000.0f);
+        t_unpack += (long long)(std::max(0.0f, ms_unpack) * 1000.0f);
+        t_pcal   += (long long)(std::max(0.0f, ms_pcal) * 1000.0f);
+        t_rotate += (long long)(std::max(0.0f, ms_rotate) * 1000.0f);
+        t_fft    += (long long)(std::max(0.0f, ms_fft) * 1000.0f);
+        t_fracrotate += (long long)(std::max(0.0f, ms_frac) * 1000.0f);
 
+        // ==========================================
+        // 8. POST-PROCESSING (Host Autocorrelations)
+        // ==========================================
+        // This synchronise is really needed, as we need the GPU processing/memcpys
+        // to finish before we read the result data in to the autocorrelation
+        // vectors. On the device-weights path both the drain and the copy move
+        // to finishWeights(), after GPUCore's single end-of-subint drain.
+        auto post_start = high_resolution_clock::now();
+        temp_autocorrelations_gpu->sync();
 
-
-    // ==========================================
-    // 8. POST-PROCESSING (Host Autocorrelations)
-    // ==========================================
-    // This synchronise is really needed, as we need the GPU processing/memcpys to finish before we read the result
-    // data in to the autocorrelation vectors
-    auto post_start = high_resolution_clock::now();
-    temp_autocorrelations_gpu->sync();
-
-    
-
-    // Copy over the autocorrs
-    for (int i = 0; i < autocorrwidth; i++) {
-        for (int j = 0; j < numrecordedbands; j++) {
-            vectorCopy_cf32(
-                    reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
-                    autocorrelations[i][j],
-                    recordedbandchannels
-            );
+        // Copy over the autocorrs
+        for (int i = 0; i < autocorrwidth; i++) {
+            for (int j = 0; j < numrecordedbands; j++) {
+                vectorCopy_cf32(
+                        reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
+                        autocorrelations[i][j],
+                        recordedbandchannels
+                );
+            }
         }
-    }
 
-    auto post_stop = high_resolution_clock::now();
-    t_postprocess += duration_cast<microseconds>(post_stop - post_start).count();
+        auto post_stop = high_resolution_clock::now();
+        t_postprocess += duration_cast<microseconds>(post_stop - post_start).count();
+    }
 
     // 9. TOTAL PROCESSING TIME
     auto end_time = high_resolution_clock::now();

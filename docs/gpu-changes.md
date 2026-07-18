@@ -110,6 +110,21 @@ Core thread alternates host work and GPU work. Groundwork and levers:
   Desktop benchmark: 269 s → 259 s (~4%); the cluster fraction was
   larger. Verified 6/6 Synthetic PASS in both pipeline modes.
 
+- **De-serialization Increment 1 — set_weights on the device**
+  (2026-07-18): the per-window weight/validity/sample-index calculation
+  moved from a host loop (fed by a device-to-host copy of the frame
+  validity, and followed by re-uploads) into a small per-window kernel
+  that computes everything in place. All three per-datastream stream
+  drains inside process_gpu disappear on the default path
+  (`DIFX_GPU_WEIGHTS_HOST=1` restores the host path, which also carries
+  full-fidelity WDEBUG). The config-static band map is now built once at
+  construction. Verified: fractional boundary-window weights bit-identical
+  to the CPU (WDEBUG money grep), 8/8 scenarios PASS, benchmark
+  T5-T1 66.7 -> 62.4 s; nsys shows station_processing collapsed from
+  83.6 to 63.6 ms/subint (= its GPU kernel content). host_accumulate
+  (72 ms/subint, 48% of wall) is Increment 2's target. Design and audit
+  trail: docs/gpu-deserialization-design.md.
+
 ## 6. Multi-station, multi-subband correctness coverage
 
 Until 2026-07-18 every correctness scenario was 2 stations with a single
