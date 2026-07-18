@@ -24,6 +24,7 @@ Rules:
 | date | commit | mode | T1 (s) | T5 (s) | T5−T1 (s) | notes |
 |---|---|---|---|---|---|---|
 | 2026-07-18 | 785bcaec0 | gpu | 24.0 | 90.7 | 66.7 | first ledger row; Lever A (pinned input) in |
+| 2026-07-18 | f39cd5bc3 | gpu | 22.5 | 84.9 | 62.4 | set_weights on device (de-serialization Incr 1) |
 
 ## Pre-protocol reference points (15 s of data, tInt 2 s, whole-run wall)
 
