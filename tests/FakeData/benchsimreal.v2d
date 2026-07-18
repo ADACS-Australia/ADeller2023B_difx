@@ -7,14 +7,22 @@ antennas = BR, FD, HN, KP, LA, MK, NL, OV, PT, SC
 # original window started 02:18:00 (mjdStart 59675.09583333, mjdStop
 # 59675.09653444 = 60.6s) but not all antennas are on source at the very
 # start - a short window there yields only 4 active datastreams. Start
-# +20s instead. 15s of data = 260s wall on the RTX 2070 desktop; 4s
-# keeps nsys runs around a minute.
+# +20s instead.
+# The benchmark metric is T(5s of data) - T(1s of data), which cancels
+# start-up/shutdown costs; run-bench.sh generates both jobs from this
+# file by rewriting mjdStop (1s: 59675.09607640, 5s: 59675.09612270,
+# padded high so MJD rounding cannot fall below minLength).
+# See BENCHMARKS.md. For nsys profiling ~4s (59675.09611111) is right.
 mjdStart = 59675.09606481
-mjdStop  = 59675.09623843
+mjdStop  = 59675.09612268
+
+# permit the benchmark's 1s leg (vex2difx default minLength is 2s)
+minLength = 0.5
 
 SETUP default
 {
-  tInt = 2.000
+  # 1s integrations so the 1s benchmark leg contains a whole number of them
+  tInt = 1.000
   nChan = 64
   nFFTChan = 128
   doPolar = True
