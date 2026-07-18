@@ -28,6 +28,13 @@ Notes:
   `benchsimreal_1.difx/DIFX_*` file, not the exit code.
 - Wall-time scaling on an RTX 2070: 15 s of data (the default window)
   takes ~260 s.
+- **Benchmarking only - do not use for correctness testing.** The fake
+  datastream writes valid VDIF headers over untouched (uninitialised)
+  payload bytes, so every antenna delivers essentially the same
+  pathological stream: correlation sums grow coherently (~N, not sqrt N),
+  amplifying FP rounding differences, and the XMAC's atomic adds make the
+  output non-bit-reproducible run to run (~1e-6 relative variation).
+  Correctness lives in tests/Synthetic.
 
 ## Profiling (Nsight Systems)
 

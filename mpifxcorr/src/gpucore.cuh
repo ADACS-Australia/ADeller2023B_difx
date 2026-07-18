@@ -85,6 +85,15 @@ private:
     /// for the manager send.
     std::vector<cudaEvent_t> d2hDone;
 
+    /// Per-procslot event marking completion of that slot's input host->device
+    /// copies on cuStream (recorded once in issuegpudata, after the fftloop
+    /// loop). completegpudata() waits on it before the slot is released,
+    /// so the manager cannot start refilling procslots[].databuffer[] while an
+    /// async copy from it (pinned-input path) is still in flight. This makes the
+    /// input-reuse invariant explicit; on the staging fallback path the wait is
+    /// trivially satisfied.
+    std::vector<cudaEvent_t> h2dInputDone;
+
     /// When true (default; disable with DIFX_GPU_PIPELINE=0), subint N's visibility
     /// transfer is left in flight while subint N+1 is issued, and only awaited just
     /// before slot N is released - overlapping the transfer with N+1's compute. When

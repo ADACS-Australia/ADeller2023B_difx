@@ -23,6 +23,7 @@ using namespace std::chrono;
 const int MAX_INDICIES = 10;
 
 cudaStream_t GPUMode::sharedComputeStream = nullptr;
+bool GPUMode::inputBuffersPinned = false;
 
 static int weightDebugFrom();   // defined above set_weights, also used by process_gpu
 
@@ -132,8 +133,13 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
  
-    // Pre-allocate packed data buffer at max possible size
-    packeddata_gpu = new GpuMemHelper<char>(config->getMaxDataBytes(), cuStream);
+    // Pre-allocate packed data buffer at max possible size. When this mode
+    // will use the direct pinned-input path (pinned buffers + shared stream,
+    // the same condition process_gpu tests), the host staging half is never
+    // touched - skip it (gpuOnly) rather than page-locking getMaxDataBytes
+    // per mode that would sit idle.
+    packeddata_gpu = new GpuMemHelper<char>(config->getMaxDataBytes(), cuStream,
+                                            inputBuffersPinned && !ownsStream);
     checkCuda(cudaStreamSynchronize(cuStream));
 
     complex_fringe_rotated_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, true);
@@ -598,12 +604,25 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // Copy packed data to device, needed to refactor this since we moved packed data allocation to the constructor.
     cudaEventRecord(ev_start, cuStream);
 
-    // Host stage (pageable procslots databuffer -> pinned) then async H2D. The
-    // host memcpy dominates this range; the H2D itself is small.
+    // Input H2D. When GPUCore has page-locked the procslots receive buffers
+    // (see DIFX_GPU_PIN_INPUT), DMA directly from the delivered buffer -
+    // no host staging copy. GPUCore's h2dInputDone event guarantees the
+    // buffer is not recycled while this async copy is in flight. Otherwise
+    // fall back to staging through packeddata_gpu's pinned host half
+    // (pageable -> pinned -> device); there the host memcpy dominates this
+    // range, the H2D itself is small.
     DIFX_NVTX_PUSH("h2d_stage");
-    memcpy(packeddata_gpu->ptr(), data, datalengthbytes);
-    checkCuda(cudaMemcpyAsync(packeddata_gpu->gpuPtr(), packeddata_gpu->ptr(),
-                              datalengthbytes, cudaMemcpyHostToDevice, cuStream));
+    // The !ownsStream condition guards the direct path's reuse fence:
+    // GPUCore's h2dInputDone event is recorded on the SHARED stream, so a
+    // mode running on a private stream (standalone use) must stage instead.
+    if (inputBuffersPinned && !ownsStream) {
+        checkCuda(cudaMemcpyAsync(packeddata_gpu->gpuPtr(), data,
+                                  datalengthbytes, cudaMemcpyHostToDevice, cuStream));
+    } else {
+        memcpy(packeddata_gpu->ptr(), data, datalengthbytes);
+        checkCuda(cudaMemcpyAsync(packeddata_gpu->gpuPtr(), packeddata_gpu->ptr(),
+                                  datalengthbytes, cudaMemcpyHostToDevice, cuStream));
+    }
     DIFX_NVTX_POP();
 
     // Figure out how many frames in the packed data
@@ -694,7 +713,9 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         int dbg_framebytes = config->getMultiplexedFrameBytes(configindex, datastreamindex);
         int prevclass = -1;
         for (int f = 0; f < framestounpack; f++) {
-            const unsigned int *hdr = (const unsigned int *)((const unsigned char *)packeddata_gpu->ptr() + (size_t)f * dbg_framebytes);
+            // Read from the delivered buffer, not packeddata_gpu's host half -
+            // the latter is no longer filled when the input buffers are pinned.
+            const unsigned int *hdr = (const unsigned int *)((const unsigned char *)data + (size_t)f * dbg_framebytes);
             const unsigned int *pay = hdr + 8;
             int cls;
             if (hdr[0] == 0 && hdr[1] == 0 && hdr[2] == 0 && hdr[3] == 0)

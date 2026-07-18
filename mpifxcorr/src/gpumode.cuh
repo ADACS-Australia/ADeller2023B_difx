@@ -34,6 +34,17 @@ public:
     static void setSharedComputeStream(cudaStream_t stream) { sharedComputeStream = stream; }
 
     /**
+     * Declare whether the Core receive buffers (procslots[].databuffer[]) that
+     * setData() hands to process_gpu are page-locked (cudaHostRegister'd).
+     * GPUCore calls this once, before any Mode is constructed, after
+     * registering (or failing to register) those buffers. When true,
+     * process_gpu issues its input H2D copy directly from the delivered
+     * buffer; when false it falls back to staging through packeddata_gpu's
+     * pinned host half.
+     */
+    static void setInputBuffersPinned(bool pinned) { inputBuffersPinned = pinned; }
+
+    /**
      * Estimate the total device memory (bytes) a GPUMode for this
      * config/datastream will allocate, using only Configuration lookups -
      * callable before any Mode exists. Mirrors the constructor's device
@@ -110,6 +121,9 @@ protected:
     cudaStream_t cuStream;
     /// The stream installed by setSharedComputeStream (GPUCore's), or nullptr.
     static cudaStream_t sharedComputeStream;
+    /// True when GPUCore has page-locked the procslots receive buffers, so
+    /// process_gpu can DMA directly from them (see setInputBuffersPinned).
+    static bool inputBuffersPinned;
     /// True when cuStream is a private stream this mode must destroy.
     bool ownsStream;
 

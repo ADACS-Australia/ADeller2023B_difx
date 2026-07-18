@@ -10,6 +10,9 @@
 
 using namespace std::chrono;
 
+// One place for byte->MB formatting in log messages.
+static const double MB = 1024.0 * 1024.0;
+
 // Adapted from https://forums.developer.nvidia.com/t/atomic-add-for-complex-numbers/39757
 // todo: deduplicate this function
 __device__ void atomicAddFloatComplex1(cuFloatComplex* a, cuFloatComplex b){
@@ -192,6 +195,56 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
         cinfo << startl << "GPU Core visibility-transfer pipelining is "
               << (pipeline ? "ENABLED" : "disabled") << endl;
 
+    // Page-lock the Core receive buffers (procslots[].databuffer[], allocated
+    // pageable by the Core constructor) so the GPUModes can cudaMemcpyAsync
+    // their input straight from them, eliminating the per-subint host staging
+    // memcpy into packeddata_gpu. On by default; DIFX_GPU_PIN_INPUT=0 disables
+    // (falling back to the staging path) for A/B comparison. Registration
+    // failure (e.g. locked-memory limits) is not fatal - warn, unregister
+    // whatever succeeded, and fall back. Like the shared stream above, this
+    // must be settled before any GPUMode is constructed (Modes are built later,
+    // in loopprocess -> updateconfig).
+    bool inputPinned = false;
+    bool wantpinned = true;
+    {
+        const char *e = getenv("DIFX_GPU_PIN_INPUT");
+        if (e != NULL && atoi(e) == 0)
+            wantpinned = false;
+    }
+    if (wantpinned) {
+        cudaError_t pinerr = cudaSuccess;
+        int npinned = 0;
+        for (int i = 0; i < RECEIVE_RING_LENGTH && pinerr == cudaSuccess; i++) {
+            for (int j = 0; j < numdatastreams && pinerr == cudaSuccess; j++) {
+                // Deliberately not checkCuda - a failure here must not exit.
+                pinerr = cudaHostRegister(procslots[i].databuffer[j], databytes,
+                                          cudaHostRegisterDefault);
+                if (pinerr == cudaSuccess)
+                    npinned++;
+            }
+        }
+        if (pinerr == cudaSuccess) {
+            inputPinned = true;
+            if (mpiid == numdatastreams + fxcorr::FIRSTTELESCOPEID)
+                cinfo << startl << "GPU Core " << mpiid << " pinned "
+                      << (RECEIVE_RING_LENGTH * numdatastreams * (double)databytes) / MB
+                      << " MB of receive buffers for direct H2D input transfers" << endl;
+        } else {
+            cwarn << startl << "GPU Core " << mpiid << " could not page-lock the receive"
+                  << " buffers (" << cudaGetErrorString(pinerr) << ") - falling back to"
+                  << " staged input transfers" << endl;
+            // Undo the registrations that did succeed (registration order is
+            // row-major over (slot, stream)), and clear the sticky error so
+            // later checkCuda calls don't trip over it.
+            for (int k = 0; k < npinned; k++)
+                cudaHostUnregister(procslots[k / numdatastreams].databuffer[k % numdatastreams]);
+            cudaGetLastError();
+        }
+    } else if (mpiid == numdatastreams + fxcorr::FIRSTTELESCOPEID) {
+        cinfo << startl << "GPU Core input-buffer pinning disabled by DIFX_GPU_PIN_INPUT" << endl;
+    }
+    GPUMode::setInputBuffersPinned(inputPinned);
+
     // Fail fast if this job cannot fit in device memory, before the large
     // per-Mode buffers start being allocated inside loopprocess.
     checkDeviceMemory();
@@ -202,10 +255,12 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     results_gpu.resize(RECEIVE_RING_LENGTH);
     results_host.resize(RECEIVE_RING_LENGTH);
     d2hDone.resize(RECEIVE_RING_LENGTH);
+    h2dInputDone.resize(RECEIVE_RING_LENGTH);
     for (int i = 0; i < RECEIVE_RING_LENGTH; i++) {
         checkCuda(cudaMalloc(&results_gpu[i], maxcoreresultlength * sizeof(cuFloatComplex)));
         checkCuda(cudaMallocHost(&results_host[i], maxcoreresultlength * sizeof(cuFloatComplex)));
         checkCuda(cudaEventCreateWithFlags(&d2hDone[i], cudaEventDisableTiming));
+        checkCuda(cudaEventCreateWithFlags(&h2dInputDone[i], cudaEventDisableTiming));
     }
 
     // Allocate the shared, frequency-independent FFT buffer pointer arrays (one
@@ -254,7 +309,6 @@ void GPUCore::checkDeviceMemory() {
     const double SAFETY = 0.90;
     const size_t usable = (size_t)(freeBytes * SAFETY);
 
-    const double MB = 1024.0 * 1024.0;
     cinfo << startl << "GPU Core " << mpiid << " estimated device memory need "
           << required / MB << " MB (modes " << maxConfigBytes / MB << " MB + core "
           << coreBytes / MB << " MB); device reports " << freeBytes / MB << " MB free of "
@@ -289,6 +343,9 @@ GPUCore::~GPUCore() {
     // with CUDA 12.8). The process is exiting and the driver reclaims all
     // device memory and streams itself, so freeing results_gpu, the pointer
     // arrays, the cached XMAC plans and cuStream here would gain nothing.
+    // For the same reason there is no cudaHostUnregister of the pinned
+    // procslots receive buffers and no destruction of the h2dInputDone/d2hDone
+    // events here - the driver unwinds those registrations at process exit.
 }
 
 void GPUCore::freeXmacPlans() {
@@ -1208,6 +1265,19 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
 
 
     //std::cout << "Ended fft loop" << std::endl;
+
+    // Mark completion of this subint's input host->device copies. The copies
+    // are enqueued on cuStream interleaved with the station-processing kernels,
+    // so a single record here (after the last fftloop pass) necessarily covers
+    // them all. completegpudata(index) waits on this before the slot lock is
+    // released, so the manager cannot refill procslots[index].databuffer[]
+    // while a direct (pinned-input) async copy from it is still in flight.
+    // NOTE: this therefore fences everything enqueued on cuStream so far, not
+    // just the copies; if the input copies ever move to a dedicated H2D stream
+    // (to overlap with compute), record this event on that stream instead so
+    // slot release does not serialize against the subint's compute.
+    checkCuda(cudaEventRecord(h2dInputDone[index], cuStream));
+
     start = high_resolution_clock::now();
 
 //    checkCuda(cudaHostUnregister(stream1BandIndexes));
@@ -1317,6 +1387,11 @@ void GPUCore::completegpudata(int index) {
     // complete and it may be released to the manager for sending.
     DIFX_NVTX_RANGE("complete_d2h_wait");
     checkCuda(cudaEventSynchronize(d2hDone[index]));
+    // Also ensure this slot's input host->device copies have drained before the
+    // slot (and its databuffer, which the pinned-input path DMAs from directly)
+    // is recycled. Usually already satisfied - the compute stream was drained
+    // in issuegpudata - but this makes the input-reuse invariant explicit.
+    checkCuda(cudaEventSynchronize(h2dInputDone[index]));
     int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
     memcpy(procslots[index].results, results_host[index], xcorrslength * sizeof(cuFloatComplex));
 }
