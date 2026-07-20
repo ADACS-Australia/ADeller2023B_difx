@@ -137,9 +137,16 @@ protected:
     /// This subint's validity bit-words (host-born, uploaded per subint for
     /// the gpu_set_weights kernel; FLAGS_PER_INT bits per word).
     GpuMemHelper<unsigned int> *gValidFlags;
-    /// Per-window data weights, computed on the device by gpu_set_weights
-    /// and copied back asynchronously for the interim host consumers.
+    /// Per-window data weights, computed on the device by gpu_set_weights.
+    /// The full array is only D2H'd under the WDEBUG gate (Increment 2b);
+    /// routine consumers use the reduced scalar gTotalWeight instead.
     GpuMemHelper<float> *gDataWeights;
+    /// Single-scalar device+host reduction of gDataWeights over the subint's
+    /// windows (Increment 2b): totalW = sum_w dataweight[w]. The AC per-band
+    /// weight accumulation is totalW times a config-static band multiplicity,
+    /// so only this scalar needs to come back to the host each subint -
+    /// replacing the per-subint full gDataWeights D2H.
+    GpuMemHelper<float> *gTotalWeight;
     /// Per-freq matching-band count for the indices band map - pure
     /// configuration, built once at construction (see also indices).
     int *countsStatic;

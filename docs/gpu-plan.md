@@ -13,8 +13,10 @@ unimplemented). The current phase is **performance**: the GPU is
 gap-dominated because one Core thread alternates host and GPU work.
 Landed so far: Lever A (pinned input buffers, direct H2D, 2026-07-18);
 de-serialization Increment 1 (set_weights on the device, 2026-07-18);
-de-serialization Increment 2 (baseline weights on the device,
-2026-07-20). Together these cut the T5-T1 benchmark 66.7 -> 32.4 s. The
+Increment 2 (baseline weights on the device, 2026-07-20); Increment 2b
+(autocorrelation weights on the device, dropping the last interim bulk
+`gDataWeights` D2H, 2026-07-21). Increments 1-2 cut the T5-T1 benchmark
+66.7 -> 32.4 s; 2b holds it flat (a cleanup, not a perf lever). The
 biggest remaining host cost was `host_accumulate`'s baseline-weight loop,
 now gone; what remains of item 2 is overlapping the per-datastream H2D
 and host work with GPU compute.
@@ -30,7 +32,9 @@ and host work with GPU compute.
    Increment 1 (set_weights on the device, 2026-07-18) removed the
    per-datastream stream drains; Increment 2 (baseline weights on the
    device, 2026-07-20) removed `host_accumulate`'s dominant per-window
-   loop — together T5-T1 66.7 -> 32.4 s. **Remaining:** overlap
+   loop — together T5-T1 66.7 -> 32.4 s; Increment 2b (AC weights on the
+   device, 2026-07-21) dropped the last interim bulk `gDataWeights` D2H
+   (now only under the WDEBUG gate). **Remaining:** overlap
    datastream j+1's input H2D and host-side work with datastream j's GPU
    compute, and overlap `host_accumulate`'s residual (autocorr flush,
    pcal) with the next subint. Machinery anticipated by Lever A: move

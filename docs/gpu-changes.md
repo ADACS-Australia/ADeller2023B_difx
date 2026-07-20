@@ -149,6 +149,29 @@ Core thread alternates host work and GPU work. Groundwork and levers:
   dominant host loop). Design/audit trail:
   docs/gpu-deserialization-design.md.
 
+- **De-serialization Increment 2b — autocorrelation weights on the
+  device, interim D2H dropped** (2026-07-21): the last routine bulk
+  device-to-host copy on the weights path (the per-subint full
+  `gDataWeights` array, kept through Increment 2 to feed the host AC
+  per-band weight accumulation) is gone. The AC-weight loop's band map
+  (`indices`/`countsStatic`) is window-independent, so the accumulation
+  equals `totalW = sum_w dataweight[w]` times a config-static per-band
+  multiplicity — only `totalW` is per-subint. A tiny reduction kernel
+  (`gpu_sum_weights`, single-thread sequential sum matching the host
+  window order) computes it on device, and only that one float is D2H'd
+  each subint; the host loop collapses from O(windows x freqs) to
+  O(freqs). The full per-window array is D2H'd only under the WDEBUG
+  gate. Bit-identical AC weights in the common (single-occurrence-band)
+  case — the device sum reproduces the host summation order — and
+  FP-level for the rare multi-occurrence band. `gTotalWeight` is only
+  read when `weightsOnDevice` is set (device branch only), so the
+  invalid-subint/fallback paths never read a stale scalar (no explicit
+  zeroing needed, unlike Increment 2's `gDataWeights`). Verified: 8/8
+  Synthetic PASS device + `DIFX_GPU_WEIGHTS_HOST` fallback, both pipeline
+  modes; boundary weights byte-identical (WDEBUG); benchmark T5-T1 flat
+  at 32.4 s (a cleanup/D2H-removal, not a perf lever — the win was
+  Increment 2). Design/audit trail: docs/gpu-deserialization-design.md.
+
 ## 6. Multi-station, multi-subband correctness coverage
 
 Until 2026-07-18 every correctness scenario was 2 stations with a single

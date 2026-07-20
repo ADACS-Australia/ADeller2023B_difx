@@ -41,10 +41,14 @@ void GPUMode::finishWeights() {
         return;             // host path or invalid subint: host arrays already correct
     weightsOnDevice = false;
 
-    // GPUCore has drained the compute stream, so the async D2H of the
-    // device-computed weights (and of the autocorr accumulators, enqueued
-    // in fractionalRotation) have landed in the pinned halves.
-    memcpy(dataweight, gDataWeights->ptr(), cfg_numBufferedFFTs * sizeof(f32));
+    // GPUCore has drained the compute stream, so the async D2H of the device
+    // reductions (total weight, autocorr accumulators) have landed in the
+    // pinned halves. The per-window dataweight[] array is only refreshed for
+    // the WDEBUG parity output below - Increment 2b replaced the routine full
+    // D2H with the single total-weight scalar (gTotalWeight).
+    const bool wdebug = weightDebugFrom() >= 0 && datasec >= weightDebugFrom();
+    if (wdebug)
+        memcpy(dataweight, gDataWeights->ptr(), cfg_numBufferedFFTs * sizeof(f32));
 
     // Host mirror of the device autocorrelation accumulators (was section 8
     // of process_gpu on the host-weights path).
@@ -58,10 +62,12 @@ void GPUMode::finishWeights() {
         }
     }
 
-    // Per-band autocorrelation weight accumulation (was the tail of the host
-    // set_weights loop; zero-weight windows contribute nothing, so summing
-    // unconditionally over all windows gives identical totals). Becomes a
-    // device reduction in Increment 2 (docs/gpu-deserialization-design.md).
+    // Per-band autocorrelation weight accumulation (Increment 2b). The band
+    // map (indices/countsStatic) is window-independent, so the host path's
+    // per-window sum weights[c][band] += dataweight[w] equals the device-reduced
+    // total weight (gTotalWeight = sum_w dataweight[w]) times each band's static
+    // multiplicity. Zero-weight windows contributed nothing to the old sum, so
+    // this matches to FP level.
     // NOTE: assumes perbandweights is not in use on the GPU path (true today;
     // the host tail has a perbandweights branch this does not replicate - see
     // gpu-plan.md work item on GPU perbandweights support).
@@ -69,22 +75,21 @@ void GPUMode::finishWeights() {
         cfatal << startl << "GPUMode::finishWeights: perbandweights is set but not supported on the device-weights path" << endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    for (int w = 0; w < cfg_numBufferedFFTs; w++) {
-        const f32 dw = dataweight[w];
-        for (int i = 0; i < numrecordedfreqs; i++) {
-            const int count = countsStatic[i];
-            for (int k = 0; k < count; k++)
-                weights[0][indices->ptr()[(i * MAX_INDICIES) + k]] += dw;
-            if (count > 1) {
-                weights[1][indices->ptr()[(i * MAX_INDICIES)]] += dw;
-                weights[1][indices->ptr()[(i * MAX_INDICIES) + 1]] += dw;
-            }
+    const f32 totalW = gTotalWeight->ptr()[0];
+    for (int i = 0; i < numrecordedfreqs; i++) {
+        const int count = countsStatic[i];
+        for (int k = 0; k < count; k++)
+            weights[0][indices->ptr()[(i * MAX_INDICIES) + k]] += totalW;
+        if (count > 1) {
+            weights[1][indices->ptr()[(i * MAX_INDICIES)]] += totalW;
+            weights[1][indices->ptr()[(i * MAX_INDICIES) + 1]] += totalW;
         }
     }
 
     // WDEBUG parity output for the device path: reconstruct the host path's
-    // per-window lines (validity inputs are all host-known).
-    if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom()) {
+    // per-window lines (validity inputs are all host-known; dataweight[] was
+    // refreshed above under the same gate).
+    if (wdebug) {
         const bool subintValid = (datalengthbytes > 1) && (offsetseconds != INVALID_SUBINT);
         for (int w = 0; w < cfg_numBufferedFFTs; w++) {
             const bool flagged_ok =
@@ -180,6 +185,23 @@ __global__ void gpu_set_weights(const int *nearest, const bool *validFrames,
 
     dataweight[w] = weight;
     validSamples[w] = weight > 0.0f;
+}
+
+// Increment 2b: reduce the per-window data weights to a single scalar on the
+// device (totalW = sum over the subint's windows of dataweight[w]). The AC
+// per-band weight accumulation in finishWeights adds dataweight[w] to a
+// window-INDEPENDENT set of band slots, so it equals totalW times a static
+// per-band multiplicity - only totalW is per-subint. Summing sequentially in
+// window order matches the host loop's accumulation order (bit-identical for
+// single-occurrence bands). One thread suffices: numWindows is small and this
+// runs overlapped on the compute stream.
+__global__ void gpu_sum_weights(const float *dataweight, int numWindows, float *out) {
+    if (blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+    float s = 0.0f;
+    for (int w = 0; w < numWindows; w++)
+        s += dataweight[w];
+    *out = s;
 }
 
 __global__ void gpu_allocate_unpacked_complex(cuFloatComplex** arrays, cuFloatComplex* data, int nchan, int dlen) {
@@ -351,6 +373,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     indices->copyToDevice();
     gValidFlags = new GpuMemHelper<unsigned int>(cfg_numBufferedFFTs / FLAGS_PER_INT + 1, cuStream);
     gDataWeights = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
+    gTotalWeight = new GpuMemHelper<float>(1, cuStream);
     weightsOnDevice = false;
     grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
     grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedbands, cuStream);
@@ -487,6 +510,7 @@ GPUMode::~GPUMode() {
     delete gValidSamples;
     delete gValidFlags;
     delete gDataWeights;
+    delete gTotalWeight;
     delete[] countsStatic;
     delete gInterpolator;
     delete gFracSampleError;
@@ -944,10 +968,10 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         // Device-side weights (default): upload this subint's validity
         // bit-words (host-born, tiny) and compute weight/validity/sample
         // index per window in place on the device - no drain, no
-        // valid_frames round trip, no result re-upload. The host copy of
-        // dataweight[] still needed by the interim host accumulations is
-        // brought back asynchronously here and landed by finishWeights()
-        // after GPUCore's end-of-subint drain.
+        // valid_frames round trip, no result re-upload. Only the reduced
+        // total weight (a single scalar) is brought back each subint for the
+        // host AC-weight accumulation in finishWeights(); the full per-window
+        // dataweight[] array is D2H'd only under the WDEBUG gate.
         DIFX_NVTX_PUSH("set_weights");
         const int nflagwords = cfg_numBufferedFFTs / FLAGS_PER_INT + 1;
         const int srcwords = (flaglength < nflagwords) ? flaglength : nflagwords;
@@ -972,9 +996,18 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
             gSampleIndexes->gpuPtr(),
             numBufferedFFTs, framestounpack, framesamples, fftchannels,
             subintValid);
-        checkCuda(cudaMemcpyAsync(gDataWeights->ptr(), gDataWeights->gpuPtr(),
-                                  cfg_numBufferedFFTs * sizeof(float),
-                                  cudaMemcpyDeviceToHost, cuStream));
+        // Reduce the per-window weights to a single scalar and bring back just
+        // that float (Increment 2b): finishWeights' AC per-band accumulation
+        // needs only the total. The full per-window array is D2H'd only when
+        // WDEBUG is active (its parity output prints per-window values).
+        gpu_sum_weights<<<1, 1, 0, cuStream>>>(
+            gDataWeights->gpuPtr(), numBufferedFFTs, gTotalWeight->gpuPtr());
+        checkCuda(cudaMemcpyAsync(gTotalWeight->ptr(), gTotalWeight->gpuPtr(),
+                                  sizeof(float), cudaMemcpyDeviceToHost, cuStream));
+        if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+            checkCuda(cudaMemcpyAsync(gDataWeights->ptr(), gDataWeights->gpuPtr(),
+                                      cfg_numBufferedFFTs * sizeof(float),
+                                      cudaMemcpyDeviceToHost, cuStream));
         weightsOnDevice = true;
         memcpy(counts, countsStatic, numrecordedfreqs * sizeof(int));
         DIFX_NVTX_POP();
