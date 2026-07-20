@@ -161,6 +161,29 @@ __global__ void gpu_fuse_xmac_and_average(
     }
 }
 
+// Increment 2: per-subint baseline-weight reduction on the device. One thread
+// per accumulator (freq, baseline, polproduct) sums dw1[w]*dw2[w] over the
+// subint's FFT windows, replacing the host per-window baseline-weight loop that
+// used to run in host_accumulate. dw1/dw2 point at the two datastreams'
+// device per-window dataweight arrays (GPUMode::getGpuDataWeights). Windows
+// beyond the subint carry weight 0, so summing [0, numWindows) is exact. The
+// sequential accumulation reproduces the CPU loop's window order; weights are
+// 0/1 except at the subint's start/end frames, so the sums agree with the host
+// path to floating-point precision.
+__global__ void gpu_baseline_weights(const float* const* dw1,
+                                     const float* const* dw2,
+                                     float* out, int numAccum, int numWindows) {
+    const int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (a >= numAccum)
+        return;
+    const float* w1 = dw1[a];
+    const float* w2 = dw2[a];
+    float s = 0.0f;
+    for (int w = 0; w < numWindows; w++)
+        s += w1[w] * w2[w];
+    out[a] = s;
+}
+
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)
         : Core(id, conf, dids, rcomm) {
     cudaDeviceProp prop;
@@ -362,6 +385,15 @@ void GPUCore::freeXmacPlans() {
     }
     xmacPlans.clear();
     xmacPlanConfigIndex = -1;
+
+    // Baseline-weight reduction plan (Increment 2) is rebuilt alongside the
+    // XMAC plans, so release its device/pinned buffers here too.
+    if (d_bwDw1) { checkCuda(cudaFree(d_bwDw1)); d_bwDw1 = nullptr; }
+    if (d_bwDw2) { checkCuda(cudaFree(d_bwDw2)); d_bwDw2 = nullptr; }
+    if (d_bweightResults) { checkCuda(cudaFree(d_bweightResults)); d_bweightResults = nullptr; }
+    if (h_bweightResults) { checkCuda(cudaFreeHost(h_bweightResults)); h_bweightResults = nullptr; }
+    bwDestOffset.clear();
+    bweightNumAccum = 0;
 }
 
 // Precompute, once per configuration, all the DiFX config-tree metadata that the
@@ -482,8 +514,51 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         xmacPlans.push_back(plan);
     }
 
-    // The uploads above source from host stack buffers that go out of scope when
-    // this function returns; synchronise so the (one-off) copies complete first.
+    // Baseline-weight reduction plan (Increment 2). Enumerate the accumulators
+    // in the exact order the host finalize fold consumes them (used freq ->
+    // baseline with localfreqindex>=0 -> polproduct), gathering each baseline's
+    // two datastreams' device dataweight arrays. gDataWeights buffers are
+    // allocated once per GPUMode and never move, so this is config-invariant
+    // like the XMAC plans above. (freeXmacPlans, called at the top, already
+    // released any previous config's buffers.)
+    std::vector<const float*> h_bwDw1, h_bwDw2;
+    for (int f = 0; f < config->getFreqTableLength(); f++) {
+        if (!config->isFrequencyUsed(configindex, f)) continue;
+        for (int l = 0; l < numbaselines; l++) {
+            int localfreqindex = config->getBLocalFreqIndex(configindex, l, f);
+            if (localfreqindex < 0) continue;
+            int ds1index = config->getBOrderedDataStream1Index(configindex, l);
+            int ds2index = config->getBOrderedDataStream2Index(configindex, l);
+            const float* dw1 = ((GPUMode*)modes[ds1index])->getGpuDataWeights();
+            const float* dw2 = ((GPUMode*)modes[ds2index])->getGpuDataWeights();
+            int npol = config->getBNumPolProducts(configindex, l, localfreqindex);
+            // Destination of this baseline's bin-0 weights in floatresults; pol p
+            // lands at base + p (the host fold's resultindex++ walk for bin 0).
+            int bwbase = config->getCoreResultBWeightOffset(configindex, f, l) * 2;
+            for (int p = 0; p < npol; p++) {
+                h_bwDw1.push_back(dw1);
+                h_bwDw2.push_back(dw2);
+                bwDestOffset.push_back(bwbase + p);
+            }
+        }
+    }
+    bweightNumAccum = (int)h_bwDw1.size();
+    if (bweightNumAccum > 0) {
+        checkCuda(cudaMalloc(&d_bwDw1, bweightNumAccum * sizeof(float*)));
+        checkCuda(cudaMalloc(&d_bwDw2, bweightNumAccum * sizeof(float*)));
+        checkCuda(cudaMalloc(&d_bweightResults, bweightNumAccum * sizeof(float)));
+        checkCuda(cudaMallocHost(&h_bweightResults, bweightNumAccum * sizeof(float)));
+        checkCuda(cudaMemcpyAsync(d_bwDw1, h_bwDw1.data(),
+                                 bweightNumAccum * sizeof(float*),
+                                 cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(d_bwDw2, h_bwDw2.data(),
+                                 bweightNumAccum * sizeof(float*),
+                                 cudaMemcpyHostToDevice, cuStream));
+    }
+
+    // The uploads above source from host stack/vector buffers that go out of
+    // scope when this function returns; synchronise so the (one-off) copies
+    // complete first.
     checkCuda(cudaStreamSynchronize(cuStream));
 
     xmacPlanConfigIndex = configindex;
@@ -1167,6 +1242,25 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
             );
         }
 
+        // Reduce the per-window baseline weights on the device (Increment 2):
+        // sum dataweight1[w]*dataweight2[w] over the subint's windows for every
+        // (freq, baseline, polproduct), then async-copy the small flat result
+        // back for the host finalize fold. Enqueued on cuStream after the XMAC,
+        // so the drain below guarantees both the kernel and its D2H completed
+        // before the fold reads h_bweightResults. Device-weights path only;
+        // the DIFX_GPU_WEIGHTS_HOST fallback keeps the host per-window loop.
+        // A single (non-ringed) result buffer suffices: unlike the deferred
+        // visibility D2H, this copy is fully drained here, before this subint's
+        // fold and the next subint's reduction.
+        if (GPUMode::useGpuWeights() && bweightNumAccum > 0) {
+            const int tpb = 128;
+            gpu_baseline_weights<<<(bweightNumAccum + tpb - 1) / tpb, tpb, 0, cuStream>>>(
+                d_bwDw1, d_bwDw2, d_bweightResults, bweightNumAccum, numBufferedFFTs);
+            checkCuda(cudaMemcpyAsync(h_bweightResults, d_bweightResults,
+                                      bweightNumAccum * sizeof(float),
+                                      cudaMemcpyDeviceToHost, cuStream));
+        }
+
         // ---------------------------------------------------------------------
         // FINAL HOST TRANSFER (deferred / overlapped)
         // ---------------------------------------------------------------------
@@ -1220,8 +1314,13 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
                 modes[j]->zeroAutocorrelations();
         }
 
-        //finally, update the baselineweight if not doing any pulsar stuff
-        if (!procslots[index].pulsarbin) {
+        // Update the baselineweight if not doing any pulsar stuff. On the
+        // device-weights path this per-window sum now runs on the GPU
+        // (gpu_baseline_weights above) and is folded into procslots results in
+        // host_finalize below; this host loop remains only for the
+        // DIFX_GPU_WEIGHTS_HOST fallback, which fills the host dataweight[]
+        // arrays instead of gDataWeights.
+        if (!procslots[index].pulsarbin && !GPUMode::useGpuWeights()) {
             for (int fftsubloop = 0; fftsubloop < numBufferedFFTs; fftsubloop++) {
                 auto i = fftloop * numBufferedFFTs + fftsubloop + startblock;
                 if (i >= startblock + numblocks)
@@ -1328,29 +1427,42 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying lock bweight copy mutex!!!"
                 << endl;
 
-    for (int f = 0; f < config->getFreqTableLength(); f++) {
-        if (config->isFrequencyUsed(procslots[index].configindex, f)) {
-            for (int l = 0; l < numbaselines; l++) {
-                localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, l, f);
-                if (localfreqindex >= 0) {
-                    auto resultindex = config->getCoreResultBWeightOffset(procslots[index].configindex, f, l) * 2;
-                    for (int b = 0; b < binloop; b++) {
-                        for (int j = 0;
-                             j < config->getBNumPolProducts(procslots[index].configindex, l, localfreqindex); j++) {
-                            procslots[index].floatresults[resultindex] += scratchspace->baselineweight[f][b][l][j];
-                            resultindex++;
-                        }
-                    }
-                }
-            }
-            if (model->getNumPhaseCentres(procslots[index].offsets[0]) > 1) {
+    // Fold the baseline weights into the results. On the device-weights path the
+    // weights were reduced on the GPU (gpu_baseline_weights) into
+    // h_bweightResults, each accumulator carrying its own destination float index
+    // (bwDestOffset) recorded at plan-build time - so this is a flat, one-pass
+    // add that cannot silently diverge from the plan's enumeration. The
+    // DIFX_GPU_WEIGHTS_HOST fallback keeps the original nested host fold
+    // (baseline weights, plus the multiple-phase-centre baselineshiftdecorr -
+    // itself unsupported on the GPU path, where baselineshiftdecorr stays zero).
+    if (GPUMode::useGpuWeights()) {
+        for (int a = 0; a < bweightNumAccum; a++)
+            procslots[index].floatresults[bwDestOffset[a]] += h_bweightResults[a];
+    } else {
+        for (int f = 0; f < config->getFreqTableLength(); f++) {
+            if (config->isFrequencyUsed(procslots[index].configindex, f)) {
                 for (int l = 0; l < numbaselines; l++) {
                     localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, l, f);
                     if (localfreqindex >= 0) {
-                        auto resultindex = config->getCoreResultBShiftDecorrOffset(procslots[index].configindex, f, l) * 2;
-                        for (int s = 0; s < model->getNumPhaseCentres(procslots[index].offsets[0]); s++) {
-                            procslots[index].floatresults[resultindex] += scratchspace->baselineshiftdecorr[f][l][s];
-                            resultindex++;
+                        auto resultindex = config->getCoreResultBWeightOffset(procslots[index].configindex, f, l) * 2;
+                        for (int b = 0; b < binloop; b++) {
+                            for (int j = 0;
+                                 j < config->getBNumPolProducts(procslots[index].configindex, l, localfreqindex); j++) {
+                                procslots[index].floatresults[resultindex] += scratchspace->baselineweight[f][b][l][j];
+                                resultindex++;
+                            }
+                        }
+                    }
+                }
+                if (model->getNumPhaseCentres(procslots[index].offsets[0]) > 1) {
+                    for (int l = 0; l < numbaselines; l++) {
+                        localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, l, f);
+                        if (localfreqindex >= 0) {
+                            auto resultindex = config->getCoreResultBShiftDecorrOffset(procslots[index].configindex, f, l) * 2;
+                            for (int s = 0; s < model->getNumPhaseCentres(procslots[index].offsets[0]); s++) {
+                                procslots[index].floatresults[resultindex] += scratchspace->baselineshiftdecorr[f][l][s];
+                                resultindex++;
+                            }
                         }
                     }
                 }

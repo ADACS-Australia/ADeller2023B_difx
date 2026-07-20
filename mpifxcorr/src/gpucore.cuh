@@ -133,6 +133,32 @@ private:
     const bool** d_v2_ptrs;
 
     /**
+     * @brief Per-configuration baseline-weight reduction plan (Increment 2).
+     *
+     * Replaces the per-window host loop that used to sum dataweight1[w] *
+     * dataweight2[w] over the subint's FFT windows for every (freq, baseline,
+     * polproduct) in host_accumulate. The accumulators are enumerated in the
+     * EXACT order the host finalize fold consumes them (used freq -> baseline
+     * with localfreqindex>=0 -> polproduct), so the reduced values D2H'd into
+     * h_bweightResults map one-to-one onto the fold's walk. d_bwDw1/d_bwDw2 hold,
+     * per accumulator, the two datastreams' device per-window dataweight arrays
+     * (GPUMode::getGpuDataWeights). Built once per configuration in
+     * buildXmacPlans, freed in freeXmacPlans. Only used on the device-weights
+     * path; the DIFX_GPU_WEIGHTS_HOST fallback keeps the host loop.
+     *
+     * bwDestOffset carries each accumulator's destination: the float index into
+     * procslots[].floatresults where its reduced weight is added. Recording it
+     * at plan-build time makes the flat fold self-describing - it does not
+     * re-walk (and cannot silently diverge from) the config enumeration.
+     */
+    const float** d_bwDw1 = nullptr;    ///< [bweightNumAccum] ds1 dataweight ptrs
+    const float** d_bwDw2 = nullptr;    ///< [bweightNumAccum] ds2 dataweight ptrs
+    float* d_bweightResults = nullptr;  ///< [bweightNumAccum] per-subint device sums
+    float* h_bweightResults = nullptr;  ///< [bweightNumAccum] pinned host mirror
+    std::vector<int> bwDestOffset;      ///< [bweightNumAccum] floatresults index per accumulator
+    int bweightNumAccum = 0;
+
+    /**
      * @brief Cached, per-frequency launch metadata for the fused XMAC kernel.
      *
      * All of the DiFX Configuration lookups (band indexes, baseline result

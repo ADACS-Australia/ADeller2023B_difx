@@ -125,6 +125,30 @@ Core thread alternates host work and GPU work. Groundwork and levers:
   (72 ms/subint, 48% of wall) is Increment 2's target. Design and audit
   trail: docs/gpu-deserialization-design.md.
 
+- **De-serialization Increment 2 — baseline weights on the device**
+  (2026-07-20): the per-window baseline-weight loop that dominated
+  `host_accumulate` — summing `dataweight1[w]*dataweight2[w]` over the
+  subint's FFT windows for every (freq, baseline, polproduct),
+  O(windows x freqs x baselines x pols) on the host — moved to a device
+  reduction kernel (`gpu_baseline_weights`, one thread per accumulator,
+  sequential window sum matching the CPU order). A per-config plan built
+  in `buildXmacPlans` gathers each baseline's two device `gDataWeights`
+  arrays and records each accumulator's destination float offset into the
+  results buffer; the reduced weights are D2H'd (a few hundred floats)
+  and folded in by a flat, self-describing one-pass loop that cannot
+  diverge from the plan enumeration. The host per-window loop and nested
+  fold survive only on the `DIFX_GPU_WEIGHTS_HOST` fallback path. A code
+  review caught a latent correctness bug fixed here: the invalid-subint
+  early return zeroed the host `dataweight[]` but not the device
+  `gDataWeights` the reduction reads, so an out-of-data datastream at a
+  recording boundary would have contributed stale weights — the device
+  buffer is now zeroed there too. Verified: 8/8 Synthetic scenarios PASS
+  on the device path AND on the `DIFX_GPU_WEIGHTS_HOST` fallback, both
+  pipeline modes; boundary-window weights byte-identical CPU-vs-GPU
+  (WDEBUG); benchmark T5-T1 62.4 -> 32.4 s (~48%, from gutting the
+  dominant host loop). Design/audit trail:
+  docs/gpu-deserialization-design.md.
+
 ## 6. Multi-station, multi-subband correctness coverage
 
 Until 2026-07-18 every correctness scenario was 2 stations with a single

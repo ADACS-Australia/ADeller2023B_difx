@@ -7,12 +7,17 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 ## Where we are
 
 Correctness is done for the USB scenarios (usb, usb-complex,
-complex-complex PASS CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes; LSB
-deliberately unimplemented). The current phase is **performance**: the
-GPU is gap-dominated because one Core thread alternates host and GPU
-work. Lever A (pinned input buffers, direct H2D) landed 2026-07-18 for
-~4% on the desktop; the profile says the big remaining host costs are
-`host_accumulate` (37% of wall) and the serialized per-datastream loop.
+complex-complex, and the 5-station/4-subband `multi` scenario PASS
+CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes; LSB deliberately
+unimplemented). The current phase is **performance**: the GPU is
+gap-dominated because one Core thread alternates host and GPU work.
+Landed so far: Lever A (pinned input buffers, direct H2D, 2026-07-18);
+de-serialization Increment 1 (set_weights on the device, 2026-07-18);
+de-serialization Increment 2 (baseline weights on the device,
+2026-07-20). Together these cut the T5-T1 benchmark 66.7 -> 32.4 s. The
+biggest remaining host cost was `host_accumulate`'s baseline-weight loop,
+now gone; what remains of item 2 is overlapping the per-datastream H2D
+and host work with GPU compute.
 
 ## Work queue (ordered)
 
@@ -21,15 +26,19 @@ work. Lever A (pinned input buffers, direct H2D) landed 2026-07-18 for
    (test-multi.vex/v2d, 4-channel VDIF from generateVDIF) — PASSes
    CPU-vs-GPU in both pipeline modes and is wired into run-local.sh and
    run-slurm.sh (rank counts now sized per scenario).
-2. **De-serialize the per-datastream loop** (the main event). Overlap
-   datastream j+1's input H2D and host-side work with datastream j's
-   GPU compute, and overlap `host_accumulate` with the next subint.
-   Machinery anticipated by Lever A: move input copies to a dedicated
-   H2D stream and record `h2dInputDone` there (see note in
-   `issuegpudata`); relax the per-pass `cudaStreamSynchronize`.
-   Candidate within the same effort: reduce `fringeRotation`'s
-   double-precision arithmetic (66% of GPU time on GeForce, ~25% on
-   data-centre cards) if accuracy analysis allows.
+2. **De-serialize the per-datastream loop** (the main event). Progress:
+   Increment 1 (set_weights on the device, 2026-07-18) removed the
+   per-datastream stream drains; Increment 2 (baseline weights on the
+   device, 2026-07-20) removed `host_accumulate`'s dominant per-window
+   loop — together T5-T1 66.7 -> 32.4 s. **Remaining:** overlap
+   datastream j+1's input H2D and host-side work with datastream j's GPU
+   compute, and overlap `host_accumulate`'s residual (autocorr flush,
+   pcal) with the next subint. Machinery anticipated by Lever A: move
+   input copies to a dedicated H2D stream and record `h2dInputDone`
+   there (see note in `issuegpudata`); relax the per-pass
+   `cudaStreamSynchronize`. Candidate within the same effort: reduce
+   `fringeRotation`'s double-precision arithmetic (66% of GPU time on
+   GeForce, ~25% on data-centre cards) if accuracy analysis allows.
 3. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape

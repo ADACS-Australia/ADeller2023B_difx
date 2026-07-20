@@ -807,6 +807,15 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         }
         gValidSamples->copyToDevice();
 
+        // Zero the DEVICE per-window weights too: GPUCore's baseline-weight
+        // reduction (gpu_baseline_weights) reads gDataWeights directly on the
+        // device-weights path, so leaving it stale would let an invalid
+        // datastream contribute its previous subint's weights to the baseline
+        // weight. The host dataweight[] zeroed above only serves the host
+        // fallback/WDEBUG; the device buffer needs its own zero.
+        checkCuda(cudaMemsetAsync(gDataWeights->gpuPtr(), 0,
+                                  cfg_numBufferedFFTs * sizeof(float), cuStream));
+
         // Host arrays are authoritative for this subint (all zero) - make
         // sure finishWeights() does not overwrite them from the device.
         weightsOnDevice = false;

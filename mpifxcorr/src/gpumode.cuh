@@ -103,6 +103,14 @@ public:
     /// path instead zeroes such spectra so they contribute nothing.
     [[nodiscard]] const bool* getGpuValidSamples() const { return gValidSamples->gpuPtr(); }
 
+    /// Device-side per-FFT-window data weights, computed by gpu_set_weights.
+    /// Consumed by GPUCore's baseline-weight reduction (gpu_baseline_weights),
+    /// which sums dw1[w]*dw2[w] over the subint's windows on the device instead
+    /// of on the host. Valid only on the device-weights path (the
+    /// DIFX_GPU_WEIGHTS_HOST fallback fills the host dataweight[] array, not
+    /// this buffer).
+    [[nodiscard]] const float* getGpuDataWeights() const { return gDataWeights->gpuPtr(); }
+
     GpuMemHelper<cuFloatComplex> *fftd_gpu;
     GpuMemHelper<cuFloatComplex> *conj_fftd_gpu;
 
