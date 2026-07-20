@@ -18,36 +18,61 @@ Increment 2 (baseline weights on the device, 2026-07-20); Increment 2b
 `gDataWeights` D2H, 2026-07-21). Increments 1-2 cut the T5-T1 benchmark
 66.7 -> 32.4 s; 2b holds it flat (a cleanup, not a perf lever). The
 biggest remaining host cost was `host_accumulate`'s baseline-weight loop,
-now gone; what remains of item 2 is overlapping the per-datastream H2D
-and host work with GPU compute.
+now gone; the next perf work (see the work queue below) is the
+fringe-rotation interpolator hoisting, then overlapping the
+per-datastream H2D and host work with GPU compute.
 
-## Work queue (ordered)
+## Completed activities
 
-1. ~~**Multi-subband, N>2-station Synthetic scenario.**~~ DONE
-   2026-07-18: the `multi` scenario — 5 stations x 4 subbands
-   (test-multi.vex/v2d, 4-channel VDIF from generateVDIF) — PASSes
-   CPU-vs-GPU in both pipeline modes and is wired into run-local.sh and
-   run-slurm.sh (rank counts now sized per scenario).
-2. **De-serialize the per-datastream loop** (the main event). Progress:
-   Increment 1 (set_weights on the device, 2026-07-18) removed the
-   per-datastream stream drains; Increment 2 (baseline weights on the
-   device, 2026-07-20) removed `host_accumulate`'s dominant per-window
-   loop — together T5-T1 66.7 -> 32.4 s; Increment 2b (AC weights on the
-   device, 2026-07-21) dropped the last interim bulk `gDataWeights` D2H
-   (now only under the WDEBUG gate). **Remaining:** overlap
-   datastream j+1's input H2D and host-side work with datastream j's GPU
-   compute, and overlap `host_accumulate`'s residual (autocorr flush,
-   pcal) with the next subint. Machinery anticipated by Lever A: move
-   input copies to a dedicated H2D stream and record `h2dInputDone`
-   there (see note in `issuegpudata`); relax the per-pass
-   `cudaStreamSynchronize`. Candidate within the same effort: reduce
-   `fringeRotation`'s double-precision arithmetic (66% of GPU time on
-   GeForce, ~25% on data-centre cards) if accuracy analysis allows.
+- **Multi-subband, N>2-station Synthetic scenario** (2026-07-18): the
+  `multi` scenario — 5 stations x 4 subbands (test-multi.vex/v2d,
+  4-channel VDIF from generateVDIF) — PASSes CPU-vs-GPU in both pipeline
+  modes and is wired into run-local.sh and run-slurm.sh (rank counts now
+  sized per scenario).
+- **De-serialize the per-datastream loop — weights arc**: Increment 1
+  (set_weights on the device, 2026-07-18) removed the per-datastream
+  stream drains; Increment 2 (baseline weights on the device,
+  2026-07-20) removed `host_accumulate`'s dominant per-window loop;
+  Increment 2b (AC weights on the device, 2026-07-21) dropped the last
+  interim bulk `gDataWeights` D2H (now only under the WDEBUG gate).
+  Together: T5-T1 66.7 -> 32.4 s. (Prose detail in gpu-changes.md; the
+  remaining gap-closing — compute/H2D overlap — is a future item below.)
+
+## Work queue (underway + future)
+
+1. **Fringe-rotation interpolator hoisting** (next perf gain). The
+   `gpu_fringeRotation` / `gpu_complex_fringeRotation` kernels launch one
+   thread per (FFT window, band, channel) and *every* thread recomputes,
+   from scratch, quantities that vary far more coarsely — so this FP64
+   work (`fringeRotation` is ~66% of GPU time on GeForce, ~25% on
+   data-centre cards) is repeated `numrecordedbands x fftchannels` times
+   more than necessary. Compute each quantity only as often as it varies:
+   - `d0`/`d1`/`d2` -> the per-window `a`/`b` can be batch-computed once
+     per subint (one `a`/`b` pair per FFT window; `d0`/`d1`/`d2` are
+     internal per-window intermediates of that single per-subint pass);
+   - `a`/`b`: once per FFT window (the CPU does exactly this — once per
+     `CPUMode::process` call, cpumode.cpp ~line 390);
+   - `bigAval`/`bigBval`/`bigB_reduced`: once per (window, band) — these
+     vary with `lofreqs[bandindex]`, so per band within a window, finer
+     than `a`/`b`.
+   The per-sample kernel then does only the final `exponent` +
+   `__sincosf` + complex multiply. Approach: precompute the per-window
+   `a`/`b` (and optionally per-(window,band) `bigA`/`bigB`) into device
+   arrays once per subint (a small kernel, or extend `calculatePre`) and
+   pass them into the rotation kernel. Must stay FP-parity with the CPU
+   (WDEBUG/SPECDEBUG, diffDiFX). Supersedes the old "reduce fringeRotation
+   FP64" note, and dovetails with the FP16 / kernel-fusion items below.
+2. **Compute/H2D overlap across datastreams.** Overlap datastream j+1's
+   input H2D and host-side work with datastream j's GPU compute, and
+   overlap `host_accumulate`'s residual (autocorr flush, pcal) with the
+   next subint. Machinery anticipated by Lever A: move input copies to a
+   dedicated H2D stream and record `h2dInputDone` there (see note in
+   `issuegpudata`); relax the per-pass `cudaStreamSynchronize`.
 3. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
-   the device weights kernel (item 2, Increment 1) so per-(window, band)
-   weights are a natural extension.
+   the device weights kernel (de-serialization Increment 1) so
+   per-(window, band) weights are a natural extension.
 4. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
 5. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
    `blanker_vdif_gpu`) + widen the `getMode` format gate. MUST add the
@@ -110,6 +135,19 @@ will ease the eventual merge and put GPU code where it belongs:
   complex GEMM at heart, a natural tensor-core target (Turing: FP16
   multiply / FP32 accumulate; data-centre cards add TF32/FP64 paths).
   Needs an accuracy assessment against the correlator's dynamic range.
+- **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
+  FFT): an opt-in reduced-precision path that carries the unpacked
+  samples and the fringe rotation in FP16, with the FFT taking FP16 in
+  and producing FP32 output. Roughly halves the memory traffic for those
+  stages (and the compute on cards with fast FP16). Needs an accuracy
+  assessment against the correlator's dynamic range; gated so the
+  full-precision path stays the default.
+- **Fuse the unpack and fringe-rotation kernels**: today `gpu_unpack`
+  writes the unpacked samples to global memory and the fringe-rotation
+  kernel reads them straight back. Fusing the two keeps samples in
+  registers/shared memory and saves that global-memory round-trip
+  (memory-bandwidth bound). Interacts with the FP16 path above and with
+  the per-window `a`/`b` hoisting (work-queue item 1).
 - NUMA/affinity audit (mattered on the cluster, less on the desktop).
 - Profile the fftsPerChunk XMAC grid split if atomics show up.
 - GPU pcal regression coverage (currently untested by diffDiFX).
