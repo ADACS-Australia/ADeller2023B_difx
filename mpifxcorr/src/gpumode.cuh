@@ -51,7 +51,27 @@ public:
      * host_accumulate). No-op when this subint's weights were computed on
      * the host (fallback path or invalid subint).
      */
-    void finishWeights();
+    /**
+     * Fold this subint's device-computed weights and autocorrelations from the
+     * pinned staging halves into the host mirrors (weights[][], autocorrelations
+     * [][]). validsubint is subint-N's validity captured at issue time (see
+     * GPUCore per-slot validsubint) - it must be passed rather than read from
+     * the mutable Mode state, which the pipelined next-subint issue has already
+     * overwritten by the time this runs. No-op on the host-weights fallback
+     * (keyed off the static useGpuWeights()) or an invalid subint.
+     */
+    void finishWeights(bool validsubint);
+
+    /**
+     * Was the subint most recently set up (setData/setOffsets) valid? Captured
+     * by GPUCore per procslot right after process_gpu_tofft, before the next
+     * subint's issue overwrites datalengthbytes/offsetseconds. Validity is
+     * datalengthbytes>1 && offsetseconds!=INVALID_SUBINT (matches the invalid
+     * early-return in process_gpu_tofft and the old set_weights subintValid).
+     */
+    [[nodiscard]] bool isSubintValid() const {
+        return (datalengthbytes > 1) && (offsetseconds != INVALID_SUBINT);
+    }
 
     /**
      * Declare whether the Core receive buffers (procslots[].databuffer[]) that
@@ -74,8 +94,27 @@ public:
      */
     static size_t estimateDeviceBytes(Configuration *config, int configindex, int dsindex);
 
-    int process_gpu(int fftloop, int numBufferedFFTs, int startblock,
-                    int numblocks) override;  //frac sample error is in microseconds
+    /**
+     * First half of a subint's station processing: input H2D, unpack,
+     * gpu_set_weights (sample indices/validity + per-window dataweights),
+     * fringe rotation, FFT. Writes NONE of the buffers the deferred host tail
+     * reads (autocorr/gTotalWeight/pcal host mirrors), so the next subint's
+     * process_gpu_tofft can run on the compute stream while the current
+     * subint's outputs drain and its host tail runs. Returns numBufferedFFTs.
+     * On an invalid subint (datalengthbytes<=1) it zeros fftd/conj/gDataWeights
+     * /validity and returns early (no sync); process_gpu_afterfft then no-ops.
+     */
+    int process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
+                          int numblocks);
+    /**
+     * Second half: gpu_sum_weights + gTotalWeight D2H, pcal extraction +
+     * copyToHost, fractionalRotation (autocorrelations) + autocorr copyToHost.
+     * Produces every tail-consumed output. Enqueued on the compute stream after
+     * tofft; must run before the NEXT subint's tofft (single-stream order keeps
+     * the fftd/gDataWeights it reads valid). No-op for an invalid subint.
+     */
+    int process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblock,
+                             int numblocks);
 
 //    int GPUMode::set_invalid_data(int fftloop, int numBufferedFFTs, int startblock,
 //                         int numblocks);
@@ -192,6 +231,17 @@ private:
 
     bool is_dataweight_valid(int subloopindex);
     bool is_data_valid(int index, int subloopindex);
+
+    /// Per-freq matching-band counts, filled in process_gpu_tofft (device path:
+    /// copied from countsStatic; host-weights path: filled by set_weights) and
+    /// consumed by fractionalRotation in process_gpu_afterfft. A member (not a
+    /// process_gpu local) because the two halves are now separate calls.
+    /// Allocated to numrecordedfreqs in the constructor.
+    int *savedProcessCounts = nullptr;
+    /// True between process_gpu_tofft's invalid early-return and afterfft, so
+    /// afterfft no-ops for an invalid subint (mirrors the old single-function
+    /// early return). Only meaningful between the paired tofft/afterfft calls.
+    bool tofftInvalidSubint = false;
 
     std::chrono::time_point<std::chrono::system_clock, std::chrono::system_clock::duration> constructor_time;
     // Per-instance CUDA timing events

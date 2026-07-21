@@ -36,10 +36,15 @@ bool GPUMode::useGpuWeights() {
     return cached == 1;
 }
 
-void GPUMode::finishWeights() {
-    if (!weightsOnDevice)
-        return;             // host path or invalid subint: host arrays already correct
-    weightsOnDevice = false;
+void GPUMode::finishWeights(bool validsubint) {
+    // Host-weights fallback (static, whole-run) fills the host arrays directly
+    // in process_gpu_afterfft, and an invalid subint has no device outputs to
+    // fold - either way there is nothing to do here. validsubint is passed by
+    // GPUCore (captured per-slot at issue time) rather than read from the
+    // mutable Mode state, which the pipelined next-subint issue has already
+    // overwritten by the time this deferred tail runs.
+    if (!useGpuWeights() || !validsubint)
+        return;
 
     // GPUCore has drained the compute stream, so the async D2H of the device
     // reductions (total weight, autocorr accumulators) have landed in the
@@ -362,6 +367,7 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     // FFT window in the host set_weights loop (which still refreshes its own
     // copy when the DIFX_GPU_WEIGHTS_HOST fallback is active).
     countsStatic = new int[numrecordedfreqs]();
+    savedProcessCounts = new int[numrecordedfreqs]();
     for (int i = 0; i < numrecordedfreqs; i++) {
         int count = 0;
         for (int j = 0; j < numrecordedbands; j++) {
@@ -516,6 +522,7 @@ GPUMode::~GPUMode() {
     delete gDataWeights;
     delete gTotalWeight;
     delete[] countsStatic;
+    delete[] savedProcessCounts;
     delete gInterpolator;
     delete gFracSampleError;
     delete gBigA;
@@ -712,8 +719,8 @@ __global__ void print_fft_window(cuFloatComplex* fftd_data, int nchan, int fftch
 
 }
 
-int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
-                         int numblocks)  //frac sample error is in microseconds
+int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
+                               int numblocks)  //frac sample error is in microseconds
 {
 
 
@@ -768,8 +775,6 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     } else if (phasepoloffset) {
         NOT_SUPPORTED("phase polarisation offset");
     }
-
-    auto start = high_resolution_clock::now();
 
 
     if (ev_start == nullptr) {
@@ -851,9 +856,14 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
         // sure finishWeights() does not overwrite them from the device.
         weightsOnDevice = false;
 
-        checkCuda(cudaStreamSynchronize(cuStream));
+        // Invalid subint: process_gpu_afterfft() will no-op on this flag. No
+        // stream drain here - the memsets are enqueued on cuStream and ordered
+        // ahead of everything the pipeline issues next; GPUCore's per-slot
+        // validsubint (captured from isSubintValid()) drives the tail skip.
+        tofftInvalidSubint = true;
 	    return numBufferedFFTs;
     }
+    tofftInvalidSubint = false;
 
     //valid_frames = new GpuMemHelper<bool>(framestounpack, cuStream, false); 
 
@@ -881,9 +891,8 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     //        pcalResetDataNs = datans;
     //}
 
-    // Reset the autocorrelations
-    checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
-                              sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
+    // (The temp_autocorrelations device reset moves to process_gpu_afterfft,
+    // immediately before fractionalRotation accumulates into it.)
 
     // Update the interpolator
     gInterpolator->copyToDevice();
@@ -969,7 +978,16 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
     // ==========================================
     // 3. COPY TO (Weights & Indices)
     // ==========================================
-    int counts[numrecordedfreqs] = {0};
+    // counts is filled here (tofft) and consumed by fractionalRotation in
+    // process_gpu_afterfft, so it lives in the member savedProcessCounts rather
+    // than a process_gpu local. The gpu_set_weights kernel that produces the
+    // per-window dataweights/sample-indices/validity stays here (fringe
+    // rotation below needs the indices); its reduction to a single total weight
+    // (gpu_sum_weights + the gTotalWeight D2H) moves to process_gpu_afterfft so
+    // gTotalWeight's pinned host mirror is written at drain time, not while the
+    // next subint's tail may still be reading it.
+    int *counts = savedProcessCounts;
+    for (int i = 0; i < numrecordedfreqs; i++) counts[i] = 0;
 
     if (useGpuWeights()) {
         // Device-side weights (default): upload this subint's validity
@@ -1003,18 +1021,7 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
             gSampleIndexes->gpuPtr(),
             numBufferedFFTs, framestounpack, framesamples, fftchannels,
             subintValid);
-        // Reduce the per-window weights to a single scalar and bring back just
-        // that float (Increment 2b): finishWeights' AC per-band accumulation
-        // needs only the total. The full per-window array is D2H'd only when
-        // WDEBUG is active (its parity output prints per-window values).
-        gpu_sum_weights<<<1, 1, 0, cuStream>>>(
-            gDataWeights->gpuPtr(), numBufferedFFTs, gTotalWeight->gpuPtr());
-        checkCuda(cudaMemcpyAsync(gTotalWeight->ptr(), gTotalWeight->gpuPtr(),
-                                  sizeof(float), cudaMemcpyDeviceToHost, cuStream));
-        if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
-            checkCuda(cudaMemcpyAsync(gDataWeights->ptr(), gDataWeights->gpuPtr(),
-                                      cfg_numBufferedFFTs * sizeof(float),
-                                      cudaMemcpyDeviceToHost, cuStream));
+        // (gpu_sum_weights + gTotalWeight D2H moved to process_gpu_afterfft.)
         weightsOnDevice = true;
         memcpy(counts, countsStatic, numrecordedfreqs * sizeof(int));
         DIFX_NVTX_POP();
@@ -1043,11 +1050,69 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
 
     cudaEventRecord(ev_copy2, cuStream);
 
+    // (PCAL extraction moves to process_gpu_afterfft - it reads the unpacked
+    // samples, still valid there by stream order, and writes a tail-consumed
+    // host mirror, so it belongs with the other outputs after the FFT.)
+
+    // ==========================================
+    // 5. FRINGE ROTATION
+    // ==========================================
+    fringeRotation(fftloop, numBufferedFFTs, startblock, numblocks);
+    cudaEventRecord(ev_rotate, cuStream);
+
+    // ==========================================
+    // 6. FFT
+    // ==========================================
+
+    runFFT();
+    cudaEventRecord(ev_fft, cuStream);
+
+    // End of process_gpu_tofft: fftd_gpu/conj_fftd_gpu now hold this subint's
+    // spectra. No tail-consumed output buffer has been written, so the next
+    // subint's process_gpu_tofft may run on the compute stream while this
+    // subint's afterfft outputs drain and its host tail runs.
+    t_total += duration_cast<microseconds>(high_resolution_clock::now() - begin_time).count();
+    return numBufferedFFTs;
+}
+
+int GPUMode::process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblock,
+                                  int numblocks)
+{
+    // No-op for an invalid subint (process_gpu_tofft already zeroed fftd/conj/
+    // gDataWeights/validity and set the flag). Mirrors the old single-function
+    // early return; GPUCore's per-slot validsubint drives the tail skip.
+    if (tofftInvalidSubint)
+        return numBufferedFFTs;
+
+    auto begin_time = high_resolution_clock::now();
+    int *counts = savedProcessCounts;
+
+    // Reset the autocorrelations (device) immediately before fractionalRotation
+    // accumulates into them (moved here from process_gpu_tofft).
+    checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
+                              sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
+
+    if (useGpuWeights()) {
+        // Reduce the per-window weights (computed by gpu_set_weights in tofft)
+        // to a single scalar and bring back just that float (Increment 2b):
+        // finishWeights' AC per-band accumulation needs only the total. The
+        // full per-window array is D2H'd only under the WDEBUG gate. Placed
+        // here (not tofft) so gTotalWeight's pinned mirror is written at drain
+        // time, after which GPUCore's completegpudata reads it in the tail.
+        gpu_sum_weights<<<1, 1, 0, cuStream>>>(
+            gDataWeights->gpuPtr(), numBufferedFFTs, gTotalWeight->gpuPtr());
+        checkCuda(cudaMemcpyAsync(gTotalWeight->ptr(), gTotalWeight->gpuPtr(),
+                                  sizeof(float), cudaMemcpyDeviceToHost, cuStream));
+        if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())
+            checkCuda(cudaMemcpyAsync(gDataWeights->ptr(), gDataWeights->gpuPtr(),
+                                      cfg_numBufferedFFTs * sizeof(float),
+                                      cudaMemcpyDeviceToHost, cuStream));
+    }
+
     // ==========================================
     // 4. PCAL EXTRACTION
     // ==========================================
-
-    if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) { 
+    if(!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0)) {
         pcalExtraction(fftloop, numBufferedFFTs, startblock, numblocks);
         // point pcal_output_real_gpu_mode
         if (usecomplex) {
@@ -1057,30 +1122,13 @@ int GPUMode::process_gpu(int fftloop, int numBufferedFFTs, int startblock,
             pcal_output_real->copyToHost();
             pcal_output_real_gpu_mode = pcal_output_real->ptr();
         }
-    }    
-    cudaEventRecord(ev_pcal, cuStream);  
-
-    
-    // ==========================================
-    // 5. FRINGE ROTATION
-    // ==========================================
-    fringeRotation(fftloop, numBufferedFFTs, startblock, numblocks);
-    cudaEventRecord(ev_rotate, cuStream);
-    
-    // ==========================================
-    // 6. FFT
-    // ==========================================
-
-    runFFT();
-    cudaEventRecord(ev_fft, cuStream);
-   
-
-    
+    }
+    cudaEventRecord(ev_pcal, cuStream);
 
     // ==========================================
     // 7. FRACTIONAL ROTATION
     // ==========================================
-    // do the frac sample correct (+ phase shifting if applicable, + fringe rotate if its post-f) 
+    // do the frac sample correct (+ phase shifting if applicable, + fringe rotate if its post-f)
     fractionalRotation(fftloop, numBufferedFFTs, startblock, numblocks, calccrosspolautocorrs, counts);
     cudaEventRecord(ev_frac, cuStream);
     // The per-datastream end drain exists for the host-weights path (and

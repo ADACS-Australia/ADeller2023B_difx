@@ -214,9 +214,30 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
         if (e != NULL && atoi(e) == 0)
             pipeline = false;
     }
+    // The DIFX_GPU_WEIGHTS_HOST fallback computes this subint's weights on the
+    // host in issue_tofft (set_weights) and copies its autocorrelations in
+    // issue_afterfft, both consumed by the host tail. Tail-overlap pipelining
+    // inserts the NEXT subint's issue_tofft between afterfft and complete, which
+    // would clobber those shared host mirrors - so force the synchronous path
+    // when the device-weights path is off. (It is a debug/comparison path; it
+    // does not need the overlap.)
+    if (!GPUMode::useGpuWeights())
+        pipeline = false;
     if (mpiid == numdatastreams + fxcorr::FIRSTTELESCOPEID)
         cinfo << startl << "GPU Core visibility-transfer pipelining is "
               << (pipeline ? "ENABLED" : "disabled") << endl;
+
+    // Per-window WDEBUG (DIFX_WEIGHT_DEBUG) prints Mode scalars (datasec/datans/
+    // nearestSamples/validflags) that, with pipelining on, the tail reads AFTER
+    // the next subint's tofft has overwritten them - so the values would be
+    // wrong. WDEBUG is a debug-only tool (slated for removal); require the
+    // synchronous, no-overlap path so it stays exact by construction.
+    if (pipeline && getenv("DIFX_WEIGHT_DEBUG") != NULL) {
+        cfatal << startl << "DIFX_WEIGHT_DEBUG requires DIFX_GPU_PIPELINE=0 on the GPU path "
+               << "(per-window weight debug is not valid while tail-overlap pipelining is on)"
+               << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     // Page-lock the Core receive buffers (procslots[].databuffer[], allocated
     // pageable by the Core constructor) so the GPUModes can cudaMemcpyAsync
@@ -279,11 +300,21 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     results_host.resize(RECEIVE_RING_LENGTH);
     d2hDone.resize(RECEIVE_RING_LENGTH);
     h2dInputDone.resize(RECEIVE_RING_LENGTH);
+    // evComputeDone[slot] is recorded on cuStream after this subint's afterfft
+    // + XMAC + output D2Hs; d2hStream waits on it before the visibility D2H, and
+    // it lets the tail-overlap pipeline replace the old end-of-subint
+    // cudaStreamSynchronize. validsubint[slot][ds] captures each datastream's
+    // subint validity at issue time (isSubintValid()), because the pipelined
+    // next-subint tofft overwrites the Mode's datalengthbytes/offsetseconds
+    // before the deferred tail folds this subint's weights/autocorrs.
+    evComputeDone.resize(RECEIVE_RING_LENGTH);
+    validsubint.assign(RECEIVE_RING_LENGTH, std::vector<char>(numdatastreams, 0));
     for (int i = 0; i < RECEIVE_RING_LENGTH; i++) {
         checkCuda(cudaMalloc(&results_gpu[i], maxcoreresultlength * sizeof(cuFloatComplex)));
         checkCuda(cudaMallocHost(&results_host[i], maxcoreresultlength * sizeof(cuFloatComplex)));
         checkCuda(cudaEventCreateWithFlags(&d2hDone[i], cudaEventDisableTiming));
         checkCuda(cudaEventCreateWithFlags(&h2dInputDone[i], cudaEventDisableTiming));
+        checkCuda(cudaEventCreateWithFlags(&evComputeDone[i], cudaEventDisableTiming));
     }
 
     // Allocate the shared, frequency-independent FFT buffer pointer arrays (one
@@ -568,7 +599,6 @@ void GPUCore::loopprocess(int threadid) {
     int perr, numprocessed, startblock, numblocks, lastconfigindex, numpolycos, maxchan, maxpolycos, stadumpchannels, strideplussteplen, maxrotatestrideplussteplength, maxxmaclength, slen;
     double sec;
     bool pulsarbin, somepulsarbin, somescrunch, dumpingsta, nowdumpingsta;
-    processslot *currentslot;
     Polyco **polycos = 0;
     Polyco *currentpolyco = 0;
     Mode **modes;
@@ -672,22 +702,32 @@ void GPUCore::loopprocess(int threadid) {
               << " is about to start processing" << endl;
 
     //while valid, process data.
-    // inflight = procslot index of a subint whose visibility transfer has been
-    // issued but not yet awaited (pipelining), or -1. The process thread holds
-    // the slot locks for both inflight and the slot currently being issued.
-    int inflight = -1;
-    while (procslots[(numprocessed) % RECEIVE_RING_LENGTH].keepprocessing) {
-        currentslot = &(procslots[numprocessed % RECEIVE_RING_LENGTH]);
+    //
+    // Tail-overlap pipeline: process_gpu is split into a first half (tofft: input
+    // H2D, unpack, weights, fringe rotation, FFT - issue_tofft) and a second half
+    // (afterfft: weight reduction, pcal, fractional rotation, then the fused XMAC
+    // + baseline-weight reduction + output D2Hs - issue_afterfft_xmac_drain).
+    // Invariant at each loop top: this slot's first half has already been issued
+    // (prologue or previous iteration) and its slot lock is held. Each iteration
+    // issues this subint's second half, then - before completing it - pre-issues
+    // the NEXT subint's first half onto the compute stream, so that first half
+    // runs while this subint's outputs drain and its host tail (completegpudata)
+    // runs. The pipeline is broken (next tofft deferred until after complete)
+    // across a config change, at end of data, and when DIFX_GPU_PIPELINE=0.
+    //
+    // Per-subint pulsar-polyco + STA setup, then issue_tofft, for one slot.
+    auto setupAndTofft = [&](int slot) {
+        processslot *cs = &(procslots[slot]);
         if (pulsarbin) {
-            sec = double(startseconds + model->getScanStartSec(currentslot->offsets[0], startmjd, startseconds) +
-                         currentslot->offsets[1]) + ((double) currentslot->offsets[2]) / 1000000000.0;
+            sec = double(startseconds + model->getScanStartSec(cs->offsets[0], startmjd, startseconds) +
+                         cs->offsets[1]) + ((double) cs->offsets[2]) / 1000000000.0;
             //get the correct Polyco for this time range and set it up correctly
-            currentpolyco = Polyco::getCurrentPolyco(currentslot->configindex, startmjd, sec / 86400.0, polycos,
+            currentpolyco = Polyco::getCurrentPolyco(cs->configindex, startmjd, sec / 86400.0, polycos,
                                                      numpolycos, false);
             if (currentpolyco == NULL) {
                 cfatal << startl << "Could not locate a polyco to cover time " << startmjd + sec / 86400.0
                        << " - aborting!!!" << endl;
-                currentpolyco = Polyco::getCurrentPolyco(currentslot->configindex, startmjd, sec / 86400.0, polycos,
+                currentpolyco = Polyco::getCurrentPolyco(cs->configindex, startmjd, sec / 86400.0, polycos,
                                                          numpolycos, true);
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
@@ -713,75 +753,76 @@ void GPUCore::loopprocess(int threadid) {
             dumpingsta = nowdumpingsta;
         }
 
-        //issue this subint's GPU work (this does NOT wait for the visibility
-        //transfer back to the host - that is awaited later, in completegpudata)
-        int index = numprocessed % RECEIVE_RING_LENGTH;
-        issuegpudata(index, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+        issue_tofft(slot, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+    };
 
-        if (pipeline) {
-            //Retain this slot's lock, complete the PREVIOUS in-flight subint (its
-            //transfer has had this subint's issue to overlap with) and release it,
-            //then grab the next slot's lock so the manager thread stays ahead. The
-            //process thread thus holds at most two slot locks at once.
-            if (inflight >= 0) {
-                completegpudata(inflight);
-                perr = pthread_mutex_unlock(&(procslots[inflight].slotlocks[threadid]));
-                if (perr != 0)
-                    csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
-                            << " error trying unlock mutex " << inflight << endl;
-            }
-            perr = pthread_mutex_lock(&(procslots[(index + 1) % RECEIVE_RING_LENGTH].slotlocks[threadid]));
-            if (perr != 0)
-                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
-                        << " error trying lock mutex " << (index + 1) % RECEIVE_RING_LENGTH << endl;
-            inflight = index;
-        } else {
-            //Synchronous fallback (DIFX_GPU_PIPELINE=0): complete immediately, then
-            //hand off the lock exactly as the pre-pipelining code did.
-            completegpudata(index);
-            perr = pthread_mutex_lock(&(procslots[(index + 1) % RECEIVE_RING_LENGTH].slotlocks[threadid]));
-            if (perr != 0)
-                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
-                        << " error trying lock mutex " << (index + 1) % RECEIVE_RING_LENGTH << endl;
-            perr = pthread_mutex_unlock(&(procslots[index].slotlocks[threadid]));
-            if (perr != 0)
-                csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
-                        << " error trying unlock mutex " << index << endl;
+    // Prologue: issue the first subint's first half (its slot lock is held from
+    // the initialisation above).
+    setupAndTofft(numprocessed % RECEIVE_RING_LENGTH);
+
+    while (procslots[(numprocessed) % RECEIVE_RING_LENGTH].keepprocessing) {
+        int index = numprocessed % RECEIVE_RING_LENGTH;
+
+        //second half + XMAC + output drain for this subint (its first half ran in
+        //the prologue or the previous iteration)
+        issue_afterfft_xmac_drain(index, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+
+        //grab the next slot's lock (blocks until the manager has filled it),
+        //keeping the manager one slot ahead - exactly as the pre-pipelining code
+        //did. If pipelining and the next slot is a real subint with the same
+        //config, pre-issue its first half NOW so it runs on the compute stream
+        //during this subint's drain + host tail below.
+        int nextindex = (index + 1) % RECEIVE_RING_LENGTH;
+        perr = pthread_mutex_lock(&(procslots[nextindex].slotlocks[threadid]));
+        if (perr != 0)
+            csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                    << " error trying lock mutex " << nextindex << endl;
+        bool nextToffted = false;
+        if (pipeline && procslots[nextindex].keepprocessing &&
+            procslots[nextindex].configindex == lastconfigindex) {
+            setupAndTofft(nextindex);
+            nextToffted = true;
         }
+
+        //complete this subint (await its outputs, run the host tail) while the
+        //next subint's first half executes on the GPU, then release its lock
+        completegpudata(index, threadid, startblock, numblocks, modes, currentpolyco, scratchspace);
+        perr = pthread_mutex_unlock(&(procslots[index].slotlocks[threadid]));
+        if (perr != 0)
+            csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid
+                    << " error trying unlock mutex " << index << endl;
 
         if (threadid == 0)
             numcomplete++;
         numprocessed++;
 
-        currentslot = &(procslots[numprocessed % RECEIVE_RING_LENGTH]);
-        //if the configuration changes from this segment to the next, change our setup accordingly
-        if (currentslot->configindex != lastconfigindex) {
-            cinfo << startl << "Core " << mpiid << " threadid " << threadid << ": changing config to "
-                  << currentslot->configindex << endl;
-            updateconfig(lastconfigindex, currentslot->configindex, threadid, startblock, numblocks, numpolycos,
-                         pulsarbin, modes, polycos, false);
-            cinfo << startl << "Core " << mpiid << " threadid " << threadid
-                  << ": config changed successfully - pulsarbin is now " << pulsarbin << endl;
-            createPulsarVaryingSpace(scratchspace->pulsaraccumspace, &(scratchspace->bins), currentslot->configindex,
-                                     lastconfigindex, threadid);
-            allocateConfigSpecificThreadArrays(scratchspace->baselineweight, scratchspace->baselineshiftdecorr,
-                                               currentslot->configindex, lastconfigindex, threadid);
-            lastconfigindex = currentslot->configindex;
+        //restore the loop-top invariant for the new current slot: handle a config
+        //change, and issue its first half if it was not pre-issued above (i.e.
+        //pipelining off, a config change, or the slot after a config boundary).
+        //We already hold its lock (grabbed above as nextindex).
+        int newindex = numprocessed % RECEIVE_RING_LENGTH;
+        if (procslots[newindex].keepprocessing) {
+            if (procslots[newindex].configindex != lastconfigindex) {
+                cinfo << startl << "Core " << mpiid << " threadid " << threadid << ": changing config to "
+                      << procslots[newindex].configindex << endl;
+                updateconfig(lastconfigindex, procslots[newindex].configindex, threadid, startblock, numblocks,
+                             numpolycos, pulsarbin, modes, polycos, false);
+                cinfo << startl << "Core " << mpiid << " threadid " << threadid
+                      << ": config changed successfully - pulsarbin is now " << pulsarbin << endl;
+                createPulsarVaryingSpace(scratchspace->pulsaraccumspace, &(scratchspace->bins),
+                                         procslots[newindex].configindex, lastconfigindex, threadid);
+                allocateConfigSpecificThreadArrays(scratchspace->baselineweight, scratchspace->baselineshiftdecorr,
+                                                   procslots[newindex].configindex, lastconfigindex, threadid);
+                lastconfigindex = procslots[newindex].configindex;
+            }
+            if (!nextToffted)
+                setupAndTofft(newindex);
         }
     }
 
-    //fallen out of loop, so must be finished.
-//  cinfo << startl << "PROCESS " << mpiid << "/" << threadid << " process thread about to free resources and exit" << endl;
-    //Drain the last still-in-flight subint's visibility transfer and release its
-    //slot lock (pipelined path only; the synchronous path leaves inflight == -1).
-    if (pipeline && inflight >= 0) {
-        completegpudata(inflight);
-        perr = pthread_mutex_unlock(&(procslots[inflight].slotlocks[threadid]));
-        if (perr != 0)
-            csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex "
-                    << inflight << endl;
-    }
-    //Unlock the slot lock we still hold (the terminator slot we grabbed ahead).
+    //fallen out of loop, so must be finished. completegpudata ran inside the loop
+    //for every real subint, so nothing is left in flight - we only still hold the
+    //lock on the current (terminator) slot, whose first half was never issued.
     perr = pthread_mutex_unlock(&(procslots[numprocessed % RECEIVE_RING_LENGTH].slotlocks[threadid]));
     if (perr != 0)
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock mutex "
@@ -889,42 +930,34 @@ __global__ void _gpu_processBaselineBased(
 }
 
 void
-GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
-                      threadscratchspace *scratchspace) {
-    ++core_calls;
-
-    auto start = high_resolution_clock::now();
-
-    //std::cout << "called GPUCore::processgpudata for the " << core_calls << " time, index: " << index << ", startblock: "
-    //          << startblock << ", numblocks: " << numblocks << std::endl;
-
+GPUCore::issue_tofft(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
+                     threadscratchspace *scratchspace) {
 #ifndef NEUTERED_DIFX
-    int status, numfftloops, numfftsprocessed;
+    int status, localfreqindex;
     int binloop;
-    int xcblockcount, maxxcblocks, xcshiftcount;
-    int acblockcount, maxacblocks, acshiftcount;
-    int xmacstridelength, localfreqindex;
-    double blockns;
-    int numBufferedFFTs;
-#endif
-    int perr;
 
-//following statement used to cut all all processing for "Neutered DiFX"
-#ifndef NEUTERED_DIFX
-    xmacstridelength = config->getXmacStrideLength(procslots[index].configindex);
     binloop = 1;
     if (procslots[index].pulsarbin && !procslots[index].scrunchoutput)
         binloop = procslots[index].numpulsarbins;
 
-    //set up the mode objects that will do the station-based processing
+    // Per-datastream host prep + first GPU half (input H2D, unpack, weights,
+    // fringe rotation, FFT). NOTE: on the DEVICE-weights path, zeroAutocorrelations
+    // and resetpcal are NOT done here - they clear host mirrors the deferred tail
+    // reads, and with tail-overlap pipelining the next subint's issue_tofft runs
+    // before this subint's tail, so they move to completegpudata (just before
+    // finishWeights / copyPCalTones).
+    //
+    // The DIFX_GPU_WEIGHTS_HOST fallback is different: it fills weights[][] here
+    // (in set_weights, += per window) and copies autocorrelations[][] in afterfft,
+    // both BEFORE the tail - so on that path zeroAutocorrelations must run HERE,
+    // ahead of set_weights, not in the tail (where it would wipe them). That path
+    // is forced non-pipelined (see the constructor), so this pre-zero is safe.
+    if (!GPUMode::useGpuWeights()) {
+        for (int j = 0; j < numdatastreams; j++)
+            modes[j]->zeroAutocorrelations();
+    }
     for (int j = 0; j < numdatastreams; j++) {
-        //zero the autocorrelations and set delays
-        modes[j]->zeroAutocorrelations();
         modes[j]->setValidFlags(&(procslots[index].controlbuffer[j][3]));
-        //std::cout << "Setting data for datastream " << j << " with datalengthbytes: " << procslots[index].datalengthbytes[j]
-        //          << " and controlbuffer: " << procslots[index].controlbuffer[j][0] << ", "
-       //           << procslots[index].controlbuffer[j][1] << ", " << procslots[index].controlbuffer[j][2]
-       //           << std::endl;
         modes[j]->setData(procslots[index].databuffer[j], procslots[index].datalengthbytes[j],
                           procslots[index].controlbuffer[j][0], procslots[index].controlbuffer[j][1],
                           procslots[index].controlbuffer[j][2]);
@@ -933,18 +966,22 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         if (scratchspace->dumpkurtosis)
             modes[j]->zeroKurtosis();
 
-        //reset pcal
-        if (config->getDPhaseCalIntervalMHz(procslots[index].configindex, j) > 0) {
-            modes[j]->resetpcal();
-        }
+        // First half of station processing (see process_gpu_afterfft for the rest).
+        ((GPUMode *) modes[j])->process_gpu_tofft(0, numblocks, startblock, numblocks);
+
+        // Capture this subint's validity NOW, before the next subint's issue
+        // overwrites datalengthbytes/offsetseconds; the deferred tail reads it.
+        validsubint[index][j] = ((GPUMode *) modes[j])->isSubintValid() ? 1 : 0;
     }
 
-    //zero the results for this thread
+    //zero the results for this thread (unused on the GPU path, but kept in step
+    //with the CPU path; the fused XMAC writes results_gpu directly)
     status = vectorZero_cf32(scratchspace->threadcrosscorrs, procslots[index].threadresultlength);
     if (status != vecNoErr)
         csevere << startl << "Error trying to zero threadcrosscorrs!!!" << endl;
 
-    //zero the baselineweights and baselineshiftdecorrs for this thread
+    //zero the baselineweights and baselineshiftdecorrs for this thread (consumed
+    //by the tail's host-weights-fallback fold, so zero them before that runs)
     for (int i = 0; i < config->getFreqTableLength(); i++) {
         if (config->isFrequencyUsed(procslots[index].configindex, i)) {
             for (int b = 0; b < binloop; b++) {
@@ -974,111 +1011,35 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
             }
         }
     }
+#endif
+}
 
-    //set up variables which control the number of loops through buffered FFT results
-    xcblockcount = 0;
-    xcshiftcount = 0;
-    acblockcount = 0;
-    acshiftcount = 0;
-    // Force a single data transfer to the GPU
-    numBufferedFFTs = numblocks; // Do all the FFTs in one go
-    numfftloops = numblocks / numBufferedFFTs; // so this will always be 1
-    if (numblocks % numBufferedFFTs != 0)
-        numfftloops++;
-    blockns = ((double) (config->getSubintNS(procslots[index].configindex))) /
-              ((double) (config->getBlocksPerSend(procslots[index].configindex)));
+void
+GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int numblocks, Mode **modes,
+                                   Polyco *currentpolyco, threadscratchspace *scratchspace) {
+    ++core_calls;
 
-    maxxcblocks = ((int) (model->getMaxNSBetweenXCAvg(procslots[index].offsets[0]) / blockns));
-    maxxcblocks -= maxxcblocks % numBufferedFFTs;
-    if (maxxcblocks == 0) {
-        maxxcblocks = numBufferedFFTs;
-        cverbose << startl << "Requested cross-correlation shift/average time of "
-                 << model->getMaxNSBetweenXCAvg(procslots[index].offsets[0]) << " ns cannot be met with "
-                 << numBufferedFFTs << " FFTs being buffered; the time resolution which will be attained is "
-                 << maxxcblocks * blockns << " ns" << endl;
+    auto start = high_resolution_clock::now();
+
+    //std::cout << "called GPUCore::processgpudata for the " << core_calls << " time, index: " << index << ", startblock: "
+    //          << startblock << ", numblocks: " << numblocks << std::endl;
+
+//following statement used to cut all all processing for "Neutered DiFX"
+#ifndef NEUTERED_DIFX
+    // Whole subint processed in one FFT batch (numfftloops == 1 on the GPU path).
+    int numBufferedFFTs = numblocks;
+
+    // Second half of per-datastream station processing (weight reduction, pcal,
+    // fractional rotation + autocorrelations). The first half (input H2D, unpack,
+    // gpu_set_weights, fringe rotation, FFT) ran in issue_tofft; single-compute-
+    // stream ordering keeps the fftd/gDataWeights buffers this reads valid.
+    DIFX_NVTX_PUSH("station_processing");
+    for (int j = 0; j < numdatastreams; j++) {
+        ((GPUMode *) modes[j])->process_gpu_afterfft(0, numBufferedFFTs, startblock, numblocks);
     }
+    DIFX_NVTX_POP(); // station_processing
 
-    maxacblocks = ((int) (model->getMaxNSBetweenACAvg(procslots[index].offsets[0]) / blockns));
-    maxacblocks -= maxacblocks % numBufferedFFTs;
-    if (maxacblocks == 0) {
-        maxacblocks = numBufferedFFTs;
-        cverbose << startl << "Requested autocorrelation shift/average time of "
-                 << model->getMaxNSBetweenACAvg(procslots[index].offsets[0]) << " ns cannot be met with "
-                 << numBufferedFFTs << " FFTs being buffered; the time resolution which will be attained is "
-                 << maxacblocks * blockns << " ns" << endl;
-    }
-
-    // Use the Core's persistent stream (created in the constructor and shared
-    // with the GPUModes) rather than creating and destroying a stream every
-    // subint. Because the modes enqueue their station processing on this same
-    // stream, the XMAC launches below are naturally ordered after the FFT
-    // output they consume - no cross-stream synchronisation needed.
-//    cuFloatComplex* threadcrosscorrs_gpu;
-//
-//    checkCuda(cudaStreamCreate(&cuStream));
-//
-//    checkCuda(cudaMallocAsync(&threadcrosscorrs_gpu, sizeof(cuFloatComplex) * maxthreadresultlength, cuStream));
-//    checkCuda(cudaMemsetAsync(threadcrosscorrs_gpu, 0, sizeof(cuFloatComplex) * maxthreadresultlength, cuStream));
-//    checkCuda(cudaHostRegister(scratchspace->threadcrosscorrs, sizeof(cuFloatComplex) * maxthreadresultlength, cudaHostRegisterPortable));
-//
-//    cuFloatComplex** gpuM1Freqs;
-//    cuFloatComplex** gpuM2Freqs;
-//    checkCuda(cudaMallocAsync(&gpuM1Freqs, sizeof(cuFloatComplex*) * numbaselines, cuStream));
-//    checkCuda(cudaMallocAsync(&gpuM2Freqs, sizeof(cuFloatComplex*) * numbaselines, cuStream));
-//
-//    auto numPolarisationProducts = config->getBNumPolProducts(procslots[index].configindex, 0, 0);
-//
-//    char* stream1BandIndexes_gpu;
-//    char* stream2BandIndexes_gpu;
-//    checkCuda(cudaMallocAsync(&stream1BandIndexes_gpu, sizeof(char) * numPolarisationProducts * numBufferedFFTs * numbaselines, cuStream));
-//    checkCuda(cudaMallocAsync(&stream2BandIndexes_gpu, sizeof(char) * numPolarisationProducts * numBufferedFFTs * numbaselines, cuStream));
-//
-//    auto stream1BandIndexes = new char[numPolarisationProducts * numBufferedFFTs * numbaselines];
-//    auto stream2BandIndexes = new char[numPolarisationProducts * numBufferedFFTs * numbaselines];
-//
-//    checkCuda(cudaHostRegister(stream1BandIndexes, numPolarisationProducts * numBufferedFFTs * numbaselines, cudaHostRegisterPortable));
-//    checkCuda(cudaHostRegister(stream2BandIndexes, numPolarisationProducts * numBufferedFFTs * numbaselines, cudaHostRegisterPortable));
-//
-    auto stop = high_resolution_clock::now();
-    auto duration = duration_cast<microseconds>(stop - start);
-
-    avg_preprocess += duration.count();
-
-    // process each chunk of FFTs in turn
-    //std::cout << "numfftloops = " << numfftloops << std::endl;
-    //std::cout << "numsdatastreams = " << numdatastreams << std::endl;
-    for (int fftloop = 0; fftloop < numfftloops; fftloop++) {
-        start = high_resolution_clock::now();
-
-        numfftsprocessed = 0;   // not strictly needed, but to prevent compiler warning
-
-        // do the station-based processing for this batch of FFT chunks.
-        vector<std::thread> streamThreads;
-
-        // Per-datastream station processing, run sequentially on the shared
-        // compute stream (each process_gpu drains before the next).
-        DIFX_NVTX_PUSH("station_processing");
-        for (int j = 0; j < numdatastreams; j++) {
-            //std::cout << "datastream " << j << " processing fftloop " << fftloop << std::endl;  
-          //  if (procslots[index].datalengthbytes[j] > 1) {
-    	//    streamThreads.emplace_back([&numfftsprocessed, &modes, j, fftloop, numBufferedFFTs, startblock, numblocks] {
-            //std::cout << "before process_gpu: fftloop = " << fftloop << ", startblock = " << startblock << std::endl;    
-        //    numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
-        //    });
-             numfftsprocessed = ((GPUMode *) modes[j])->process_gpu(fftloop, numBufferedFFTs, startblock, numblocks);
-
-        //    }
-        }
-
-        for (auto &t: streamThreads) {
-            t.join();
-        }
-        DIFX_NVTX_POP(); // station_processing
-
-        stop = high_resolution_clock::now();
-        duration = duration_cast<microseconds>(stop - start);
-        //cout << "total processing: " << duration.count() << endl;
-        start = high_resolution_clock::now();
+    {
 //
 //        //All baseline freq indices into the freq table are determined by the *first* datastream
 //        //in the event of correlating USB with LSB data.  Hence all Nyquist offsets/channels etc
@@ -1262,113 +1223,31 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
         }
 
         // ---------------------------------------------------------------------
-        // FINAL HOST TRANSFER (deferred / overlapped)
+        // DRAIN (event-based, non-blocking) - overlaps the NEXT subint's compute
         // ---------------------------------------------------------------------
-        // Drain the compute stream so all of this subint's device work - the
-        // modes' autocorrelation/pcal copies AND the XMAC into results_gpu[index]
-        // - is complete before we read any of it.
-        checkCuda(cudaStreamSynchronize(cuStream));
-        DIFX_NVTX_POP(); // xmac_launch (includes the wait for XMAC/compute to finish)
+        // Record compute-done on cuStream after all of this subint's device work
+        // (afterfft outputs + XMAC + the baseline-weight reduction and their
+        // cuStream D2Hs). This REPLACES the old cudaStreamSynchronize: the host
+        // no longer blocks here, so loopprocess enqueues the NEXT subint's
+        // issue_tofft on cuStream right after this - running during this subint's
+        // drain and its host tail (completegpudata).
+        checkCuda(cudaEventRecord(evComputeDone[index], cuStream));
+        DIFX_NVTX_POP(); // xmac_launch
 
-        // Land the device-computed per-window weights and autocorr mirrors on
-        // the host (no-op on the host-weights fallback path) - the drain above
-        // guarantees their async D2H copies have completed. Must precede the
-        // averageAndSendAutocorrs/baseline-weight consumers below. Correct
-        // only while numfftloops == 1 (guaranteed above): finishWeights sums
-        // all cfg_numBufferedFFTs windows, i.e. the whole subint per call.
-        for (int j = 0; j < numdatastreams; j++)
-            ((GPUMode *) modes[j])->finishWeights();
-
-        // Transfer ONLY the leading visibility block back to the host, into this
-        // slot's pinned staging buffer, on the dedicated d2h stream - so the copy
-        // is genuinely asynchronous and overlaps both the host-side tail
-        // accumulation immediately below and the NEXT subint's compute. The
-        // trailing baseline-weight/autocorrelation/pcal sections are added on the
-        // host directly into procslots[index].results (which the main thread zeroed
-        // before handing us this slot). completegpudata(index) awaits d2hDone[index]
-        // and then copies the staged visibilities across into procslots.
+        // Visibility D2H on the dedicated d2h stream, gated on evComputeDone so
+        // it waits for the XMAC output without draining cuStream (letting it
+        // overlap the next subint's compute and this subint's host tail).
+        // completegpudata(index) awaits d2hDone[index]; because d2hStream first
+        // waits evComputeDone, that wait transitively covers the cuStream output
+        // D2Hs too (autocorr / gTotalWeight / pcal / baseline-weights). The whole
+        // host tail (finishWeights, autocorr + baseline-weight fold, pcal, and
+        // the visibility memcpy) moves to completegpudata.
         int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
+        checkCuda(cudaStreamWaitEvent(d2hStream, evComputeDone[index], 0));
         checkCuda(cudaMemcpyAsync(results_host[index], results_gpu[index],
                                   xcorrslength * sizeof(cuFloatComplex),
                                   cudaMemcpyDeviceToHost, d2hStream));
         checkCuda(cudaEventRecord(d2hDone[index], d2hStream));
-
-        // Host-side accumulation into procslots results (autocorrelations and
-        // baseline weights), overlapping the visibility D2H issued above.
-        DIFX_NVTX_PUSH("host_accumulate");
-        // Accumulate the autocorrelation block count and flush the modes'
-        // autocorrelations into the results buffer at the AC averaging
-        // cadence, exactly as Core::processdata does (the leftover-count
-        // flush after this loop handles the common maxacblocks > numblocks
-        // case). NOTE: this must stay after the results transfer above -
-        // that memcpy overwrites the entire results buffer (zeros in the
-        // autocorr region) and averageAndSendAutocorrs *adds* into it.
-        acblockcount += numfftsprocessed;
-        if (acblockcount == maxacblocks) {
-            averageAndSendAutocorrs(index, threadid,
-                                    (startblock + acshiftcount * maxacblocks + ((double) maxacblocks) / 2.0) * blockns,
-                                    maxacblocks * blockns, modes, scratchspace);
-            acblockcount = 0;
-            acshiftcount++;
-            for (int j = 0; j < numdatastreams; j++)
-                modes[j]->zeroAutocorrelations();
-        }
-
-        // Update the baselineweight if not doing any pulsar stuff. On the
-        // device-weights path this per-window sum now runs on the GPU
-        // (gpu_baseline_weights above) and is folded into procslots results in
-        // host_finalize below; this host loop remains only for the
-        // DIFX_GPU_WEIGHTS_HOST fallback, which fills the host dataweight[]
-        // arrays instead of gDataWeights.
-        if (!procslots[index].pulsarbin && !GPUMode::useGpuWeights()) {
-            for (int fftsubloop = 0; fftsubloop < numBufferedFFTs; fftsubloop++) {
-                auto i = fftloop * numBufferedFFTs + fftsubloop + startblock;
-                if (i >= startblock + numblocks)
-                    break; //may not have to fully complete last fftloop
-                for (int f = 0; f < config->getFreqTableLength(); f++) {
-                    if (config->isFrequencyUsed(procslots[index].configindex, f)) {
-                        for (int j = 0; j < numbaselines; j++) {
-                            localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, j, f);
-                            if (localfreqindex >= 0) {
-                                auto ds1index = config->getBOrderedDataStream1Index(procslots[index].configindex, j);
-                                auto ds2index = config->getBOrderedDataStream2Index(procslots[index].configindex, j);
-                                auto m1 = modes[ds1index];
-                                auto m2 = modes[ds2index];
-                                for (int p = 0; p < config->getBNumPolProducts(procslots[index].configindex, j,
-                                                                               localfreqindex); p++) {
-                                    int ds1recordbandindex, ds2recordbandindex;
-
-                                    ds1recordbandindex = config->getBDataStream1RecordBandIndex(
-                                            procslots[index].configindex, j, localfreqindex, p);
-                                    ds2recordbandindex = config->getBDataStream2RecordBandIndex(
-                                            procslots[index].configindex, j, localfreqindex, p);
-
-                                    if (ds1recordbandindex < 0 || ds2recordbandindex < 0) {
-                                        cerror << startl
-                                               << "Error: Core::processdata(): one of the record band indices could not be found: ds1recordbandindex = "
-                                               << ds1recordbandindex << " ds2recordbandindex = " << ds2recordbandindex
-                                               << endl;
-                                    } else {
-                                        auto weight1 = m1->getDataWeight(ds1recordbandindex, fftsubloop);
-                                        auto weight2 = m2->getDataWeight(ds2recordbandindex, fftsubloop);
-
-                                        auto bweight = weight1 * weight2;
-
-                                        scratchspace->baselineweight[f][0][j][p] += bweight;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        DIFX_NVTX_POP(); // host_accumulate
-
-        stop = high_resolution_clock::now();
-        duration = duration_cast<microseconds>(stop - start);
-        //cout << "baseline weight: " << duration.count() << endl;
     }
 
 
@@ -1386,31 +1265,93 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
     // slot release does not serialize against the subint's compute.
     checkCuda(cudaEventRecord(h2dInputDone[index], cuStream));
 
-    start = high_resolution_clock::now();
-
-//    checkCuda(cudaHostUnregister(stream1BandIndexes));
-//    checkCuda(cudaHostUnregister(stream2BandIndexes));
-//    checkCuda(cudaFreeAsync(stream1BandIndexes_gpu, cuStream));
-//    checkCuda(cudaFreeAsync(stream2BandIndexes_gpu, cuStream));
-//
-//    delete[] stream1BandIndexes;
-//    delete[] stream2BandIndexes;
-//
-//    checkCuda(cudaFreeAsync(threadcrosscorrs_gpu, cuStream));
-//    checkCuda(cudaHostUnregister(scratchspace->threadcrosscorrs));
     // cuStream is the Core's persistent stream now; it is NOT destroyed here
-    // (nor in ~GPUCore - see the no-CUDA-calls-at-teardown note there).
+    // (nor in ~GPUCore - see the no-CUDA-calls-at-teardown note there). The host
+    // tail (autocorrelation + baseline-weight fold, pcal, visibility memcpy) is
+    // deferred to completegpudata so it overlaps the next subint's compute.
+    auto stop = high_resolution_clock::now();
+    auto duration = duration_cast<microseconds>(stop - start);
+    avg_postprocess += duration.count();
+#endif
+}
 
-    // The rest of this function uses an insignificant amount of time
-    //
+void GPUCore::completegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes,
+                              Polyco *currentpolyco, threadscratchspace *scratchspace) {
+    (void) currentpolyco; // pulsar binning / uvshift not supported on the GPU path
+    // Wait for this subint's device->host copies to land: d2hDone[index] (the
+    // visibility D2H on d2hStream, which first waited evComputeDone - so this
+    // transitively covers the cuStream output D2Hs: autocorr / gTotalWeight /
+    // pcal / baseline-weights) and h2dInputDone[index] (the input copies, so the
+    // slot's databuffer can be recycled by the manager).
+    DIFX_NVTX_RANGE("complete_d2h_wait");
+    checkCuda(cudaEventSynchronize(d2hDone[index]));
+    checkCuda(cudaEventSynchronize(h2dInputDone[index]));
+
+#ifndef NEUTERED_DIFX
+    int perr, localfreqindex, numfftsprocessed;
+    int binloop, maxacblocks, acblockcount, acshiftcount;
+    double blockns;
+
+    binloop = 1;
+    if (procslots[index].pulsarbin && !procslots[index].scrunchoutput)
+        binloop = procslots[index].numpulsarbins;
+
+    // Whole subint is one FFT batch on the GPU path (numfftloops == 1), so one
+    // AC-average pass covers it. Recompute the AC cadence params here (they were
+    // issue-time locals in the old monolithic issuegpudata).
+    numfftsprocessed = numblocks;
+    acblockcount = 0;
+    acshiftcount = 0;
+    blockns = ((double) (config->getSubintNS(procslots[index].configindex))) /
+              ((double) (config->getBlocksPerSend(procslots[index].configindex)));
+    maxacblocks = ((int) (model->getMaxNSBetweenACAvg(procslots[index].offsets[0]) / blockns));
+    maxacblocks -= maxacblocks % numblocks;
+    if (maxacblocks == 0)
+        maxacblocks = numblocks;
+
+    DIFX_NVTX_PUSH("host_finalize");
+
+    // Zero the host autocorrelation/weight mirrors for every datastream, then
+    // fold each VALID datastream's device-computed weights + autocorrelations
+    // into them. On the device-weights path zeroAutocorrelations() moved here
+    // from the old pre-GPU prep: finishWeights overwrites the autocorr mirror and
+    // accumulates (+=) into weights[][], so the mirrors must be zeroed here, just
+    // before it (and doing it here rather than at issue time is required by tail-
+    // overlap pipelining - the next subint's issue_tofft runs before this tail).
+    // validsubint[index][j] (captured at issue time) drives the invalid-subint
+    // skip - an invalid datastream's autocorr/weights stay zeroed. On the
+    // DIFX_GPU_WEIGHTS_HOST fallback the mirrors were already filled before the
+    // tail (weights in set_weights, autocorr in afterfft) and were pre-zeroed in
+    // issue_tofft, so they must NOT be re-zeroed here.
+    if (GPUMode::useGpuWeights()) {
+        for (int j = 0; j < numdatastreams; j++)
+            modes[j]->zeroAutocorrelations();
+    }
+    for (int j = 0; j < numdatastreams; j++)
+        ((GPUMode *) modes[j])->finishWeights(validsubint[index][j] != 0);
+
     // NOTE: unlike Core::processdata we must NOT call uvshiftAndAverage here.
     // The fused XMAC kernel has already written the final averaged cross
-    // correlations directly into procslots[index].results, and nothing on the
-    // GPU path fills scratchspace->threadcrosscorrs - so the CPU averaging
-    // would add uninitialised memory on top of the correct visibilities.
-    // (This also means multiple phase centres / pulsar binning, which rely on
-    // uvshiftAndAverage, are not supported on the GPU path.)
-    DIFX_NVTX_PUSH("host_finalize");
+    // correlations directly into results_gpu[index] (staged to results_host and
+    // memcpy'd into procslots below), and nothing on the GPU path fills
+    // scratchspace->threadcrosscorrs - so the CPU averaging would add
+    // uninitialised memory on top of the correct visibilities. (This also means
+    // multiple phase centres / pulsar binning, which rely on uvshiftAndAverage,
+    // are not supported on the GPU path.)
+
+    // Autocorrelation averaging into procslots results at the AC cadence, then
+    // the leftover flush (mirrors the old host_accumulate + host_finalize; with
+    // numfftloops == 1 exactly one of the two averageAndSendAutocorrs runs).
+    acblockcount += numfftsprocessed;
+    if (acblockcount == maxacblocks) {
+        averageAndSendAutocorrs(index, threadid,
+                                (startblock + acshiftcount * maxacblocks + ((double) maxacblocks) / 2.0) * blockns,
+                                maxacblocks * blockns, modes, scratchspace);
+        acblockcount = 0;
+        acshiftcount++;
+        for (int j = 0; j < numdatastreams; j++)
+            modes[j]->zeroAutocorrelations();
+    }
     if (acblockcount != 0) {
         averageAndSendAutocorrs(index, threadid,
                                 (startblock + acshiftcount * maxacblocks + ((double) acblockcount) / 2.0) * blockns,
@@ -1421,20 +1362,55 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
                                numblocks, modes, scratchspace);
     }
 
-    //lock the bweight copylock, so we're the only one adding to the result array (baseline weight section)
+    // Baseline-weight per-window host loop (DIFX_GPU_WEIGHTS_HOST fallback only;
+    // the device-weights path reduced these on the GPU into h_bweightResults,
+    // folded below). numfftloops == 1, so the FFT index is just startblock+sub.
+    if (!procslots[index].pulsarbin && !GPUMode::useGpuWeights()) {
+        for (int fftsubloop = 0; fftsubloop < numblocks; fftsubloop++) {
+            auto i = fftsubloop + startblock;
+            if (i >= startblock + numblocks)
+                break;
+            for (int f = 0; f < config->getFreqTableLength(); f++) {
+                if (config->isFrequencyUsed(procslots[index].configindex, f)) {
+                    for (int j = 0; j < numbaselines; j++) {
+                        localfreqindex = config->getBLocalFreqIndex(procslots[index].configindex, j, f);
+                        if (localfreqindex >= 0) {
+                            auto ds1index = config->getBOrderedDataStream1Index(procslots[index].configindex, j);
+                            auto ds2index = config->getBOrderedDataStream2Index(procslots[index].configindex, j);
+                            auto m1 = modes[ds1index];
+                            auto m2 = modes[ds2index];
+                            for (int p = 0; p < config->getBNumPolProducts(procslots[index].configindex, j,
+                                                                           localfreqindex); p++) {
+                                int ds1recordbandindex = config->getBDataStream1RecordBandIndex(
+                                        procslots[index].configindex, j, localfreqindex, p);
+                                int ds2recordbandindex = config->getBDataStream2RecordBandIndex(
+                                        procslots[index].configindex, j, localfreqindex, p);
+                                if (ds1recordbandindex < 0 || ds2recordbandindex < 0) {
+                                    cerror << startl
+                                           << "Error: Core::processdata(): one of the record band indices could not be found: ds1recordbandindex = "
+                                           << ds1recordbandindex << " ds2recordbandindex = " << ds2recordbandindex
+                                           << endl;
+                                } else {
+                                    auto weight1 = m1->getDataWeight(ds1recordbandindex, fftsubloop);
+                                    auto weight2 = m2->getDataWeight(ds2recordbandindex, fftsubloop);
+                                    scratchspace->baselineweight[f][0][j][p] += weight1 * weight2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fold the baseline weights into the results. Device-weights path: the flat,
+    // self-describing h_bweightResults (each accumulator carries its floatresults
+    // destination). Fallback: the nested config walk (plus multiple-phase-centre
+    // baselineshiftdecorr, which stays zero on the GPU path).
     perr = pthread_mutex_lock(&(procslots[index].bweightcopylock));
     if (perr != 0)
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying lock bweight copy mutex!!!"
                 << endl;
-
-    // Fold the baseline weights into the results. On the device-weights path the
-    // weights were reduced on the GPU (gpu_baseline_weights) into
-    // h_bweightResults, each accumulator carrying its own destination float index
-    // (bwDestOffset) recorded at plan-build time - so this is a flat, one-pass
-    // add that cannot silently diverge from the plan's enumeration. The
-    // DIFX_GPU_WEIGHTS_HOST fallback keeps the original nested host fold
-    // (baseline weights, plus the multiple-phase-centre baselineshiftdecorr -
-    // itself unsupported on the GPU path, where baselineshiftdecorr stays zero).
     if (GPUMode::useGpuWeights()) {
         for (int a = 0; a < bweightNumAccum; a++)
             procslots[index].floatresults[bwDestOffset[a]] += h_bweightResults[a];
@@ -1469,50 +1445,27 @@ GPUCore::issuegpudata(int index, int threadid, int startblock, int numblocks, Mo
             }
         }
     }
-
-    //unlock the bweight copylock
     perr = pthread_mutex_unlock(&(procslots[index].bweightcopylock));
     if (perr != 0)
         csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock copy mutex!!!"
                 << endl;
 
-
-
-    
-
-    //copy the PCal results
+    // pcal: reset the host extractors (moved from the old pre-GPU prep) then copy
+    // the pcal tones. On the GPU path finalisepcal re-sets the extractor data
+    // from the pinned pcal_output before reading, so resetting here (in the tail,
+    // just before copyPCalTones) is equivalent to the old prep-time reset and
+    // avoids the next subint's reset clobbering this subint's pcal.
+    for (int j = 0; j < numdatastreams; j++) {
+        if (config->getDPhaseCalIntervalMHz(procslots[index].configindex, j) > 0)
+            modes[j]->resetpcal();
+    }
     copyPCalTones(index, threadid, modes);
     DIFX_NVTX_POP(); // host_finalize
-
-//end the cutout of processing in "Neutered DiFX"
 #endif
 
-    // NOTE: the slot lock handoff is NOT done here any more - loopprocess owns
-    // it, because with visibility-transfer pipelining the lock on this slot must
-    // be retained until completegpudata() has awaited the deferred device->host
-    // copy issued above.
-
-    stop = high_resolution_clock::now();
-    duration = duration_cast<microseconds>(stop - start);
-
-    avg_postprocess += duration.count();
-    //std::cout << "At the bottom of Core" << std::endl;
-}
-
-void GPUCore::completegpudata(int index) {
-    // Wait for this slot's visibility device->host copy (issued on d2hStream at
-    // the end of issuegpudata) to land in the pinned staging buffer, then copy
-    // the visibilities across into procslots[index].results. The trailing
-    // weight/autocorrelation/pcal sections there were already filled on the host
-    // in issuegpudata and are left untouched. After this the slot's results are
-    // complete and it may be released to the manager for sending.
-    DIFX_NVTX_RANGE("complete_d2h_wait");
-    checkCuda(cudaEventSynchronize(d2hDone[index]));
-    // Also ensure this slot's input host->device copies have drained before the
-    // slot (and its databuffer, which the pinned-input path DMAs from directly)
-    // is recycled. Usually already satisfied - the compute stream was drained
-    // in issuegpudata - but this makes the input-reuse invariant explicit.
-    checkCuda(cudaEventSynchronize(h2dInputDone[index]));
+    // Copy the staged visibilities across into procslots (the visibility prefix,
+    // disjoint from the autocorr/weight/pcal trailing regions folded above,
+    // which the main thread pre-zeroed before handing us this slot).
     int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
     memcpy(procslots[index].results, results_host[index], xcorrslength * sizeof(cuFloatComplex));
 }

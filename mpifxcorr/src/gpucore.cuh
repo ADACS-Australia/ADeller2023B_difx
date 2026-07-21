@@ -29,24 +29,42 @@ public:
     virtual void loopprocess(int threadid);
 
     /**
-     * Issue all of subint `index`'s GPU work: station processing, the fused XMAC
-     * into results_gpu[index], and an asynchronous device->host copy of just the
-     * visibility prefix onto d2hStream (recording d2hDone[index]). The host-side
-     * trailing sections (baseline weights, autocorrelations, pcal) are added into
-     * the pre-zeroed procslots[index].results here too, since they occupy a region
-     * disjoint from the visibility copy. Does NOT wait for the visibility copy, so
-     * it can overlap the next subint's compute. The slot lock is retained until
-     * completegpudata(index) runs.
+     * First pipeline stage for subint `index`: per-datastream host prep
+     * (setData/setValidFlags/setOffsets - NOT zeroAutocorrelations/resetpcal,
+     * which move to the tail) followed by GPUMode::process_gpu_tofft (input H2D,
+     * unpack, weights, fringe rotation, FFT) on the compute stream. Captures
+     * each datastream's validity into validsubint[index][ds]. Writes no
+     * tail-consumed output, so it can run on the compute stream while the
+     * PREVIOUS subint's outputs drain and its host tail runs.
      */
-    void issuegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
-                      threadscratchspace *scratchspace);
+    void issue_tofft(int index, int threadid, int startblock, int numblocks, Mode **modes, Polyco *currentpolyco,
+                     threadscratchspace *scratchspace);
 
     /**
-     * Complete subint `index`: wait for its visibility device->host copy
-     * (d2hDone[index]) to land, after which procslots[index].results is fully valid
-     * and the slot may be released to the manager.
+     * Second pipeline stage for subint `index`: per-datastream
+     * GPUMode::process_gpu_afterfft (weight reduction, pcal, fractional
+     * rotation/autocorr) then the fused XMAC into results_gpu[index] and the
+     * baseline-weight reduction, all on the compute stream; records
+     * evComputeDone[index]; then the asynchronous output device->host copies
+     * (visibilities onto d2hStream, gated on evComputeDone) recording
+     * d2hDone[index] and h2dInputDone[index]. Does NOT wait for them or run the
+     * host tail - that is completegpudata(index).
      */
-    void completegpudata(int index);
+    void issue_afterfft_xmac_drain(int index, int threadid, int startblock, int numblocks, Mode **modes,
+                                   Polyco *currentpolyco, threadscratchspace *scratchspace);
+
+    /**
+     * Complete subint `index`: wait for its device->host copies (d2hDone[index],
+     * h2dInputDone[index]) to land, then run the host tail - fold the
+     * device-computed weights and autocorrelations (finishWeights), accumulate
+     * autocorrelations/baseline-weights into procslots[index].results, copy
+     * pcal, and memcpy the staged visibilities across. After this the slot's
+     * results are complete and it may be released to the manager. Reads
+     * validsubint[index][ds] (captured at issue time) for the invalid-subint
+     * skip, since the Mode scalars now reflect the next subint.
+     */
+    void completegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes,
+                         Polyco *currentpolyco, threadscratchspace *scratchspace);
 
 protected:
     virtual Mode *getMode(const int configindex, const int datastreamindex) {
@@ -93,6 +111,20 @@ private:
     /// input-reuse invariant explicit; on the staging fallback path the wait is
     /// trivially satisfied.
     std::vector<cudaEvent_t> h2dInputDone;
+
+    /// Per-procslot event recorded on cuStream after this subint's afterfft +
+    /// XMAC + baseline-weight reduction (and their output D2Hs enqueued on
+    /// cuStream). d2hStream waits on it before the visibility D2H, and it lets
+    /// issue_tofft(N+1) be enqueued right after (running during this subint's
+    /// drain + host tail) - replacing the old end-of-subint cudaStreamSynchronize.
+    std::vector<cudaEvent_t> evComputeDone;
+
+    /// validsubint[slot][ds]: each datastream's subint validity captured
+    /// (GPUMode::isSubintValid()) right after issue_tofft, before the pipelined
+    /// next-subint issue overwrites the Mode's datalengthbytes/offsetseconds.
+    /// completegpudata reads it to skip the weight/autocorr fold for datastreams
+    /// whose subint had no valid data (mirrors the old weightsOnDevice gate).
+    std::vector<std::vector<char>> validsubint;
 
     /// When true (default; disable with DIFX_GPU_PIPELINE=0), subint N's visibility
     /// transfer is left in flight while subint N+1 is issued, and only awaited just
