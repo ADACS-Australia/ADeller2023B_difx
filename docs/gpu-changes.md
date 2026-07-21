@@ -215,3 +215,68 @@ configure.ac were made portable (configure-derived flags, env-respected
 GCC 15 / C23 breakage in difx2fits and the vex parser was fixed
 (`5c1a6f8d2`), and the local test/benchmark workflows above were
 established.
+
+## 8. Host-tail overlap (intra-subint half-split, 2026-07-21)
+
+The clean A100 profile settled the idle question: the GPU is ~48% idle,
+real (not oversubscription/IO), 70% of it a between-subints host tail.
+The cause was structural - `GPUCore::issuegpudata` enqueued a subint's
+GPU work, drained the compute stream (`cudaStreamSynchronize`), and only
+then ran the whole per-subint host tail (finishWeights, autocorrelation +
+baseline-weight fold, pcal copy, visibility memcpy) with the GPU idle,
+before the next subint's kernels launched.
+
+`GPUMode::process_gpu` is split at the FFT: `process_gpu_tofft` (input
+H2D, unpack, `gpu_set_weights`, fringe rotation, FFT) and
+`process_gpu_afterfft` (the `gpu_sum_weights` reduction + `gTotalWeight`
+D2H, pcal extraction + copy, fractional rotation / autocorrelations). The
+split point was chosen so the first half writes NONE of the buffers the
+host tail consumes - the weight reduction and pcal, though computed before
+the FFT in the old code, were moved into the after-FFT half for exactly
+this reason.
+
+`GPUCore` mirrors the split: `issuegpudata` becomes `issue_tofft` and
+`issue_afterfft_xmac_drain`, and the entire host tail moves into
+`completegpudata`. `loopprocess` software-pipelines at half granularity -
+a prologue issues subint 0's first half, then each iteration issues the
+current subint's second half + XMAC + output drain, pre-issues the NEXT
+subint's first half onto the compute stream, and only then completes the
+current subint (awaits its outputs and runs its host tail). The next
+subint's input half therefore executes on the GPU while the current
+subint's outputs drain and its host tail runs on the CPU.
+
+The mid-loop `cudaStreamSynchronize` is replaced by an `evComputeDone`
+event recorded on the compute stream; the d2h stream waits on it before
+the visibility D2H, and `completegpudata` waits `d2hDone` (which
+transitively covers the compute-stream output D2Hs). No buffer
+duplication is needed: single-compute-stream ordering keeps the fftd /
+gDataWeights buffers the second half reads valid across subints, and each
+subint's host tail runs (in the same loop iteration) before the next
+subint's second half overwrites the shared output mirrors.
+
+Correctness subtleties handled:
+- **Per-slot `validsubint[slot][ds]`** captures each datastream's subint
+  validity at issue time (`GPUMode::isSubintValid()`), because the
+  pipelined next-subint issue overwrites the Mode's
+  `datalengthbytes`/`offsetseconds`/`weightsOnDevice` before the deferred
+  tail folds this subint's weights/autocorrs. `finishWeights` takes the
+  validity as a parameter instead of reading the mutable member.
+- **`zeroAutocorrelations` / `resetpcal`** move out of the pre-GPU prep
+  into the tail (device path), just before `finishWeights` /
+  `copyPCalTones`.
+- **`DIFX_GPU_WEIGHTS_HOST` fallback**: it computes `weights[][]` on the
+  host in `set_weights` (in the first half) and copies autocorrelations in
+  the second half, both before the tail, so on that path
+  `zeroAutocorrelations` runs at `issue_tofft` start and the pipeline is
+  forced synchronous - its shared-mirror lifecycle is incompatible with
+  inserting the next subint's first half between afterfft and complete.
+- **`DIFX_WEIGHT_DEBUG`** now aborts unless `DIFX_GPU_PIPELINE=0` (its
+  per-window scalars would reflect the next subint under overlap).
+- The pipeline is broken (next first-half deferred until after complete)
+  across a config change and at end of data.
+
+Verified CPU-vs-GPU via run-local.sh on an RTX 2070: usb, usb-complex,
+complex-complex, multi all PASS in both `DIFX_GPU_PIPELINE` modes, plus
+usb/complex-complex/multi on the `DIFX_GPU_WEIGHTS_HOST` fallback.
+Benchmark (T5-T1 on the desktop, idle-collapse on the A100 re-profile):
+pending.

@@ -21,24 +21,25 @@ hoisting (2026-07-21). Increments 1-2 cut the T5-T1 benchmark
 22.9 s (~29%).
 
 Fresh NVTX profiles (2026-07-21, RTX 2070 benchprof + tooarrana `multi`)
-reframed the next step. Scoped to the correlation, the GPU is ~55-58%
-busy / ~42-45% idle on both platforms. A per-kernel gap analysis then
-**ruled CUDA graphs out** (recheck only if the clean profile below
-contradicts it): launch overhead is just 3-4% of host CUDA-API time, and
-~97% of the GPU idle is in big (>100us) gaps where the GPU waits on host
-work / data delivery - not the small inter-kernel gaps graphs remove. So
-the idle is **host / data-delivery bound** (the per-subint host tail plus
-the procslot data-delivery pipeline), amplified on the desktop by
-12-ranks-on-8-cores oversubscription and on the cluster `multi` job by
-VDIF disk I/O - a separate, larger investigation, deferred until a clean
-GPU-bound cluster profile (fake data, one rank per core, ~400 subints)
-isolates the real gap. Input H2D is <1% of wall on both, so the
-transfer-overlap idea (old work-queue item 1) is demoted to longer-term.
-Meanwhile the live GPU-side levers cut GPU-busy time: fuse unpack+fringe
-(work-queue item 1; unpack is the largest kernel on the cluster at 34.9%)
-and reduced precision (FP16 / precision-drop, items 2-3; fringe FP64 is
-24% of GPU time on the 2070 but only 12% on the fast-FP64 cluster card,
-so precision work leans desktop).
+reframed the next step, and the clean GPU-bound cluster profile then
+settled it. On an A100 (one rank/core, `--exclusive`, fake data, 400
+subints) the GPU is **~48% idle** - the idle is REAL, not an
+oversubscription/IO artifact, and slightly worse than the polluted
+profiles because the A100's faster kernels make the fixed host tail a
+larger fraction. A per-kernel gap analysis **ruled CUDA graphs out**:
+90% of the idle is in >500us gaps and sub-20us launch gaps are only 8.4%
+of idle. The idle is **host-bound** - 70% is a between-subints host tail,
+20% intra-subint host waits. Input H2D is <5% of wall, so the
+transfer-overlap idea is demoted to longer-term.
+
+**Landed 2026-07-21: host-tail overlap** (see Completed) attacks that
+idle directly by splitting each subint's GPU work at the FFT and running
+the next subint's input half while the current subint's host tail runs.
+The remaining GPU-side levers cut GPU-busy time: fuse unpack+fringe
+(work-queue item 1) and reduced precision (FP16 / precision-drop). On the
+A100 the fringe-rotation family is ~46% of GPU time (post-FFT fractional
+rotation 30% + pre-FFT fringe rotation 15%) and unpack 24%; FP64 is cheap
+there, so the precision work leans desktop (2070).
 
 ## Completed activities
 
@@ -67,6 +68,26 @@ so precision work leans desktop).
   rate). 8/8 device + fallback PASS, both pipeline modes. Design:
   gpu-fringerotation-design.md. Follow-up (per-sample precision drop) is a
   work-queue item below.
+- **Host-tail overlap (intra-subint half-split)** (2026-07-21): the
+  ~48% between-subints GPU idle came from `issuegpudata` draining the
+  stream (`cudaStreamSynchronize`) and then running the whole per-subint
+  host tail (finishWeights, autocorr + baseline-weight fold, pcal,
+  visibility memcpy) with the GPU parked. `process_gpu` is now split at
+  the FFT into `process_gpu_tofft` (input H2D, unpack, gpu_set_weights,
+  fringe rotation, FFT) and `process_gpu_afterfft` (weight reduction,
+  pcal, fractional rotation/autocorr); `issuegpudata` into `issue_tofft`
+  and `issue_afterfft_xmac_drain`; the host tail into `completegpudata`.
+  `loopprocess` software-pipelines at half granularity: after a subint's
+  second half it pre-issues the NEXT subint's first half onto the compute
+  stream, so that input half runs while this subint's outputs drain and
+  its host tail runs. The mid-loop drain is replaced by an `evComputeDone`
+  event the d2h stream waits on. No buffer duplication - single-stream
+  ordering keeps fftd/gDataWeights valid across subints, and each subint's
+  tail runs before the next subint's afterfft overwrites the shared output
+  mirrors. Per-slot `validsubint` drives the invalid-subint skip;
+  `DIFX_GPU_WEIGHTS_HOST` fallback is forced synchronous. PASS CPU-vs-GPU
+  (usb, usb-complex, complex-complex, multi) in both pipeline modes +
+  fallback. Design: gpu-tailoverlap-design.md. (Benchmark: pending.)
 
 ## Work queue (underway + future)
 
@@ -105,18 +126,23 @@ so precision work leans desktop).
    else is float (the precompute can then emit `bigB_reduced` as float
    too, halving the gBigBred traffic). Not bit-identical; validate with
    diffDiFX/SPECDEBUG.
-4. **perbandweights on GPU** — currently unused on the GPU path but
+4. **Check why fractional sample correction is so slow** - currently
+   this is running almost 2x more slowly than fringe rotation, but 
+   really should be of similar speed. I suspect the issue is the 
+   auto-correlation calculation, probably the calculation of the 
+   indices for that or something. Should check that kernel.
+5. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
    the device weights kernel (de-serialization Increment 1) so
    per-(window, band) weights are a natural extension.
-5. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
-6. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
+6. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
+7. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
    `blanker_vdif_gpu`) + widen the `getMode` format gate. MUST add the
    `datalengthbytes <= getMaxDataBytes` clamp in `process_gpu` first:
    non-VDIF datastreams keep the base class's guard-scaled sendbytes,
    which can exceed the packed-data buffer (latent, unreachable today).
-7. **Kernel launch-configuration / occupancy audit.** Verify every GPU
+8. **Kernel launch-configuration / occupancy audit.** Verify every GPU
    kernel launches an appropriate grid/block size - enough threads to
    fill the device, a block shape with good occupancy, and no accidental
    under- or over-subscription. Several kernels were written with ad-hoc
@@ -181,6 +207,8 @@ will ease the eventual merge and put GPU code where it belongs:
   complex GEMM at heart, a natural tensor-core target (Turing: FP16
   multiply / FP32 accumulate; data-centre cards add TF32/FP64 paths).
   Needs an accuracy assessment against the correlator's dynamic range.
+- **Templating the unpack**: Can we make the unpack on the GPU neater 
+  (possibly in conjunction with fusing with fringe rotation).
 - **Compute/H2D overlap across datastreams (the "Option A / Option B"
   ideas)**: overlap the input H2D with GPU compute - Option A intra-subint
   (datastream j+1's H2D during datastream j's compute), Option B
