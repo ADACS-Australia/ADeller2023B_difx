@@ -68,8 +68,10 @@ fi
 
 ######## Scenarios and modes #################################################
 
-# NOTE: the multi scenario (5 stations) needs ntasks >= 7 - check
-# CPU_NTASKS/GPU_NTASKS in your slurm.conf (defaults below now allow it).
+# NOTE: each scenario needs ntasks >= (its antenna count + 2); the multi
+# scenario (5 stations) needs >= 7. prep_mode now enforces this per scenario
+# and refuses to queue a job whose configured ntasks is too small, so a
+# mis-sized slurm.conf fails immediately instead of after a queue wait.
 ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi)
 
 if [ "$#" -gt 0 ]; then
@@ -92,9 +94,23 @@ echo "Workdir   : $WORKDIR"
 echo
 
 ######## Ensure synthetic VDIF data exists ###################################
+# Check the specific VDIF files each SELECTED scenario needs (parsed from its
+# v2d), not a fixed pair - otherwise a newly-added scenario's data (e.g. the
+# multi files) is silently missing and its jobs fail at correlation time.
 
-if [ ! -f "$SYNTHDIR/TEST1.vdif" ] || [ ! -f "$SYNTHDIR/TEST2-dsb-lsb.vdif" ]; then
-    echo "Synthetic VDIF data not found - generating with createData.sh ..."
+data_missing=0
+for scen in "${SCENARIOS[@]}"; do
+    scen_v2d="$SYNTHDIR/test-$scen.v2d"
+    [ -f "$scen_v2d" ] || continue
+    for vdif in $(awk -F= '/^[[:space:]]*file[[:space:]]*=/{gsub(/[[:space:]]/,"",$2);print $2}' "$scen_v2d"); do
+        if [ ! -f "$SYNTHDIR/$vdif" ]; then
+            echo "Missing VDIF data for '$scen': $vdif" >&2
+            data_missing=1
+        fi
+    done
+done
+if [ "$data_missing" = 1 ]; then
+    echo "Synthetic VDIF data missing - generating with createData.sh ..."
     ( cd "$SYNTHDIR" && ./createData.sh )
 fi
 
@@ -137,9 +153,29 @@ prep_mode() {
     if ( set -e; set +u; . "$setup"; set -u; cd "$jobdir"; \
          vex2difx "$v2d"; difxcalc "${expname}.calc" ) \
          > "$jobdir/prep.log" 2>&1; then
+        # Refuse NOW (before this job is queued) if the configured ntasks is too
+        # small: mpifxcorr needs 1 manager + N datastreams + 1 core =
+        # (ACTIVE DATASTREAMS + 2) ranks. A job submitted with fewer only waits
+        # in the SLURM queue to fail at startup - so fail fast here instead.
+        local nds required modentasks confvar
+        nds="$(awk '/^ACTIVE DATASTREAMS/{print $3}' "$jobdir/${expname}.input")"
+        case "$mode" in
+            cpu)       modentasks="$CPU_NTASKS";       confvar="CPU_NTASKS" ;;
+            gpu)       modentasks="$GPU_NTASKS";       confvar="GPU_NTASKS" ;;
+            reference) modentasks="$REFERENCE_NTASKS"; confvar="REFERENCE_NTASKS" ;;
+        esac
+        if [ -z "$nds" ]; then
+            echo "  [$scen/$mode] ERROR: could not read ACTIVE DATASTREAMS from ${expname}.input" >&2
+            return 1
+        fi
+        required=$(( nds + 2 ))
+        if [ "$required" -gt "$modentasks" ]; then
+            echo "  [$scen/$mode] ERROR: $confvar=$modentasks is too small - '$scen' has $nds active datastreams and needs ntasks >= $required (1 manager + $nds datastreams + 1 core). Raise $confvar in slurm.conf and re-run." >&2
+            return 1
+        fi
         write_sbatch "$mode" "$expname" "$jobdir" >/dev/null
         state_set "prep~$scen~$mode" 1
-        echo "  [$scen/$mode] prepared"
+        echo "  [$scen/$mode] prepared (ntasks=$modentasks, needs $required)"
     else
         echo "  [$scen/$mode] ERROR: vex2difx/difxcalc failed (see $jobdir/prep.log)" >&2
     fi

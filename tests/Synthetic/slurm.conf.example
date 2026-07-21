@@ -28,16 +28,19 @@ WORKDIR=/fred/oz168/adeller/difx-synthetic-tests
 SETUP_SCRIPT=/home/adeller/setup_gpudifx.mikebranch
 
 ######## Per-mode SLURM resources ############################################
-# NTASKS is used both for #SBATCH --ntasks and for "srun -n<NTASKS>".  For the
-# 2-antenna synthetic tests the minimum workable value is 4 (1 manager +
-# 2 datastreams + 1 core); larger values just add more core processes.
-# TIME is walltime in [HH:]MM:SS.  MEM_PER_CPU is in MB.
+# NTASKS is used both for #SBATCH --ntasks and for "srun -n<NTASKS>".  Each
+# scenario needs (antenna count + 2) ranks: 1 manager + N datastreams + 1 core.
+# The 2-antenna scenarios need >= 4; the 5-antenna "multi" scenario needs >= 7.
+# 7 below therefore covers every current scenario (larger values just add idle
+# core ranks).  run-slurm.sh refuses to queue a job whose ntasks is too small
+# for its scenario, so an under-sized value fails immediately, not after a
+# queue wait.  TIME is walltime in [HH:]MM:SS.  MEM_PER_CPU is in MB.
 
-CPU_NTASKS=4
+CPU_NTASKS=7
 CPU_TIME=10:00
 CPU_MEM_PER_CPU=3000
 
-GPU_NTASKS=4
+GPU_NTASKS=7
 GPU_TIME=10:00
 GPU_MEM_PER_CPU=4000
 GPU_GRES=gpu:1
@@ -49,7 +52,7 @@ GPU_GRES=gpu:1
 # drift against a trusted baseline, not just CPU-vs-GPU disagreement within the
 # current branch.  Leave blank to skip the reference leg entirely (the default).
 REFERENCE_SETUP_SCRIPT=
-REFERENCE_NTASKS=4
+REFERENCE_NTASKS=7
 REFERENCE_TIME=10:00
 REFERENCE_MEM_PER_CPU=3000
 
