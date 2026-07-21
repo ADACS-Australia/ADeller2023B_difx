@@ -156,6 +156,13 @@ protected:
     GpuMemHelper<double> *gInterpolator;
     GpuMemHelper<float> *gFracSampleError;
     GpuMemHelper<double> *gLoFreqs;
+    /// Per-(FFT window, band) fringe-rotation phase slope (bigAval) and
+    /// reduced intercept (bigB_reduced), precomputed once per subint by
+    /// gpu_precompute_fringe_rotator so the per-sample rotation kernels do not
+    /// recompute the FP64 interpolator/bigA/bigB math in every thread. Layout
+    /// [window * numrecordedbands + band]; device-only. See gpu-plan.md.
+    GpuMemHelper<double> *gBigA;
+    GpuMemHelper<double> *gBigBred;
     GpuMemHelper<unsigned int> *indices;
     GpuMemHelper<double>* grecordedfreqclockoffsets;
     GpuMemHelper<double>* grecordedfreqclockoffsetsdelta;

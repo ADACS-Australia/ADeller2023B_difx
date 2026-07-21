@@ -15,12 +15,11 @@ Landed so far: Lever A (pinned input buffers, direct H2D, 2026-07-18);
 de-serialization Increment 1 (set_weights on the device, 2026-07-18);
 Increment 2 (baseline weights on the device, 2026-07-20); Increment 2b
 (autocorrelation weights on the device, dropping the last interim bulk
-`gDataWeights` D2H, 2026-07-21). Increments 1-2 cut the T5-T1 benchmark
-66.7 -> 32.4 s; 2b holds it flat (a cleanup, not a perf lever). The
-biggest remaining host cost was `host_accumulate`'s baseline-weight loop,
-now gone; the next perf work (see the work queue below) is the
-fringe-rotation interpolator hoisting, then overlapping the
-per-datastream H2D and host work with GPU compute.
+`gDataWeights` D2H, 2026-07-21); and the fringe-rotation interpolator
+hoisting (2026-07-21). Increments 1-2 cut the T5-T1 benchmark
+66.7 -> 32.4 s (2b held it flat); the fringe hoisting then took it to
+22.9 s (~29%). The next perf work (see the work queue below) is
+overlapping the per-datastream H2D and host work with GPU compute.
 
 ## Completed activities
 
@@ -37,37 +36,41 @@ per-datastream H2D and host work with GPU compute.
   interim bulk `gDataWeights` D2H (now only under the WDEBUG gate).
   Together: T5-T1 66.7 -> 32.4 s. (Prose detail in gpu-changes.md; the
   remaining gap-closing — compute/H2D overlap — is a future item below.)
+- **Fringe-rotation interpolator hoisting** (2026-07-21): the per-window
+  `a`/`b` and per-(window, band) `bigAval`/`bigB_reduced` are precomputed
+  once per subint (`gpu_precompute_fringe_rotator`) instead of being
+  recomputed in every (window, band, channel) thread of the rotation
+  kernels — the per-sample kernel now only forms the phase and applies the
+  rotator. A pure refactor of the same FP64 arithmetic (numerically
+  equivalent; the GPU final output is not bit-reproducible run-to-run
+  anyway, due to XMAC atomics). T5-T1 32.4 -> 22.9 s (~29%) — the
+  per-sample FP64 recompute was the dominant GeForce cost (FP64 at 1/32
+  rate). 8/8 device + fallback PASS, both pipeline modes. Design:
+  gpu-fringerotation-design.md. Follow-up (per-sample precision drop) is a
+  work-queue item below.
 
 ## Work queue (underway + future)
 
-1. **Fringe-rotation interpolator hoisting** (next perf gain). The
-   `gpu_fringeRotation` / `gpu_complex_fringeRotation` kernels launch one
-   thread per (FFT window, band, channel) and *every* thread recomputes,
-   from scratch, quantities that vary far more coarsely — so this FP64
-   work (`fringeRotation` is ~66% of GPU time on GeForce, ~25% on
-   data-centre cards) is repeated `numrecordedbands x fftchannels` times
-   more than necessary. Compute each quantity only as often as it varies:
-   - `d0`/`d1`/`d2` -> the per-window `a`/`b` can be batch-computed once
-     per subint (one `a`/`b` pair per FFT window; `d0`/`d1`/`d2` are
-     internal per-window intermediates of that single per-subint pass);
-   - `a`/`b`: once per FFT window (the CPU does exactly this — once per
-     `CPUMode::process` call, cpumode.cpp ~line 390);
-   - `bigAval`/`bigBval`/`bigB_reduced`: once per (window, band) — these
-     vary with `lofreqs[bandindex]`, so per band within a window, finer
-     than `a`/`b`.
-   The per-sample kernel then does only the final `exponent` +
-   `__sincosf` + complex multiply. Approach: precompute the per-window
-   `a`/`b` (and optionally per-(window,band) `bigA`/`bigB`) into device
-   arrays once per subint (a small kernel, or extend `calculatePre`) and
-   pass them into the rotation kernel. Must stay FP-parity with the CPU
-   (WDEBUG/SPECDEBUG, diffDiFX). Supersedes the old "reduce fringeRotation
-   FP64" note, and dovetails with the FP16 / kernel-fusion items below.
-2. **Compute/H2D overlap across datastreams.** Overlap datastream j+1's
+1. **Compute/H2D overlap across datastreams.** Overlap datastream j+1's
    input H2D and host-side work with datastream j's GPU compute, and
    overlap `host_accumulate`'s residual (autocorr flush, pcal) with the
    next subint. Machinery anticipated by Lever A: move input copies to a
    dedicated H2D stream and record `h2dInputDone` there (see note in
    `issuegpudata`); relax the per-pass `cudaStreamSynchronize`.
+2. **Fringe-rotation per-sample precision drop** (follow-up to the
+   completed hoisting; changes results at FP level, so its own accuracy
+   check). After the hoisting, the per-sample math is `exponent =
+   bigAval * (double)channelindex + bigB_reduced`, reduced to [0,1) before
+   the FP32 `__sincosf`. `bigB_reduced` is bounded to [0,1) so it can be a
+   `float`. The one quantity that genuinely needs `double` is
+   `bigAval * (double)channelindex` — `channelindex` reaches thousands at
+   high spectral resolution and `bigAval` can be large when the LO
+   frequency is high. So: compute `bigAval * (double)channelindex` in
+   double, reduce to [0,1), then add the `float` `bigB_reduced` and reduce
+   again — keeping the single necessary FP64 multiply while everything
+   else is float (the precompute can then emit `bigB_reduced` as float
+   too, halving the gBigBred traffic). Not bit-identical; validate with
+   diffDiFX/SPECDEBUG. Dovetails with the FP16 item below.
 3. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
@@ -147,7 +150,8 @@ will ease the eventual merge and put GPU code where it belongs:
   kernel reads them straight back. Fusing the two keeps samples in
   registers/shared memory and saves that global-memory round-trip
   (memory-bandwidth bound). Interacts with the FP16 path above and with
-  the per-window `a`/`b` hoisting (work-queue item 1).
+  the fringe-rotation hoisting (already landed) and its per-sample
+  precision-drop follow-up (work-queue item 2).
 - NUMA/affinity audit (mattered on the cluster, less on the desktop).
 - Profile the fftsPerChunk XMAC grid split if atomics show up.
 - GPU pcal regression coverage (currently untested by diffDiFX).

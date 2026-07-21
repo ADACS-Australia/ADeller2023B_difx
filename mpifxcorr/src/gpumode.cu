@@ -378,6 +378,10 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     grecordedfreqclockoffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
     grecordedfreqclockoffsetsdelta = new GpuMemHelper<double>(numrecordedbands, cuStream);
     grecordedfreqlooffsets = new GpuMemHelper<double>(numrecordedbands, cuStream);
+    // Per-(window, band) precomputed fringe-rotation coefficients (device-only;
+    // filled each subint by gpu_precompute_fringe_rotator).
+    gBigA = new GpuMemHelper<double>((size_t)cfg_numBufferedFFTs * numrecordedbands, cuStream, true);
+    gBigBred = new GpuMemHelper<double>((size_t)cfg_numBufferedFFTs * numrecordedbands, cuStream, true);
     // Copy the lofreq and freq clock offset values to the GPU
     for (auto i = 0; i < numrecordedbands; i++) {
         int localfreqindex = config->getDLocalRecordedFreqIndex(configindex, datastreamindex, i);
@@ -514,6 +518,8 @@ GPUMode::~GPUMode() {
     delete[] countsStatic;
     delete gInterpolator;
     delete gFracSampleError;
+    delete gBigA;
+    delete gBigBred;
 
     delete nearestSamples;
     delete counts_gpu;
@@ -614,6 +620,7 @@ size_t GPUMode::estimateDeviceBytes(Configuration *config, int configindex, int 
     bytes += nFFTs * (2 * sizeof(int) + sizeof(bool) + sizeof(float));              // gSampleIndexes+nearestSamples+gValidSamples+gFracSampleError
     bytes += 3 * sizeof(double);                                                    // gInterpolator
     bytes += (size_t)nbands * 4 * sizeof(double);                                   // gLoFreqs + 3 clock/lo offset arrays
+    bytes += 2 * (size_t)nFFTs * nbands * sizeof(double);                           // gBigA + gBigBred (precomputed fringe coeffs)
     bytes += (size_t)nfreqs * sizeof(int);                                          // counts_gpu
     bytes += maxframes * sizeof(bool);                                              // valid_frames
     bytes += (size_t)MAX_INDICIES * nfreqs * sizeof(unsigned int);                  // indices
@@ -1487,15 +1494,54 @@ void GPUMode::calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock,
     nearestSamples->copyToDevice();
 }
 
-__global__ void gpu_fringeRotation(
-        cuFloatComplex* const dest,
-        float **const src,
+// Fringe-rotation interpolator hoisting: precompute, once per subint, the
+// per-(FFT window, band) phase slope (bigAval) and reduced intercept
+// (bigB_reduced) that the rotation kernels used to recompute in every
+// (window, band, channel) thread. One thread per (window, band). This is a
+// pure hoist of the same FP64 arithmetic (same expressions, same order) out of
+// the per-sample inner loop, so the rotation is numerically equivalent
+// (identical modulo FMA-contraction between the two kernels; the GPU's final
+// visibilities are not bit-reproducible run-to-run anyway, due to downstream
+// XMAC atomics). fringeRotation is ~66% of GPU time on GeForce where FP64 runs
+// at 1/32 rate, so removing the per-sample recompute is a large win there.
+// bigA/bigBred layout: [window * numrecordedbands + band].
+__global__ void gpu_precompute_fringe_rotator(
         const double* const interpolator,
-        const int* const sampleIndexes,
-        const bool* const validSamples,
         const double* const lofreqs,
         const double* const recordedfreqlooffsets,
         double sampletime,
+        int fftloop,
+        int startblock,
+        size_t fftchannels,
+        int numrecordedbands,
+        double* const bigA,
+        double* const bigBred
+    ) {
+    const size_t subloopindex = blockIdx.x;   // FFT window within the subint
+    const size_t bandindex = threadIdx.x;     // launched with blockDim.x == numrecordedbands
+    const size_t index = fftloop * gridDim.x + subloopindex + startblock;
+
+    const double d0 = interpolator[0] * (double) index * (double) index + interpolator[1] * (double) index + interpolator[2];
+    const double d1 = interpolator[0] * ((double) index + 0.5) * ((double) index + 0.5) + interpolator[1] * ((double) index + 0.5) + interpolator[2];
+    const double d2 = interpolator[0] * ((double) index + 1) * ((double) index + 1) + interpolator[1] * ((double) index + 1) + interpolator[2];
+    const double a = d2 - d0;
+    const double b = d0 + (d1 - (a * 0.5 + d0)) / 3.0;
+
+    const double bigAval = a * lofreqs[bandindex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[bandindex];
+    const double bigBval = b * lofreqs[bandindex];
+    const double bigB_reduced = bigBval - int(bigBval);
+
+    bigA[subloopindex * numrecordedbands + bandindex] = bigAval;
+    bigBred[subloopindex * numrecordedbands + bandindex] = bigB_reduced;
+}
+
+__global__ void gpu_fringeRotation(
+        cuFloatComplex* const dest,
+        float **const src,
+        const int* const sampleIndexes,
+        const bool* const validSamples,
+        const double* const bigA,
+        const double* const bigBred,
         int fftloop,
         int startblock,
         int numblocks,
@@ -1542,41 +1588,12 @@ __global__ void gpu_fringeRotation(
     const size_t srcIndex = bandindex;
     const float srcVal = src[srcIndex][sampleIndexes[subloopindex] + channelindex];
 
-    /* The actual calculation that is going on for the linear case is as follows:
-
-     Calculate complexrotator[j]  (for j = 0 to fftchanels-1) as:
-
-     complexrotator[j] = exp( 2 pi i * (A*j + B) )
-
-     where:
-
-     A = a*lofreq/fftchannels - sampletime*1.0e-6*recordedfreqlooffsets[i]
-     B = b*lofreq + fraclofreq*integerdelay - recordedfreqlooffsets[i]*fracwalltime - fraclooffset*intwalltime
-
-     And a, b are computed outside the recordedfreq loop (variable i)
-    */
-
-    // Calculate littleA/B
-    double d0 = interpolator[0] * (double) index * (double) index + interpolator[1] * (double) index + interpolator[2];
-    double d1 = interpolator[0] * ((double) index + 0.5) * ((double) index + 0.5) + interpolator[1] * ((double) index + 0.5) + interpolator[2];
-    double d2 = interpolator[0] * ((double) index + 1) * ((double) index + 1) + interpolator[1] * ((double) index + 1) + interpolator[2];
-
-    double a = d2 - d0;
-    double b = d0 + (d1 - (a * 0.5 + d0)) / 3.0;
-
-    // Calculate BigA/B
-//    double bigAval = a * lofreqs[numrecordedfreq] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[numrecordedfreq];
-//    double bigBval = b * lofreqs[numrecordedfreq];
-
-//    double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
-//    double bigBval = b * lofreqs[0];
-
-    double bigAval = a * lofreqs[bandindex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[bandindex];
-    double bigBval = b * lofreqs[bandindex];
-
-
-    // Calculate
-    double bigB_reduced = bigBval - int(bigBval);
+    /* complexrotator[j] = exp( 2 pi i * (A*j + B) ), where A/B (bigAval and
+       bigB_reduced) are precomputed per (window, band) by
+       gpu_precompute_fringe_rotator - so this per-sample kernel only forms the
+       phase and applies the rotator. */
+    const double bigAval = bigA[subloopindex * numrecordedbands + bandindex];
+    const double bigB_reduced = bigBred[subloopindex * numrecordedbands + bandindex];
     double exponent = (bigAval * (double) channelindex + bigB_reduced);
     exponent -= int(exponent);
     cuFloatComplex cr;
@@ -1598,12 +1615,10 @@ __global__ void gpu_fringeRotation(
 __global__ void gpu_complex_fringeRotation(
         cuFloatComplex* const dest,
         cuFloatComplex **const src,
-        const double* const interpolator,
         const int* const sampleIndexes,
         const bool* const validSamples,
-        const double* const lofreqs,
-        const double* const recordedfreqlooffsets,
-        double sampletime,
+        const double* const bigA,
+        const double* const bigBred,
         int fftloop,
         int startblock,
         int numblocks,
@@ -1650,41 +1665,12 @@ __global__ void gpu_complex_fringeRotation(
     const size_t srcIndex = bandindex;
     const cuFloatComplex srcVal = src[srcIndex][sampleIndexes[subloopindex] + channelindex];
 
-    /* The actual calculation that is going on for the linear case is as follows:
-
-     Calculate complexrotator[j]  (for j = 0 to fftchanels-1) as:
-
-     complexrotator[j] = exp( 2 pi i * (A*j + B) )
-
-     where:
-
-     A = a*lofreq/fftchannels - sampletime*1.0e-6*recordedfreqlooffsets[i]
-     B = b*lofreq + fraclofreq*integerdelay - recordedfreqlooffsets[i]*fracwalltime - fraclooffset*intwalltime
-
-     And a, b are computed outside the recordedfreq loop (variable i)
-    */
-
-    // Calculate littleA/B
-    double d0 = interpolator[0] * (double) index * (double) index + interpolator[1] * (double) index + interpolator[2];
-    double d1 = interpolator[0] * ((double) index + 0.5) * ((double) index + 0.5) + interpolator[1] * ((double) index + 0.5) + interpolator[2];
-    double d2 = interpolator[0] * ((double) index + 1) * ((double) index + 1) + interpolator[1] * ((double) index + 1) + interpolator[2];
-
-    double a = d2 - d0;
-    double b = d0 + (d1 - (a * 0.5 + d0)) / 3.0;
-
-    // Calculate BigA/B
-//    double bigAval = a * lofreqs[numrecordedfreq] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[numrecordedfreq];
-//    double bigBval = b * lofreqs[numrecordedfreq];
-
-//    double bigAval = a * lofreqs[0] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[0];
-//    double bigBval = b * lofreqs[0];
-
-    double bigAval = a * lofreqs[bandindex] / (double) fftchannels - sampletime * 1.e-6 * recordedfreqlooffsets[bandindex];
-    double bigBval = b * lofreqs[bandindex];
-
-
-    // Calculate
-    double bigB_reduced = bigBval - int(bigBval);
+    /* complexrotator[j] = exp( 2 pi i * (A*j + B) ), where A/B (bigAval and
+       bigB_reduced) are precomputed per (window, band) by
+       gpu_precompute_fringe_rotator - so this per-sample kernel only forms the
+       phase and applies the rotator. */
+    const double bigAval = bigA[subloopindex * numrecordedbands + bandindex];
+    const double bigB_reduced = bigBred[subloopindex * numrecordedbands + bandindex];
     double exponent = (bigAval * (double) channelindex + bigB_reduced);
     exponent -= int(exponent);
     cuFloatComplex cr;
@@ -1942,8 +1928,27 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
             fftchannels_grid++;
         }
     }
-    //  For LSB data, gLoFreqs needs to have already been corrected for the fact that we will convert to 
+    //  For LSB data, gLoFreqs needs to have already been corrected for the fact that we will convert to
     // USB in unpacking. This means than loFreq = loFreq - bandwidth.
+
+    // Precompute the per-(window, band) fringe-rotation coefficients once for
+    // this subint (one thread per window/band), so the per-sample rotation
+    // kernel below no longer recomputes the FP64 interpolator/bigA/bigB math in
+    // every (window, band, channel) thread. Enqueued on cuStream ahead of the
+    // rotation kernel, so it is complete before the rotation reads gBigA/gBigBred.
+    gpu_precompute_fringe_rotator<<<numBufferedFFTs, numrecordedbands, 0, cuStream>>>(
+            gInterpolator->gpuPtr(),
+            gLoFreqs->gpuPtr(),
+            grecordedfreqlooffsets->gpuPtr(),
+            sampletime,
+            fftloop,
+            startblock,
+            fftchannels,
+            numrecordedbands,
+            gBigA->gpuPtr(),
+            gBigBred->gpuPtr()
+    );
+
     if (usecomplex) {
         gpu_complex_fringeRotation<<<
             dim3(numBufferedFFTs, fftchannels_grid),
@@ -1953,12 +1958,10 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
             (
                     complex_fringe_rotated_gpu->gpuPtr(),
                     complex_unpackedarrays_gpu->gpuPtr(),
-                    gInterpolator->gpuPtr(),
                     gSampleIndexes->gpuPtr(),
                     gValidSamples->gpuPtr(),
-                    gLoFreqs->gpuPtr(),
-                    grecordedfreqlooffsets->gpuPtr(),
-                    sampletime,
+                    gBigA->gpuPtr(),
+                    gBigBred->gpuPtr(),
                     fftloop,
                     startblock,
                     numblocks,
@@ -1973,12 +1976,10 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
             (
                     complex_fringe_rotated_gpu->gpuPtr(),
                     unpackedarrays_gpu->gpuPtr(),
-                    gInterpolator->gpuPtr(),
                     gSampleIndexes->gpuPtr(),
                     gValidSamples->gpuPtr(),
-                    gLoFreqs->gpuPtr(),
-                    grecordedfreqlooffsets->gpuPtr(),
-                    sampletime,
+                    gBigA->gpuPtr(),
+                    gBigBred->gpuPtr(),
                     fftloop,
                     startblock,
                     numblocks,

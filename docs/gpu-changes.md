@@ -172,6 +172,27 @@ Core thread alternates host work and GPU work. Groundwork and levers:
   at 32.4 s (a cleanup/D2H-removal, not a perf lever — the win was
   Increment 2). Design/audit trail: docs/gpu-deserialization-design.md.
 
+- **Fringe-rotation interpolator hoisting** (2026-07-21): the
+  `gpu_fringeRotation` / `gpu_complex_fringeRotation` kernels launched one
+  thread per (FFT window, band, channel) and recomputed the FP64
+  interpolator math — `d0`/`d1`/`d2` -> `a`/`b` (per window) and
+  `bigAval`/`bigB_reduced` (per (window, band)) — in *every* thread, i.e.
+  `numrecordedbands x fftchannels` times more than needed. A new
+  `gpu_precompute_fringe_rotator` kernel (one thread per (window, band))
+  computes `bigAval`/`bigB_reduced` once per subint into device arrays
+  (`gBigA`/`gBigBred`); the per-sample kernels now only read those two
+  values and form `exponent = bigAval*channel + bigB_reduced` -> FP32
+  `__sincosf` -> complex multiply. Same FP64 expressions, just hoisted out
+  of the inner loop, so it is numerically equivalent (the GPU final output
+  is not bit-reproducible run-to-run regardless, because the XMAC
+  accumulates with `atomicAdd`). This matters because `fringeRotation` was
+  ~66% of GPU time on GeForce, where FP64 runs at 1/32 of FP32.
+  Verified: 8/8 Synthetic PASS device + `DIFX_GPU_WEIGHTS_HOST` fallback,
+  both pipeline modes; benchmark **T5-T1 32.4 -> 22.9 s (~29%)** — the
+  largest single-change win since Increment 1. A per-sample precision drop
+  (keep only `bigAval*(double)channel` in FP64, `bigB_reduced` as float)
+  is a queued follow-up. Design: docs/gpu-fringerotation-design.md.
+
 ## 6. Multi-station, multi-subband correctness coverage
 
 Until 2026-07-18 every correctness scenario was 2 stations with a single
