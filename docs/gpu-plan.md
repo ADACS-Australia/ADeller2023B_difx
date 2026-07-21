@@ -18,8 +18,27 @@ Increment 2 (baseline weights on the device, 2026-07-20); Increment 2b
 `gDataWeights` D2H, 2026-07-21); and the fringe-rotation interpolator
 hoisting (2026-07-21). Increments 1-2 cut the T5-T1 benchmark
 66.7 -> 32.4 s (2b held it flat); the fringe hoisting then took it to
-22.9 s (~29%). The next perf work (see the work queue below) is
-overlapping the per-datastream H2D and host work with GPU compute.
+22.9 s (~29%).
+
+Fresh NVTX profiles (2026-07-21, RTX 2070 benchprof + tooarrana `multi`)
+reframed the next step. Scoped to the correlation, the GPU is ~55-58%
+busy / ~42-45% idle on both platforms. A per-kernel gap analysis then
+**ruled CUDA graphs out** (recheck only if the clean profile below
+contradicts it): launch overhead is just 3-4% of host CUDA-API time, and
+~97% of the GPU idle is in big (>100us) gaps where the GPU waits on host
+work / data delivery - not the small inter-kernel gaps graphs remove. So
+the idle is **host / data-delivery bound** (the per-subint host tail plus
+the procslot data-delivery pipeline), amplified on the desktop by
+12-ranks-on-8-cores oversubscription and on the cluster `multi` job by
+VDIF disk I/O - a separate, larger investigation, deferred until a clean
+GPU-bound cluster profile (fake data, one rank per core, ~400 subints)
+isolates the real gap. Input H2D is <1% of wall on both, so the
+transfer-overlap idea (old work-queue item 1) is demoted to longer-term.
+Meanwhile the live GPU-side levers cut GPU-busy time: fuse unpack+fringe
+(work-queue item 1; unpack is the largest kernel on the cluster at 34.9%)
+and reduced precision (FP16 / precision-drop, items 2-3; fringe FP64 is
+24% of GPU time on the 2070 but only 12% on the fast-FP64 cluster card,
+so precision work leans desktop).
 
 ## Completed activities
 
@@ -51,15 +70,30 @@ overlapping the per-datastream H2D and host work with GPU compute.
 
 ## Work queue (underway + future)
 
-1. **Compute/H2D overlap across datastreams.** Overlap datastream j+1's
-   input H2D and host-side work with datastream j's GPU compute, and
-   overlap `host_accumulate`'s residual (autocorr flush, pcal) with the
-   next subint. Machinery anticipated by Lever A: move input copies to a
-   dedicated H2D stream and record `h2dInputDone` there (see note in
-   `issuegpudata`); relax the per-pass `cudaStreamSynchronize`.
-2. **Fringe-rotation per-sample precision drop** (follow-up to the
+1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
+   writes the unpacked samples to global memory and the fringe-rotation
+   kernel reads them straight back; fusing keeps samples in
+   registers/shared memory and saves that global-memory round-trip.
+   Motivated by the 2026-07-21 profiles: `gpu_unpack` is the single
+   largest kernel on the cluster (34.9% of GPU time vs 19.9% on the 2070)
+   now that fringe rotation is cheap on fast-FP64 cards, so the memory
+   round-trip between them is the thing to cut. Fusing also removes two
+   kernel launches per (datastream, subint) - a minor secondary benefit
+   (launch overhead is only ~3-4% of host time; see "Where we are").
+   Interacts with the FP16 and precision-drop items below.
+2. **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
+   FFT): an opt-in reduced-precision path that carries the unpacked
+   samples and the fringe rotation in FP16, with the FFT taking FP16 in
+   and producing FP32 output. Roughly halves the memory traffic for those
+   stages (and the compute on cards with fast FP16). Needs an accuracy
+   assessment against the correlator's dynamic range; gated so the
+   full-precision path stays the default. Combines naturally with the
+   kernel fusion (item 1), and subsumes the per-sample precision drop
+   (item 3) - if FP16 lands, item 3 is moot.
+3. **Fringe-rotation per-sample precision drop** (follow-up to the
    completed hoisting; changes results at FP level, so its own accuracy
-   check). After the hoisting, the per-sample math is `exponent =
+   check; a cheaper stepping-stone that the FP16 item above would
+   subsume). After the hoisting, the per-sample math is `exponent =
    bigAval * (double)channelindex + bigB_reduced`, reduced to [0,1) before
    the FP32 `__sincosf`. `bigB_reduced` is bounded to [0,1) so it can be a
    `float`. The one quantity that genuinely needs `double` is
@@ -70,18 +104,27 @@ overlapping the per-datastream H2D and host work with GPU compute.
    again — keeping the single necessary FP64 multiply while everything
    else is float (the precompute can then emit `bigB_reduced` as float
    too, halving the gBigBred traffic). Not bit-identical; validate with
-   diffDiFX/SPECDEBUG. Dovetails with the FP16 item below.
-3. **perbandweights on GPU** — currently unused on the GPU path but
+   diffDiFX/SPECDEBUG.
+4. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
    the device weights kernel (de-serialization Increment 1) so
    per-(window, band) weights are a natural extension.
-4. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
-5. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
+5. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
+6. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
    `blanker_vdif_gpu`) + widen the `getMode` format gate. MUST add the
    `datalengthbytes <= getMaxDataBytes` clamp in `process_gpu` first:
    non-VDIF datastreams keep the base class's guard-scaled sendbytes,
    which can exceed the packed-data buffer (latent, unreachable today).
+7. **Kernel launch-configuration / occupancy audit.** Verify every GPU
+   kernel launches an appropriate grid/block size - enough threads to
+   fill the device, a block shape with good occupancy, and no accidental
+   under- or over-subscription. Several kernels were written with ad-hoc
+   launch dims (one thread per (window, band, channel) in fringe rotation;
+   one thread per accumulator in the weight reductions; single-thread
+   reductions like `gpu_sum_weights`); check each with nsys/`ncu` and fix
+   any that are badly sized. Cheap, and a natural companion to the
+   fusion/occupancy work in items 1-3.
 
 ## Standing process (adopted 2026-07-18)
 
@@ -138,20 +181,18 @@ will ease the eventual merge and put GPU code where it belongs:
   complex GEMM at heart, a natural tensor-core target (Turing: FP16
   multiply / FP32 accumulate; data-centre cards add TF32/FP64 paths).
   Needs an accuracy assessment against the correlator's dynamic range.
-- **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
-  FFT): an opt-in reduced-precision path that carries the unpacked
-  samples and the fringe rotation in FP16, with the FFT taking FP16 in
-  and producing FP32 output. Roughly halves the memory traffic for those
-  stages (and the compute on cards with fast FP16). Needs an accuracy
-  assessment against the correlator's dynamic range; gated so the
-  full-precision path stays the default.
-- **Fuse the unpack and fringe-rotation kernels**: today `gpu_unpack`
-  writes the unpacked samples to global memory and the fringe-rotation
-  kernel reads them straight back. Fusing the two keeps samples in
-  registers/shared memory and saves that global-memory round-trip
-  (memory-bandwidth bound). Interacts with the FP16 path above and with
-  the fringe-rotation hoisting (already landed) and its per-sample
-  precision-drop follow-up (work-queue item 2).
+- **Compute/H2D overlap across datastreams (the "Option A / Option B"
+  ideas)**: overlap the input H2D with GPU compute - Option A intra-subint
+  (datastream j+1's H2D during datastream j's compute), Option B
+  inter-subint (prefetch the next subint's packed data during the current
+  subint's FFT+frac, holding two procslots). Demoted here from the work
+  queue on 2026-07-21: the post-fringe profiles show input H2D
+  (`h2d_stage`) is only ~0.6% of wall on the 2070 and ~0.9% on the
+  cluster, so overlapping it is worth <1% either way. If it ever becomes
+  worthwhile, the machinery is seeded (Lever A's `h2dInputDone`, a
+  dedicated H2D stream), and Option A is far simpler than Option B (the
+  per-datastream buffers are already separate, so it needs only a
+  dedicated H2D stream, no double-buffering).
 - NUMA/affinity audit (mattered on the cluster, less on the desktop).
 - Profile the fftsPerChunk XMAC grid split if atomics show up.
 - GPU pcal regression coverage (currently untested by diffDiFX).
