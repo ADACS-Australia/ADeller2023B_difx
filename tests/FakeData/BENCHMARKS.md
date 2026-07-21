@@ -31,6 +31,31 @@ Rules:
 | 2026-07-21 | 7b8e31104 | gpu | 12.8 | 35.6 | 22.8 | host-tail overlap (intra-subint half-split); flat on the 2070 |
 | 2026-07-21 | 7b8e31104 | gpu DIFX_GPU_PIPELINE=0 | 12.7 | 35.3 | 22.6 | synchronous, no overlap; ≈ pipeline=1 ⇒ no idle to hide on the 2070 (GPU-compute-bound). The overlap targets the ~48% idle measured on the A100, so the win is expected on the cluster re-profile, not here. |
 
+## A100 cluster profiling (benchprof-profile.sbatch, 400 subints, 10 stations)
+
+Clean GPU-bound profile: A100-SXM4-80GB, one rank/core `--exclusive`,
+fake data, Core rank wrapped with nsys (`.nsys-rep` + sqlite kept under
+the run dir). "GPU span" = first-kernel to last-kernel; "busy (kernels)"
+= sum of kernel durations (single compute stream, so serial); "busy
+(+copy)" additionally counts the H2D/D2H copies that share the compute
+stream. This is a diagnostic ledger (idle %), not the T5-T1 metric.
+
+| date | commit | GPU span (ms) | busy kernels (ms) | idle kernels | busy +copy | idle +copy | notes |
+|---|---|---|---|---|---|---|---|
+| 2026-07-21 | pre-overlap (80f6e291a) | 10497 | 5471 | 47.9% | — | — | reference (tooarrana clean profile, per gpu-plan notes) |
+| 2026-07-21 | 7b8e31104 | 8798 | 5088 | 42.2% | 5695 | 35.3% | host-tail overlap; idle did NOT collapse |
+
+The overlap shortened the GPU span ~16% (10.5 -> 8.8 s) and trimmed idle
+~48% -> ~42% (kernels-only), but did **not** collapse the between-subints
+gap. Root cause of the residual idle (2657 ms, 85.6% of it in >500 us
+gaps): the process thread issues ~10 `cudaStreamSynchronize` per subint
+(5.58 s total) - one per station, matching cuFFT's per-`cufftExecC2C`
+driver footprint (`cuStreamIsCapturing`/`cuLaunchKernel`/`cudaStream-
+Synchronize` all ~3948). cuFFT is synchronising the compute stream on
+every FFT exec, serialising host and GPU at station granularity. The
+host tail the overlap moved (~900 us/subint) was never the bottleneck.
+See gpu-plan.md work queue.
+
 ## Pre-protocol reference points (15 s of data, tInt 2 s, whole-run wall)
 
 Measured 2026-07-18 during Lever A work; not comparable to the ledger

@@ -278,5 +278,23 @@ Correctness subtleties handled:
 Verified CPU-vs-GPU via run-local.sh on an RTX 2070: usb, usb-complex,
 complex-complex, multi all PASS in both `DIFX_GPU_PIPELINE` modes, plus
 usb/complex-complex/multi on the `DIFX_GPU_WEIGHTS_HOST` fallback.
-Benchmark (T5-T1 on the desktop, idle-collapse on the A100 re-profile):
-pending.
+
+**Benchmark (measured 2026-07-21).** Desktop T5-T1 flat (22.8 s
+pipeline=1 vs 22.6 s pipeline=0 vs 22.9 s baseline) - the 2070 is
+GPU-compute-bound so there is no idle to hide. The A100 re-profile
+(benchprof-profile.sbatch, 400 subints, `.nsys-rep` under
+`tests/FakeData/cluster/benchprof-21072026-after-processgpusplit/`) shows
+the overlap **did not** collapse the between-subints idle: GPU span
+10497 -> 8798 ms (~16% shorter), idle ~48% -> ~42% (kernels-only) /
+~35% (counting compute-stream copies) - a modest gain, not the hoped-for
+collapse. Root cause of the residual idle: the process thread blocks in
+~10 `cudaStreamSynchronize`/subint (5.58 s total, one per station),
+matching cuFFT's per-`cufftExecC2C` driver footprint - **cuFFT is
+synchronising the compute stream on every FFT exec** (see runFFT ->
+`cufftExecC2C`, plan built with default auto work-area allocation in the
+GPUMode constructor). This serialises host and GPU at station granularity
+and dwarfs the ~900 us/subint host tail the overlap actually moved, which
+is why wall time barely changed. The overlap is still correct and a small
+net win; the next lever is eliminating the per-station FFT sync (new top
+work-queue item), not fusing kernels. Full analysis: BENCHMARKS.md
+(A100 cluster profiling) and gpu-plan.md.

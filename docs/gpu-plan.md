@@ -32,14 +32,27 @@ of idle. The idle is **host-bound** - 70% is a between-subints host tail,
 20% intra-subint host waits. Input H2D is <5% of wall, so the
 transfer-overlap idea is demoted to longer-term.
 
-**Landed 2026-07-21: host-tail overlap** (see Completed) attacks that
-idle directly by splitting each subint's GPU work at the FFT and running
-the next subint's input half while the current subint's host tail runs.
-The remaining GPU-side levers cut GPU-busy time: fuse unpack+fringe
-(work-queue item 1) and reduced precision (FP16 / precision-drop). On the
-A100 the fringe-rotation family is ~46% of GPU time (post-FFT fractional
-rotation 30% + pre-FFT fringe rotation 15%) and unpack 24%; FP64 is cheap
-there, so the precision work leans desktop (2070).
+**Landed 2026-07-21: host-tail overlap** (see Completed) split each
+subint's GPU work at the FFT to run the next subint's input half during
+the current subint's host tail. **The A100 re-profile (2026-07-21) then
+overturned the diagnosis that motivated it.** The overlap shortened the
+GPU span ~16% (10.5 -> 8.8 s) and trimmed idle ~48% -> ~42%
+(kernels-only), but did not collapse the between-subints gap. The real
+cost was never the ~900 us/subint host tail (finishWeights/autocorr/pcal)
+the overlap moved: the process thread blocks in ~10
+`cudaStreamSynchronize`/subint (5.58 s total, one per station), and the
+count matches cuFFT's per-`cufftExecC2C` driver footprint
+(`cuStreamIsCapturing`/`cuLaunchKernel`/`cudaStreamSynchronize` all
+~3948 = 10 stations x 400 subints). **cuFFT is synchronising the compute
+stream on every FFT exec**, serialising host and GPU at station
+granularity - the first sync of each subint's tofft loop backs up behind
+the whole XMAC phase (~7 ms), the other nine wait one station each
+(~720 us). Killing that sync is now the top work-queue item, ahead of
+kernel fusion: fusion attacks the ~14 ms/subint GPU-busy half and cannot
+touch the ~8 ms/subint idle, whereas the FFT sync IS most of the idle.
+Kernel mix unchanged (A100): fringe family ~45% (fractional rotation 30%
++ fringe rotation 15%), unpack 24%, fused XMAC 16%, FFT 8%, weights ~7%;
+FP64 cheap there, so precision work still leans desktop (2070).
 
 ## Completed activities
 
@@ -87,9 +100,38 @@ there, so the precision work leans desktop (2070).
   mirrors. Per-slot `validsubint` drives the invalid-subint skip;
   `DIFX_GPU_WEIGHTS_HOST` fallback is forced synchronous. PASS CPU-vs-GPU
   (usb, usb-complex, complex-complex, multi) in both pipeline modes +
-  fallback. Design: gpu-tailoverlap-design.md. (Benchmark: pending.)
+  fallback. Design: gpu-tailoverlap-design.md. **Benchmark (2026-07-21):
+  desktop T5-T1 flat (2070 is compute-bound); A100 re-profile did NOT
+  collapse the idle** (GPU span 10.5 -> 8.8 s, idle ~48% -> ~42%
+  kernels-only). The residual idle turned out to be a per-station cuFFT
+  synchronisation (below), not the host tail the overlap moved - so the
+  overlap is a small net win but the between-subints gap is still there.
+  Analysis: BENCHMARKS.md (A100 cluster profiling), gpu-changes.md.
 
 ## Work queue (underway + future)
+
+0. **Eliminate the per-station cuFFT stream synchronisation (NEW TOP
+   PRIORITY, 2026-07-21).** The A100 re-profile showed the process thread
+   blocks in ~10 `cudaStreamSynchronize`/subint (5.58 s total over the
+   400-subint run) - the single largest source of GPU idle, dwarfing the
+   host tail. The count (and the matched `cuStreamIsCapturing` /
+   `cuLaunchKernel` counts) pins it on cuFFT: `runFFT()` ->
+   `cufftExecC2C()` appears to synchronise the compute stream on every
+   call, one per (station, subint), serialising host and GPU exactly where
+   the tail-overlap pipeline is trying to keep them concurrent. **First
+   confirm the mechanism** (nsys `--cudabacktrace=sync` or ncu, or a quick
+   bisect: comment the FFT and watch the syncs vanish), then remove it.
+   Candidate fixes, cheapest first: (a) give each plan its own explicit
+   work area - `cufftSetAutoAllocation(fft_plan, false)` +
+   `cufftSetWorkArea` with a per-Mode buffer allocated once in the
+   constructor (the plans are built with default auto-allocation today at
+   gpumode.cu ~451, and a shared/managed cuFFT work area is a known cause
+   of per-exec syncs); (b) batch the 10 per-station FFTs into fewer plans /
+   a single larger `cufftPlanMany` so there are fewer plan switches; (c) if
+   cuFFT insists on syncing, replace it with a hand-rolled or cuFFTDx FFT
+   on the stream. This attacks the idle directly and is the prerequisite
+   for the tail-overlap pipeline to actually pay off. Verify with the
+   Synthetic CPU-vs-GPU suite and re-run benchprof-profile.sbatch.
 
 1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
    writes the unpacked samples to global memory and the fringe-rotation
