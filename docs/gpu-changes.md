@@ -352,5 +352,45 @@ oversubscribed, so the removed host-serialisation has no idle to convert);
 the A100 wall win (the 5.58 s of idle) is to be confirmed on the cluster.
 Files: `gpumode_kernels.cuh` (GpuMemHelper host ring), `gpumode.cu`/`.cuh`
 (procSlot + ring setup + gInterpolator staging), `gpucore.cu` (setProcSlot
-in issue_tofft), `mk5mode_gpu.cu` (gate the drain). Full analysis:
-gpu-plan.md work-queue item 0.
+in issue_tofft), `mk5mode_gpu.cu` (gate the drain).
+
+Same day, a follow-up refactor (`8cb18851b`) folded GPUCore's six parallel
+`std::vector<...>(RECEIVE_RING_LENGTH)` members (results_gpu, results_host,
+d2hDone, h2dInputDone, evComputeDone, validsubint) into a single
+`struct gpuprocslot` + `std::vector<gpuprocslot> gpuprocslots` (access
+`gpuprocslots[index].<field>`), complementing Core::procslots. Pure cleanup,
+no behaviour change, PASS both pipeline modes.
+
+## 10. The real bottleneck: DataStream interlaced-VDIF corner-turn (2026-07-22)
+
+Whole-pipeline profiling (Manager + DataStream + Core, not just the Core)
+overturned the framing of sections 8-9: the Core-side de-serialization was
+all correct, but it was **not** the bottleneck. The A100 after-fix reprofile
+confirmed the unpack-drain fix held (no `cudaStreamSynchronize` storm) yet the
+GPU was still ~42% idle, with the Core's compute thread blocked ~8 s on the
+procslot mutex *waiting for input data*.
+
+Profiling the other ranks found why: the **Manager is pure wait** (epoll/poll),
+and the **DataStream spends ~93% of its busy CPU in `cornerturn_16thread_2bit`
++ memcpy** — `VDIFMuxer::multiplex` demultiplexing 16 interlaced VDIF threads
+into one — at only **~1.7 Gbps/core**, at/below the 2 Gbps/station record rate.
+So the GPU is simply faster than the DataStream can feed it (a 2-station job:
+GPU 8 s vs CPU 35 s). MPI transport is not the limit: `process_vm_readv` is
+0.45 s at 2 stations (the 13.6 s seen at 10 stations was desktop
+oversubscription), and forcing CMA/vader/TCP transports changed nothing.
+
+Proven by switching the fake data to **single-thread VDIF** (no interlacing →
+no corner-turn): a 2-station uncontended GPU job dropped **8.0 s → 4.8 s
+(~40%)** with identical output. That required a mark5access fix — VDIF had no
+`genheaders`, so `Mk5DataStream::fakeToMemory` never framed single-thread fake
+VDIF (all frames invalid, 0-byte output). `mark5_format_vdif_genheaders`
+(`191528ff9`, `libraries/mark5access/mark5access/format_vdif.c`) writes valid
+headers (invalid bit clear, monotonic time). For fake-data benchmarking,
+rewrite the `.input` after vex2difx with
+`sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|'`
+(keep DATA FRAME SIZE) — now wired into `benchprof-profile.sbatch`.
+
+The production fix (real interlaced recordings can't just be relabelled) is a
+longer-term goal: an unpacker that reorders the per-thread frames into time
+order (pure memcpy) + GPU channel de-interleave, instead of the CPU bit-banging
+multiplex. See gpu-plan.md (Longer-term).

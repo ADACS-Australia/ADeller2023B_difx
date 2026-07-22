@@ -6,140 +6,33 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 
 ## Where we are
 
-Correctness is done for the USB scenarios (usb, usb-complex,
+Correctness is **done** for the USB scenarios (usb, usb-complex,
 complex-complex, and the 5-station/4-subband `multi` scenario PASS
 CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes; LSB deliberately
-unimplemented). The current phase is **performance**: the GPU is
-gap-dominated because one Core thread alternates host and GPU work.
-Landed so far: Lever A (pinned input buffers, direct H2D, 2026-07-18);
-de-serialization Increment 1 (set_weights on the device, 2026-07-18);
-Increment 2 (baseline weights on the device, 2026-07-20); Increment 2b
-(autocorrelation weights on the device, dropping the last interim bulk
-`gDataWeights` D2H, 2026-07-21); and the fringe-rotation interpolator
-hoisting (2026-07-21). Increments 1-2 cut the T5-T1 benchmark
-66.7 -> 32.4 s (2b held it flat); the fringe hoisting then took it to
-22.9 s (~29%).
+unimplemented). The **performance** phase has landed a series of Core-side
+de-serializations — Lever A (pinned input), weights-on-device Increments
+1/2/2b, fringe-rotation interpolator hoisting, host-tail overlap, the
+`Mk5_GPUMode::unpack_all` drain removal + RING-deep host staging, and the
+`gpuprocslot` refactor — taking the T5-T1 benchmark 66.7 → ~22.9 s. Full
+history, rationale and the (now-corrected) cuFFT-sync misdiagnosis are in
+`gpu-changes.md` (§5-10); numbers in `BENCHMARKS.md`.
 
-Fresh NVTX profiles (2026-07-21, RTX 2070 benchprof + tooarrana `multi`)
-reframed the next step, and the clean GPU-bound cluster profile then
-settled it. On an A100 (one rank/core, `--exclusive`, fake data, 400
-subints) the GPU is **~48% idle** - the idle is REAL, not an
-oversubscription/IO artifact, and slightly worse than the polluted
-profiles because the A100's faster kernels make the fixed host tail a
-larger fraction. A per-kernel gap analysis **ruled CUDA graphs out**:
-90% of the idle is in >500us gaps and sub-20us launch gaps are only 8.4%
-of idle. The idle is **host-bound** - 70% is a between-subints host tail,
-20% intra-subint host waits. Input H2D is <5% of wall, so the
-transfer-overlap idea is demoted to longer-term.
+**Current understanding (2026-07-22): the GPU path is no longer the
+bottleneck — the DataStream interlaced-VDIF corner-turn is.** Whole-pipeline
+profiling (Manager + DataStream + Core) showed the GPU is faster than the
+DataStream can feed it: the DataStream burns ~93% of its busy CPU
+multiplexing 16 interlaced VDIF threads into one (`VDIFMuxer`,
+`cornerturn_16thread_2bit`) at ~1.7 Gbps/core — at/below the record rate — so
+the GPU then idles ~42% on the procslot mutex. The Core-side work above was
+correct de-serialization but aimed at a non-bottleneck. Removing the
+corner-turn (single-thread VDIF) cut a 2-station job 8.0 → 4.8 s (~40%). See
+gpu-changes.md §10 and the Longer-term item below. Kernel mix (A100): fringe
+family ~45%, unpack 24%, fused XMAC 16%, FFT 8%, weights ~7% (FP64 cheap
+there, so precision work leans on the 2070).
 
-**Landed 2026-07-21: host-tail overlap** (see Completed) split each
-subint's GPU work at the FFT to run the next subint's input half during
-the current subint's host tail. **The A100 re-profile (2026-07-21) then
-overturned the diagnosis that motivated it.** The overlap shortened the
-GPU span ~16% (10.5 -> 8.8 s) and trimmed idle ~48% -> ~42%
-(kernels-only), but did not collapse the between-subints gap. The real
-cost was never the ~900 us/subint host tail (finishWeights/autocorr/pcal)
-the overlap moved: the process thread blocks in ~10
-`cudaStreamSynchronize`/subint (5.58 s total, one per station), and the
-count matches cuFFT's per-`cufftExecC2C` driver footprint
-(`cuStreamIsCapturing`/`cuLaunchKernel`/`cudaStreamSynchronize` all
-~3948 = 10 stations x 400 subints). **cuFFT is synchronising the compute
-stream on every FFT exec**, serialising host and GPU at station
-granularity - the first sync of each subint's tofft loop backs up behind
-the whole XMAC phase (~7 ms), the other nine wait one station each
-(~720 us). Killing that sync is now the top work-queue item, ahead of
-kernel fusion: fusion attacks the ~14 ms/subint GPU-busy half and cannot
-touch the ~8 ms/subint idle, whereas the FFT sync IS most of the idle.
-Kernel mix unchanged (A100): fringe family ~45% (fractional rotation 30%
-+ fringe rotation 15%), unpack 24%, fused XMAC 16%, FFT 8%, weights ~7%;
-FP64 cheap there, so precision work still leans desktop (2070).
-
-## Completed activities
-
-- **Multi-subband, N>2-station Synthetic scenario** (2026-07-18): the
-  `multi` scenario — 5 stations x 4 subbands (test-multi.vex/v2d,
-  4-channel VDIF from generateVDIF) — PASSes CPU-vs-GPU in both pipeline
-  modes and is wired into run-local.sh and run-slurm.sh (rank counts now
-  sized per scenario).
-- **De-serialize the per-datastream loop — weights arc**: Increment 1
-  (set_weights on the device, 2026-07-18) removed the per-datastream
-  stream drains; Increment 2 (baseline weights on the device,
-  2026-07-20) removed `host_accumulate`'s dominant per-window loop;
-  Increment 2b (AC weights on the device, 2026-07-21) dropped the last
-  interim bulk `gDataWeights` D2H (now only under the WDEBUG gate).
-  Together: T5-T1 66.7 -> 32.4 s. (Prose detail in gpu-changes.md; the
-  remaining gap-closing — compute/H2D overlap — is a future item below.)
-- **Fringe-rotation interpolator hoisting** (2026-07-21): the per-window
-  `a`/`b` and per-(window, band) `bigAval`/`bigB_reduced` are precomputed
-  once per subint (`gpu_precompute_fringe_rotator`) instead of being
-  recomputed in every (window, band, channel) thread of the rotation
-  kernels — the per-sample kernel now only forms the phase and applies the
-  rotator. A pure refactor of the same FP64 arithmetic (numerically
-  equivalent; the GPU final output is not bit-reproducible run-to-run
-  anyway, due to XMAC atomics). T5-T1 32.4 -> 22.9 s (~29%) — the
-  per-sample FP64 recompute was the dominant GeForce cost (FP64 at 1/32
-  rate). 8/8 device + fallback PASS, both pipeline modes. Design:
-  gpu-fringerotation-design.md. Follow-up (per-sample precision drop) is a
-  work-queue item below.
-- **Host-tail overlap (intra-subint half-split)** (2026-07-21): the
-  ~48% between-subints GPU idle came from `issuegpudata` draining the
-  stream (`cudaStreamSynchronize`) and then running the whole per-subint
-  host tail (finishWeights, autocorr + baseline-weight fold, pcal,
-  visibility memcpy) with the GPU parked. `process_gpu` is now split at
-  the FFT into `process_gpu_tofft` (input H2D, unpack, gpu_set_weights,
-  fringe rotation, FFT) and `process_gpu_afterfft` (weight reduction,
-  pcal, fractional rotation/autocorr); `issuegpudata` into `issue_tofft`
-  and `issue_afterfft_xmac_drain`; the host tail into `completegpudata`.
-  `loopprocess` software-pipelines at half granularity: after a subint's
-  second half it pre-issues the NEXT subint's first half onto the compute
-  stream, so that input half runs while this subint's outputs drain and
-  its host tail runs. The mid-loop drain is replaced by an `evComputeDone`
-  event the d2h stream waits on. No buffer duplication - single-stream
-  ordering keeps fftd/gDataWeights valid across subints, and each subint's
-  tail runs before the next subint's afterfft overwrites the shared output
-  mirrors. Per-slot `validsubint` drives the invalid-subint skip;
-  `DIFX_GPU_WEIGHTS_HOST` fallback is forced synchronous. PASS CPU-vs-GPU
-  (usb, usb-complex, complex-complex, multi) in both pipeline modes +
-  fallback. Design: gpu-tailoverlap-design.md. **Benchmark (2026-07-21):
-  desktop T5-T1 flat (2070 is compute-bound); A100 re-profile did NOT
-  collapse the idle** (GPU span 10.5 -> 8.8 s, idle ~48% -> ~42%
-  kernels-only). The residual idle turned out to be a per-station
-  whole-stream drain in `Mk5_GPUMode::unpack_all` (item 0 below), NOT
-  cuFFT as first suspected - see the correction there.
-  Analysis: BENCHMARKS.md (A100 cluster profiling), gpu-changes.md.
+Completed work has moved to `gpu-changes.md`; the queue below is what remains.
 
 ## Work queue (underway + future)
-
-0. **DONE (2026-07-22): eliminate the per-station whole-stream drain in
-   `Mk5_GPUMode::unpack_all`.** The A100 re-profile showed the process
-   thread blocking in ~10 `cudaStreamSynchronize`/subint (5.58 s on the
-   A100, 13 s on the 2070 - the single largest source of GPU idle).
-   **This was first misattributed to cuFFT** because the sync count matched
-   the `cufftExecC2C` count (both ~1 per station per subint - unpack and the
-   FFT sit in the same per-station tofft iteration). The `utilities/fft-
-   profiling/fftbench.cu` microbenchmark had already shown cuFFT is async on
-   both the 2070 and the A100 cluster; two decisive checks nailed the real
-   source: (i) stubbing out `cufftExecC2C` left the sync count unchanged
-   (4021), (ii) an nsys `--cudabacktrace=sync` stack pointed at
-   `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`. That drain exists
-   only so the host-weights fallback can read `valid_frames` on the host;
-   on the default device path `gpu_set_weights` reads it via `->gpuPtr()`,
-   so the copy+drain is pure overhead. Removing it on the device path broke
-   PIPELINE=1 (weights wrong, cross-baselines garbage) because the drain
-   was also an *implicit barrier*: the four per-mode host-staging buffers
-   (`nearestSamples`, `gFracSampleError`, `gValidFlags`, `gInterpolator`,
-   plus `gValidSamples` on the invalid path) are single-buffered, and the
-   overlap lets the host fill subint N+1's copy while subint N's async H2D
-   from it is still queued behind the GPU backlog. **Fix:** RING-deep
-   (RECEIVE_RING_LENGTH) the HOST side of those buffers (device stays single
-   - device reads are stream-ordered) via `GpuMemHelper::enableHostRing` +
-   `GPUMode::setProcSlot`, then drop the drain on the device path. Result:
-   `cudaStreamSynchronize` 4021 -> 31 (13.1 s -> 0.002 s), PASS CPU-vs-GPU
-   in both pipeline modes + host-weights fallback; desktop T5-T1 flat
-   (compute-bound), A100 wall win to be confirmed on the cluster. cuFFT
-   batching (old fix (b)) is a separate, smaller FFT-efficiency idea, now a
-   future item (see cufftdx note below); it does NOT touch this idle.
-   Design/analysis: gpu-changes.md, BENCHMARKS.md.
 
 1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
    writes the unpacked samples to global memory and the fringe-rotation
@@ -150,8 +43,9 @@ FP64 cheap there, so precision work still leans desktop (2070).
    now that fringe rotation is cheap on fast-FP64 cards, so the memory
    round-trip between them is the thing to cut. Fusing also removes two
    kernel launches per (datastream, subint) - a minor secondary benefit
-   (launch overhead is only ~3-4% of host time; see "Where we are").
-   Interacts with the FP16 and precision-drop items below.
+   (launch overhead is only ~3-4% of host time). Interacts with the FP16
+   and precision-drop items below. NOTE: this attacks GPU-busy time, which
+   is not the current bottleneck (see "Where we are").
 2. **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
    FFT): an opt-in reduced-precision path that carries the unpacked
    samples and the fringe rotation in FP16, with the FFT taking FP16 in
@@ -245,27 +139,15 @@ will ease the eventual merge and put GPU code where it belongs:
 
 ## Longer-term / opportunistic
 
-- **Cheaper interlaced-VDIF demux on the DataStream (THE real bottleneck for
-  the GPU correlator, found 2026-07-22).** Profiling the *whole* pipeline
-  (not just the Core) showed the GPU idle is data-delivery bound: the
-  DataStream spends ~93% of its busy CPU in `cornerturn_16thread_2bit` +
-  memcpy (VDIFMuxer, multiplexing 16 interlaced VDIF threads into one), at
-  only ~1.7 Gbps/core - at/below the 2 Gbps/station record rate, so the fast
-  GPU starves waiting on the procslot mutex. The Core-side wins (unpack-drain
-  removal, tail-overlap) were correct de-serialization but aimed at a
-  non-bottleneck. Confirmed by switching fake data to single-thread VDIF
-  (needs the mark5access VDIF `genheaders`, committed 2026-07-22): the
-  corner-turn vanishes and a 2-station uncontended GPU job drops 8.0 s ->
-  4.8 s (~40%). **Goal:** add an unpacker path that handles interlaced VDIF
-  by *reordering* the per-thread frames into the correct time sequence
-  (pure memcpy) and letting the GPU unpack de-interleave the channels,
-  instead of the CPU bit-banging them into a single multiplexed thread
-  (VDIFMuxer). This removes the corner-turn from the DataStream critical
-  path while still accepting real interlaced-VDIF recordings. (For fake-data
-  benchmarking, the sbatch can instead rewrite the .input format
-  `INTERLACEDVDIF/0:..:N -> VDIF` via
-  `sed -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|'`,
-  keeping DATA FRAME SIZE, to measure the GPU without the demux.)
+- **Cheaper interlaced-VDIF demux on the DataStream — THE current bottleneck
+  for the GPU correlator** (found 2026-07-22; full analysis in gpu-changes.md
+  §10). The DataStream burns ~93% of its CPU bit-banging 16 interlaced VDIF
+  threads into one (`VDIFMuxer`) at ~1.7 Gbps/core, starving the GPU. **Goal:**
+  an unpacker path that handles interlaced VDIF by *reordering* the per-thread
+  frames into time order (pure memcpy) + GPU channel de-interleave, instead of
+  the CPU multiplex, so real interlaced recordings stop gating the GPU. (For
+  fake-data benchmarking, `benchprof-profile.sbatch` already rewrites the
+  `.input` `INTERLACEDVDIF/… → VDIF` to bypass the demux.)
 - **Subints larger than GPU memory**: today a subint's full set of FFT
   windows must fit on the device, so large station counts or data rates
   force short subints — at the cost of a higher visibility rate from the

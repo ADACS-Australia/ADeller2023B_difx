@@ -58,6 +58,18 @@ if [ "$nds" != 10 ]; then
     exit 1
 fi
 
+# Bypass the DataStream interlaced-VDIF corner-turn so this profiles the GPU
+# correlator, not the CPU-side thread demux (the current bottleneck - see
+# gpu-changes.md sec 10). vex2difx always emits INTERLACEDVDIF for the multi-band
+# fake data; rewrite it to single-thread VDIF (16 chans in one thread, the GPU
+# unpack de-interleaves them), keeping DATA FRAME SIZE. Needs the mark5access
+# VDIF genheaders (commit 191528ff9). Set SINGLE_THREAD_VDIF=0 to keep the
+# interlaced demux (e.g. to reproduce the corner-turn-bound profile).
+if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
+    sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|' benchprof_1.input
+    echo "benchprof: rewrote INTERLACEDVDIF -> single-thread VDIF (set SINGLE_THREAD_VDIF=0 to disable)"
+fi
+
 date
 # Collect the correlator log; killed once mpifxcorr returns.
 difxlog benchprof_1 "$WORKDIR/benchprof_1.difxlog" 4 &
