@@ -46,6 +46,8 @@ stream. This is a diagnostic ledger (idle %), not the T5-T1 metric.
 |---|---|---|---|---|---|---|---|
 | 2026-07-21 | pre-overlap (80f6e291a) | 10497 | 5471 | 47.9% | — | — | reference (tooarrana clean profile, per gpu-plan notes) |
 | 2026-07-21 | 7b8e31104 | 8798 | 5088 | 42.2% | 5695 | 35.3% | host-tail overlap; idle did NOT collapse |
+| 2026-07-22 | unpack-drain fix, INTERLACED | 9858 | 5077 | 48.5% | 5731 | 41.9% | sync fix held (no `cudaStreamSynchronize` storm) but GPU still starved by the DataStream corner-turn — see §10 |
+| 2026-07-22 | + single-thread VDIF (genheaders) | 6050 | 5058 | 16.4% | 5614 | **7.2%** | corner-turn removed; kernel busy unchanged (5058≈5077) so the win is pure idle removal; wall (CUDA-API span) 12169 → 7886 ms (**~35%**); GPU now compute-bound |
 
 The overlap shortened the GPU span ~16% (10.5 -> 8.8 s) and trimmed idle
 ~48% -> ~42% (kernels-only), but did **not** collapse the between-subints
@@ -66,8 +68,18 @@ stubbing the FFT left the sync count unchanged; an nsys sync-backtrace
 resolved the caller to `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`.
 Removed on the device path (gated to the host-weights fallback) with
 RING-deep host staging to keep the tail-overlap safe - see gpu-changes.md
-§9 and gpu-plan.md work-queue item 0. This A100 profile should be re-run
-to confirm the idle now converts to wall-time.
+§9 and gpu-plan.md work-queue item 0.
+
+**Resolved (2026-07-22, §10 / last two table rows):** the drain removal
+alone left the A100 idle at ~42% - the true limiter was the DataStream
+INTERLACEDVDIF corner-turn, not any Core-side sync. Rebuilding fake data
+as single-thread VDIF (mark5access `genheaders`, `191528ff9`) removed the
+corner-turn and the idle collapsed **41.9% → 7.2%**, wall 12.2 → 7.9 s
+(~35%). Kernel busy is unchanged (5058 ≈ 5077 ms), so the speed-up is
+purely the GPU no longer starving. The residual 7.2% idle is now mostly
+small (<20 us) inter-kernel gaps; the GPU is compute-bound, with
+`gpu_resultsrotatorMultiply` (28.9%), `gpu_unpack` (24.5%) and the
+`<<<1,1>>>` `gpu_sum_weights` (5.8%) the next kernel targets.
 
 ## Pre-protocol reference points (15 s of data, tInt 2 s, whole-run wall)
 
