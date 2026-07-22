@@ -11,7 +11,7 @@
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
 #
 # Clean GPU-bound Nsight Systems profile of the 10-antenna fake-data
-# "benchprof" job (source=fake, 400 x 10ms subints). Deliberately removes the
+# "benchprof" job (source=fake, ~20 s = ~2000 x 10ms subints). Deliberately removes the
 # two things that muddied the earlier profiles:
 #   * source=fake  -> no VDIF disk I/O,
 #   * --exclusive + --cpus-per-task=1 over 12 ranks (1 manager + 10 datastreams
@@ -47,6 +47,12 @@ mkdir -p "$WORKDIR/nsys"
 cp "$SRCDIR/benchprof.v2d" "$SRCDIR/bd247c3.vex.obs" "$SRCDIR/nsys-wrapper.sh" "$WORKDIR/"
 chmod +x "$WORKDIR/nsys-wrapper.sh"
 cd "$WORKDIR"
+
+# Profile a longer (~20 s) window than benchprof.v2d's quick-check default
+# (~4 s): now that the corner-turn is gone the run is fast, and a longer window
+# makes the headline wall time easier to read (startup/teardown is a smaller
+# fraction). mjdStart 59675.09606481 + 20 s = 59675.09629650.
+sed -i 's|^mjdStop .*|mjdStop  = 59675.09629650|' benchprof.v2d
 
 vex2difx benchprof.v2d          # -> benchprof_1.input/.calc/.threads
 difxcalc benchprof_1.calc       # -> benchprof_1.im

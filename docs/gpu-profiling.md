@@ -9,8 +9,10 @@ Companion to `gpu-plan.md` (what to do next) and `BENCHMARKS.md` (ledger).
 ## How to capture
 
 `tests/FakeData/benchprof-profile.sbatch` runs a clean GPU-bound
-correlation (A100, one rank/core `--exclusive`, `source=fake` so no disk
-I/O, 400 subints, 10 stations) with `tests/FakeData/nsys-wrapper.sh`
+correlation (A100, one rank/core, `source=fake` so no disk I/O, ~20 s =
+~2000 x 10ms subints, 10 stations; defaults to single-thread VDIF via
+`SINGLE_THREAD_VDIF=1` so it profiles the GPU rather than the DataStream
+interlaced-VDIF corner-turn) with `tests/FakeData/nsys-wrapper.sh`
 wrapping **only the Core rank** (the wrapper picks the Core rank via the
 OMPI/SLURM/PMIX rank env var; rank 0 deletes stale `.difx`). One capture =
 one correlator process. The `.nsys-rep` lands in `nsys/` under the run

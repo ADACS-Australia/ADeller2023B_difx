@@ -9,8 +9,11 @@
 # steady-state correlation rate. See BENCHMARKS.md for the results ledger.
 #
 # Usage:  ./run-bench.sh [repeats]        (default 3)
-# Env:    USEGPU=0        benchmark the CPU path instead
-#         EXTRA_ENV=...   e.g. EXTRA_ENV="DIFX_GPU_PIN_INPUT=0"
+# Env:    USEGPU=0             benchmark the CPU path instead
+#         SINGLE_THREAD_VDIF=0 keep interlaced VDIF (default: rewrite the fake
+#                              data to single-thread VDIF, bypassing the
+#                              DataStream corner-turn; needs mark5access genheaders)
+#         EXTRA_ENV=...        e.g. EXTRA_ENV="DIFX_GPU_PIN_INPUT=0"
 
 set -u
 cd "$(dirname "$0")"
@@ -34,6 +37,12 @@ set +u; . ../../setup.bash > /dev/null 2>&1; set -u
 gen() { # gen <name> <mjdstop>
     sed -e "s/^mjdStop .*/mjdStop  = $2/" benchsimreal.v2d > "$1.v2d"
     vex2difx "$1.v2d" > /dev/null
+    # Benchmark the GPU without the DataStream interlaced-VDIF corner-turn:
+    # rewrite the fake data to single-thread VDIF (needs mark5access genheaders).
+    # Set SINGLE_THREAD_VDIF=0 to keep the interlaced demux for comparison.
+    if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
+        sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|' "${1}_1.input"
+    fi
     difxcalc "${1}_1.calc" > /dev/null
     local nds
     nds=$(awk '/^ACTIVE DATASTREAMS/{print $3}' "${1}_1.input")

@@ -388,7 +388,17 @@ VDIF (all frames invalid, 0-byte output). `mark5_format_vdif_genheaders`
 headers (invalid bit clear, monotonic time). For fake-data benchmarking,
 rewrite the `.input` after vex2difx with
 `sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|'`
-(keep DATA FRAME SIZE) — now wired into `benchprof-profile.sbatch`.
+(keep DATA FRAME SIZE) — now the default in both `benchprof-profile.sbatch`
+(which also widened its profile window ~4 s → ~20 s so startup/teardown is a
+small fraction of the headline wall) and `run-bench.sh` (`SINGLE_THREAD_VDIF=0`
+keeps the interlaced demux for comparison).
+
+**Confirmed on both machines (2026-07-22):** A100 GPU idle 41.9% → 7.2%, wall
+12.2 → 7.9 s (~35%), kernel busy unchanged (see BENCHMARKS.md A100 §10 rows).
+Desktop T5-T1 (best-of-3) 23.2 s interlaced → 14.0 s single-thread (~40%) — the
+corner-turn cost the oversubscribed desktop too, not just the A100. The GPU is
+now compute-bound; next kernel targets: `gpu_resultsrotatorMultiply` (28.9%),
+`gpu_unpack` (24.5%), the `<<<1,1>>>` `gpu_sum_weights` (5.8%).
 
 The production fix (real interlaced recordings can't just be relabelled) is a
 longer-term goal: an unpacker that reorders the per-thread frames into time

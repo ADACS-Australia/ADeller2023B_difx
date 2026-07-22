@@ -100,9 +100,11 @@ Completed work has moved to `gpu-changes.md`; the queue below is what remains.
 
 - **Benchmark ledger**: every landed change gets a
   `tests/FakeData/run-bench.sh` run (metric T5−T1, best-of-3) recorded
-  in `BENCHMARKS.md`. Publishing the ledger to the fork's GitHub wiki is
-  intended once the wiki is initialised (the wiki is a git repo:
-  `ADACS-Australia/ADeller2023B_difx.wiki.git`).
+  in `BENCHMARKS.md`. Since 2026-07-22 the benchmark defaults to
+  single-thread VDIF (`SINGLE_THREAD_VDIF=0` to keep the interlaced demux)
+  so it measures the GPU, not the DataStream corner-turn. Publishing the
+  ledger to the fork's GitHub wiki is intended once the wiki is initialised
+  (the wiki is a git repo: `ADACS-Australia/ADeller2023B_difx.wiki.git`).
 - **Prose documentation**: `gpu-changes.md` is extended with every
   substantive change, at the same time as the change.
 - **Full diff review before every commit.**

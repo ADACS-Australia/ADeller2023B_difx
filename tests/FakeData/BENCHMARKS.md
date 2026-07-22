@@ -13,9 +13,17 @@ suppress scheduling noise on the oversubscribed desktop). `USEGPU=0`
 benchmarks the CPU path; `EXTRA_ENV="DIFX_GPU_PIN_INPUT=0"` etc. for A/B
 legs. The script prints a ready-to-paste ledger row.
 
+**Since 2026-07-22 the benchmark defaults to single-thread VDIF** (the fake
+data is rewritten `INTERLACEDVDIF→VDIF` after vex2difx) so it measures the GPU
+correlator, not the DataStream interlaced-VDIF corner-turn (the demux that
+dominated the pipeline - see the A100 section §10). Set `SINGLE_THREAD_VDIF=0`
+to keep the interlaced demux. Rows dated on/before 2026-07-21 are all
+interlaced and are NOT directly comparable to single-thread rows.
+
 Rules:
 - Machine otherwise idle (no builds, no nsys, no browser).
 - Record every change that lands: benchmark at the commit that follows it.
+- Note the VDIF threading (single-thread default vs `SINGLE_THREAD_VDIF=0`).
 - FakeData output is NOT bit-reproducible run to run (see README) - this
   ledger tracks time only, never correctness.
 
@@ -32,8 +40,15 @@ Rules:
 | 2026-07-21 | 7b8e31104 | gpu DIFX_GPU_PIPELINE=0 | 12.7 | 35.3 | 22.6 | synchronous, no overlap; ≈ pipeline=1 ⇒ no idle to hide on the 2070 (GPU-compute-bound). The overlap targets the ~48% idle measured on the A100, so the win is expected on the cluster re-profile, not here. |
 | 2026-07-22 | (unpack-drain fix) | gpu DIFX_GPU_PIPELINE=1 | 11.8 | 35.5 | 23.7 | RING-deep host staging + drop per-station `unpack_all` drain; `cudaStreamSynchronize` 4021→31 (13.1 s→0.002 s). Flat on the 2070 (compute-bound + oversubscribed ⇒ no idle to convert). A100 wall win TBC on the cluster. |
 | 2026-07-22 | (unpack-drain fix) | gpu DIFX_GPU_PIPELINE=0 | 12.6 | 35.5 | 22.9 | same build, no overlap; ≈ pipeline=1 on the 2070. |
+| 2026-07-22 | f3046d081 | gpu, single-thread VDIF | 9.1 | 23.1 | **14.0** | benchmark now single-thread by default (no DataStream corner-turn); ~40% faster than the interlaced row below - the corner-turn cost the oversubscribed desktop too, not just the A100 |
+| 2026-07-22 | f3046d081 | gpu, INTERLACEDVDIF (SINGLE_THREAD_VDIF=0) | 12.2 | 35.4 | 23.2 | interlaced comparison at the same commit |
 
-## A100 cluster profiling (benchprof-profile.sbatch, 400 subints, 10 stations)
+## A100 cluster profiling (benchprof-profile.sbatch, 10 stations)
+
+Note: the rows below are the original ~4 s / 400-subint window; since
+2026-07-22 the sbatch profiles a ~20 s / ~2000-subint window (spans scale
+accordingly, idle % is the comparable quantity) and defaults to single-thread
+VDIF.
 
 Clean GPU-bound profile: A100-SXM4-80GB, one rank/core `--exclusive`,
 fake data, Core rank wrapped with nsys (`.nsys-rep` + sqlite kept under
