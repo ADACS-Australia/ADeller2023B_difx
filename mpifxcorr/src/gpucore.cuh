@@ -82,49 +82,49 @@ private:
     /// it can overlap the NEXT subintegration's compute on cuStream.
     cudaStream_t d2hStream;
 
-    /** * @brief The final, device-side visibility buffers - one per procslot.
-     * Replaces the CPU's `scratchspace->threadcrosscorrs`. Each is mapped exactly
-     * to the CPU's `procslots[index].results` layout. There is one buffer per
-     * procslot (indexed by the procslots ring index) so that the deferred,
-     * overlapped device->host copy of subint N reads a stable buffer while subint
-     * N+1's XMAC writes its own. Size each: `maxcoreresultlength * sizeof(cuFloatComplex)`.
-     */
-    std::vector<cuFloatComplex*> results_gpu;
+    /// Per-procslot GPU-side state, one entry per RECEIVE_RING_LENGTH ring slot,
+    /// indexed by the procslots ring index. Complements Core::procslots (the
+    /// CPU-side ring): consolidates the buffers and events the tail-overlap
+    /// pipeline keeps per slot (previously six parallel std::vectors).
+    struct gpuprocslot {
+        /// Device-side visibility buffer, mapped exactly to the CPU's
+        /// procslots[index].results layout (replaces scratchspace->threadcrosscorrs).
+        /// One per slot so subint N's deferred, overlapped D2H reads a stable
+        /// buffer while subint N+1's XMAC writes its own. Size:
+        /// maxcoreresultlength * sizeof(cuFloatComplex).
+        cuFloatComplex* results_gpu = nullptr;
 
-    /// Per-procslot PINNED host staging buffers for the visibility transfer. The
-    /// device->host copy must land in page-locked memory to be truly asynchronous
-    /// (cudaMemcpyAsync to pageable memory is effectively synchronous and would
-    /// defeat the overlap); procslots[].results is pageable, so we stage into
-    /// these and completegpudata() copies the landed prefix across on the host.
-    std::vector<cuFloatComplex*> results_host;
+        /// PINNED host staging for the visibility transfer. The D2H must land in
+        /// page-locked memory to be truly async (cudaMemcpyAsync to pageable is
+        /// effectively synchronous and would defeat the overlap); procslots[].results
+        /// is pageable, so we stage here and completegpudata() copies the landed
+        /// prefix across on the host.
+        cuFloatComplex* results_host = nullptr;
 
-    /// Per-procslot event marking completion of that slot's visibility device->host
-    /// copy on d2hStream. completegpudata() waits on it before the slot is released
-    /// for the manager send.
-    std::vector<cudaEvent_t> d2hDone;
+        /// Event marking completion of this slot's visibility D2H on d2hStream.
+        /// completegpudata() waits on it before the slot is released for the send.
+        cudaEvent_t d2hDone = nullptr;
 
-    /// Per-procslot event marking completion of that slot's input host->device
-    /// copies on cuStream (recorded once in issuegpudata, after the fftloop
-    /// loop). completegpudata() waits on it before the slot is released,
-    /// so the manager cannot start refilling procslots[].databuffer[] while an
-    /// async copy from it (pinned-input path) is still in flight. This makes the
-    /// input-reuse invariant explicit; on the staging fallback path the wait is
-    /// trivially satisfied.
-    std::vector<cudaEvent_t> h2dInputDone;
+        /// Event marking completion of this slot's input H2D copies on cuStream
+        /// (recorded in issue_afterfft_xmac_drain). completegpudata() waits on it
+        /// before release so the manager cannot refill procslots[].databuffer[]
+        /// while an async copy from it (pinned-input path) is still in flight.
+        cudaEvent_t h2dInputDone = nullptr;
 
-    /// Per-procslot event recorded on cuStream after this subint's afterfft +
-    /// XMAC + baseline-weight reduction (and their output D2Hs enqueued on
-    /// cuStream). d2hStream waits on it before the visibility D2H, and it lets
-    /// issue_tofft(N+1) be enqueued right after (running during this subint's
-    /// drain + host tail) - replacing the old end-of-subint cudaStreamSynchronize.
-    std::vector<cudaEvent_t> evComputeDone;
+        /// Event recorded on cuStream after this subint's afterfft + XMAC +
+        /// baseline-weight reduction (and their output D2Hs). d2hStream waits on it
+        /// before the visibility D2H, and it lets issue_tofft(N+1) be enqueued
+        /// right after - replacing the old end-of-subint cudaStreamSynchronize.
+        cudaEvent_t evComputeDone = nullptr;
 
-    /// validsubint[slot][ds]: each datastream's subint validity captured
-    /// (GPUMode::isSubintValid()) right after issue_tofft, before the pipelined
-    /// next-subint issue overwrites the Mode's datalengthbytes/offsetseconds.
-    /// completegpudata reads it to skip the weight/autocorr fold for datastreams
-    /// whose subint had no valid data (mirrors the old weightsOnDevice gate).
-    std::vector<std::vector<char>> validsubint;
+        /// validsubint[ds]: each datastream's subint validity captured
+        /// (GPUMode::isSubintValid()) right after issue_tofft, before the pipelined
+        /// next-subint issue overwrites the Mode's datalengthbytes/offsetseconds.
+        /// completegpudata reads it to skip the weight/autocorr fold for datastreams
+        /// whose subint had no valid data.
+        std::vector<char> validsubint;
+    };
+    std::vector<gpuprocslot> gpuprocslots;
 
     /// When true (default; disable with DIFX_GPU_PIPELINE=0), subint N's visibility
     /// transfer is left in flight while subint N+1 is issued, and only awaited just

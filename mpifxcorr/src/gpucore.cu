@@ -296,25 +296,22 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     // Allocate one results buffer and one completion event per procslot, so the
     // deferred device->host copy of one subint does not collide with the next
     // subint's XMAC writes.
-    results_gpu.resize(RECEIVE_RING_LENGTH);
-    results_host.resize(RECEIVE_RING_LENGTH);
-    d2hDone.resize(RECEIVE_RING_LENGTH);
-    h2dInputDone.resize(RECEIVE_RING_LENGTH);
-    // evComputeDone[slot] is recorded on cuStream after this subint's afterfft
-    // + XMAC + output D2Hs; d2hStream waits on it before the visibility D2H, and
-    // it lets the tail-overlap pipeline replace the old end-of-subint
-    // cudaStreamSynchronize. validsubint[slot][ds] captures each datastream's
-    // subint validity at issue time (isSubintValid()), because the pipelined
-    // next-subint tofft overwrites the Mode's datalengthbytes/offsetseconds
-    // before the deferred tail folds this subint's weights/autocorrs.
-    evComputeDone.resize(RECEIVE_RING_LENGTH);
-    validsubint.assign(RECEIVE_RING_LENGTH, std::vector<char>(numdatastreams, 0));
+    // evComputeDone is recorded on cuStream after this subint's afterfft + XMAC +
+    // output D2Hs; d2hStream waits on it before the visibility D2H, and it lets
+    // the tail-overlap pipeline replace the old end-of-subint
+    // cudaStreamSynchronize. validsubint[ds] captures each datastream's subint
+    // validity at issue time (isSubintValid()), because the pipelined next-subint
+    // tofft overwrites the Mode's datalengthbytes/offsetseconds before the
+    // deferred tail folds this subint's weights/autocorrs.
+    gpuprocslots.resize(RECEIVE_RING_LENGTH);
     for (int i = 0; i < RECEIVE_RING_LENGTH; i++) {
-        checkCuda(cudaMalloc(&results_gpu[i], maxcoreresultlength * sizeof(cuFloatComplex)));
-        checkCuda(cudaMallocHost(&results_host[i], maxcoreresultlength * sizeof(cuFloatComplex)));
-        checkCuda(cudaEventCreateWithFlags(&d2hDone[i], cudaEventDisableTiming));
-        checkCuda(cudaEventCreateWithFlags(&h2dInputDone[i], cudaEventDisableTiming));
-        checkCuda(cudaEventCreateWithFlags(&evComputeDone[i], cudaEventDisableTiming));
+        gpuprocslot &gs = gpuprocslots[i];
+        gs.validsubint.assign(numdatastreams, 0);
+        checkCuda(cudaMalloc(&gs.results_gpu, maxcoreresultlength * sizeof(cuFloatComplex)));
+        checkCuda(cudaMallocHost(&gs.results_host, maxcoreresultlength * sizeof(cuFloatComplex)));
+        checkCuda(cudaEventCreateWithFlags(&gs.d2hDone, cudaEventDisableTiming));
+        checkCuda(cudaEventCreateWithFlags(&gs.h2dInputDone, cudaEventDisableTiming));
+        checkCuda(cudaEventCreateWithFlags(&gs.evComputeDone, cudaEventDisableTiming));
     }
 
     // Allocate the shared, frequency-independent FFT buffer pointer arrays (one
@@ -977,7 +974,7 @@ GPUCore::issue_tofft(int index, int threadid, int startblock, int numblocks, Mod
 
         // Capture this subint's validity NOW, before the next subint's issue
         // overwrites datalengthbytes/offsetseconds; the deferred tail reads it.
-        validsubint[index][j] = ((GPUMode *) modes[j])->isSubintValid() ? 1 : 0;
+        gpuprocslots[index].validsubint[j] = ((GPUMode *) modes[j])->isSubintValid() ? 1 : 0;
     }
 
     //zero the results for this thread (unused on the GPU path, but kept in step
@@ -1139,7 +1136,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
         // ---------------------------------------------------------------------
         DIFX_NVTX_PUSH("xmac_launch");
         // Ensure this slot's device-side results buffer is cleanly zeroed for this subint
-        checkCuda(cudaMemsetAsync(results_gpu[index], 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
+        checkCuda(cudaMemsetAsync(gpuprocslots[index].results_gpu, 0, maxcoreresultlength * sizeof(cuFloatComplex), cuStream));
 
         // The kernel launch metadata (band indexes, result offsets, channel/pol
         // counts and the FFT buffer pointers) is invariant for a given
@@ -1200,7 +1197,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
                 d_v1_ptrs, d_v2_ptrs,
                 plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
                 plan.d_coreResultBaselineOffsets,
-                results_gpu[index],
+                gpuprocslots[index].results_gpu,
                 numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
                 fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
@@ -1237,23 +1234,23 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
         // no longer blocks here, so loopprocess enqueues the NEXT subint's
         // issue_tofft on cuStream right after this - running during this subint's
         // drain and its host tail (completegpudata).
-        checkCuda(cudaEventRecord(evComputeDone[index], cuStream));
+        checkCuda(cudaEventRecord(gpuprocslots[index].evComputeDone, cuStream));
         DIFX_NVTX_POP(); // xmac_launch
 
         // Visibility D2H on the dedicated d2h stream, gated on evComputeDone so
         // it waits for the XMAC output without draining cuStream (letting it
         // overlap the next subint's compute and this subint's host tail).
-        // completegpudata(index) awaits d2hDone[index]; because d2hStream first
+        // completegpudata(index) awaits gpuprocslots[index].d2hDone; because d2hStream first
         // waits evComputeDone, that wait transitively covers the cuStream output
         // D2Hs too (autocorr / gTotalWeight / pcal / baseline-weights). The whole
         // host tail (finishWeights, autocorr + baseline-weight fold, pcal, and
         // the visibility memcpy) moves to completegpudata.
         int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
-        checkCuda(cudaStreamWaitEvent(d2hStream, evComputeDone[index], 0));
-        checkCuda(cudaMemcpyAsync(results_host[index], results_gpu[index],
+        checkCuda(cudaStreamWaitEvent(d2hStream, gpuprocslots[index].evComputeDone, 0));
+        checkCuda(cudaMemcpyAsync(gpuprocslots[index].results_host, gpuprocslots[index].results_gpu,
                                   xcorrslength * sizeof(cuFloatComplex),
                                   cudaMemcpyDeviceToHost, d2hStream));
-        checkCuda(cudaEventRecord(d2hDone[index], d2hStream));
+        checkCuda(cudaEventRecord(gpuprocslots[index].d2hDone, d2hStream));
     }
 
 
@@ -1269,7 +1266,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
     // just the copies; if the input copies ever move to a dedicated H2D stream
     // (to overlap with compute), record this event on that stream instead so
     // slot release does not serialize against the subint's compute.
-    checkCuda(cudaEventRecord(h2dInputDone[index], cuStream));
+    checkCuda(cudaEventRecord(gpuprocslots[index].h2dInputDone, cuStream));
 
     // cuStream is the Core's persistent stream now; it is NOT destroyed here
     // (nor in ~GPUCore - see the no-CUDA-calls-at-teardown note there). The host
@@ -1284,14 +1281,14 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
 void GPUCore::completegpudata(int index, int threadid, int startblock, int numblocks, Mode **modes,
                               Polyco *currentpolyco, threadscratchspace *scratchspace) {
     (void) currentpolyco; // pulsar binning / uvshift not supported on the GPU path
-    // Wait for this subint's device->host copies to land: d2hDone[index] (the
+    // Wait for this subint's device->host copies to land: gpuprocslots[index].d2hDone (the
     // visibility D2H on d2hStream, which first waited evComputeDone - so this
     // transitively covers the cuStream output D2Hs: autocorr / gTotalWeight /
-    // pcal / baseline-weights) and h2dInputDone[index] (the input copies, so the
+    // pcal / baseline-weights) and gpuprocslots[index].h2dInputDone (the input copies, so the
     // slot's databuffer can be recycled by the manager).
     DIFX_NVTX_RANGE("complete_d2h_wait");
-    checkCuda(cudaEventSynchronize(d2hDone[index]));
-    checkCuda(cudaEventSynchronize(h2dInputDone[index]));
+    checkCuda(cudaEventSynchronize(gpuprocslots[index].d2hDone));
+    checkCuda(cudaEventSynchronize(gpuprocslots[index].h2dInputDone));
 
 #ifndef NEUTERED_DIFX
     int perr, localfreqindex, numfftsprocessed;
@@ -1324,7 +1321,7 @@ void GPUCore::completegpudata(int index, int threadid, int startblock, int numbl
     // accumulates (+=) into weights[][], so the mirrors must be zeroed here, just
     // before it (and doing it here rather than at issue time is required by tail-
     // overlap pipelining - the next subint's issue_tofft runs before this tail).
-    // validsubint[index][j] (captured at issue time) drives the invalid-subint
+    // gpuprocslots[index].validsubint[j] (captured at issue time) drives the invalid-subint
     // skip - an invalid datastream's autocorr/weights stay zeroed. On the
     // DIFX_GPU_WEIGHTS_HOST fallback the mirrors were already filled before the
     // tail (weights in set_weights, autocorr in afterfft) and were pre-zeroed in
@@ -1334,11 +1331,11 @@ void GPUCore::completegpudata(int index, int threadid, int startblock, int numbl
             modes[j]->zeroAutocorrelations();
     }
     for (int j = 0; j < numdatastreams; j++)
-        ((GPUMode *) modes[j])->finishWeights(validsubint[index][j] != 0);
+        ((GPUMode *) modes[j])->finishWeights(gpuprocslots[index].validsubint[j] != 0);
 
     // NOTE: unlike Core::processdata we must NOT call uvshiftAndAverage here.
     // The fused XMAC kernel has already written the final averaged cross
-    // correlations directly into results_gpu[index] (staged to results_host and
+    // correlations directly into gpuprocslots[index].results_gpu (staged to results_host and
     // memcpy'd into procslots below), and nothing on the GPU path fills
     // scratchspace->threadcrosscorrs - so the CPU averaging would add
     // uninitialised memory on top of the correct visibilities. (This also means
@@ -1473,6 +1470,6 @@ void GPUCore::completegpudata(int index, int threadid, int startblock, int numbl
     // disjoint from the autocorr/weight/pcal trailing regions folded above,
     // which the main thread pre-zeroed before handing us this slot).
     int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
-    memcpy(procslots[index].results, results_host[index], xcorrslength * sizeof(cuFloatComplex));
+    memcpy(procslots[index].results, gpuprocslots[index].results_host, xcorrslength * sizeof(cuFloatComplex));
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab
