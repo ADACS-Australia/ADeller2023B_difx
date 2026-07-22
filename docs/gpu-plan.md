@@ -245,6 +245,27 @@ will ease the eventual merge and put GPU code where it belongs:
 
 ## Longer-term / opportunistic
 
+- **Cheaper interlaced-VDIF demux on the DataStream (THE real bottleneck for
+  the GPU correlator, found 2026-07-22).** Profiling the *whole* pipeline
+  (not just the Core) showed the GPU idle is data-delivery bound: the
+  DataStream spends ~93% of its busy CPU in `cornerturn_16thread_2bit` +
+  memcpy (VDIFMuxer, multiplexing 16 interlaced VDIF threads into one), at
+  only ~1.7 Gbps/core - at/below the 2 Gbps/station record rate, so the fast
+  GPU starves waiting on the procslot mutex. The Core-side wins (unpack-drain
+  removal, tail-overlap) were correct de-serialization but aimed at a
+  non-bottleneck. Confirmed by switching fake data to single-thread VDIF
+  (needs the mark5access VDIF `genheaders`, committed 2026-07-22): the
+  corner-turn vanishes and a 2-station uncontended GPU job drops 8.0 s ->
+  4.8 s (~40%). **Goal:** add an unpacker path that handles interlaced VDIF
+  by *reordering* the per-thread frames into the correct time sequence
+  (pure memcpy) and letting the GPU unpack de-interleave the channels,
+  instead of the CPU bit-banging them into a single multiplexed thread
+  (VDIFMuxer). This removes the corner-turn from the DataStream critical
+  path while still accepting real interlaced-VDIF recordings. (For fake-data
+  benchmarking, the sbatch can instead rewrite the .input format
+  `INTERLACEDVDIF/0:..:N -> VDIF` via
+  `sed -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|'`,
+  keeping DATA FRAME SIZE, to measure the GPU without the demux.)
 - **Subints larger than GPU memory**: today a subint's full set of FFT
   windows must fit on the device, so large station counts or data rates
   force short subints — at the cost of a higher visibility rate from the
