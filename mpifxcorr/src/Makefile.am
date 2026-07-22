@@ -169,5 +169,15 @@ sysutil_test_SOURCES = \
 
 sysutil_test_CXXFLAGS = -g -I$(top_srcdir)/src/ -I $(AM_CXXFLAGS)
 
+# Compile CUDA sources. -MMD -MF generates a per-object header-dependency file
+# (gpumode.d, gpucore.d, ...) so that changing a shared .cuh (e.g. a GPUMode
+# member layout) forces every dependent .cu object to recompile. Without this,
+# nvcc tracks no header deps and an incremental build silently leaves stale
+# objects with a mismatched ABI (see the gpuprocslot/gFracSlope stale-object
+# saga). The -include below feeds those deps back to make on the next build.
 .cu.o:
-	$(NVCC) $(NVCCFLAGS) -ccbin $(CXX) -g -O2 $(DEFAULT_INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(mathcflags) $(M5ACCESS_CFLAGS) -Xcompiler -fopenmp -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -ccbin $(CXX) -g -O2 $(DEFAULT_INCLUDES) $(AM_CPPFLAGS) $(CPPFLAGS) $(mathcflags) $(M5ACCESS_CFLAGS) -Xcompiler -fopenmp -MMD -MF $(@:.o=.d) -c -o $@ $<
+
+CU_DEPFILES = gpumode.d gpucore.d mk5mode_gpu.d gpudecode.d
+CLEANFILES = $(CU_DEPFILES)
+-include $(CU_DEPFILES)

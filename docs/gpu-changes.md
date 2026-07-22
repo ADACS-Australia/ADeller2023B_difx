@@ -404,3 +404,31 @@ The production fix (real interlaced recordings can't just be relabelled) is a
 longer-term goal: an unpacker that reorders the per-thread frames into time
 order (pure memcpy) + GPU channel de-interleave, instead of the CPU bit-banging
 multiplex. See gpu-plan.md (Longer-term).
+
+## 11. Build: nvcc header-dependency tracking; item-4 investigation (2026-07-22)
+
+**Makefile.am fix.** The custom `.cu.o` rule ran nvcc with no dependency
+generation, so changing a shared `.cuh` did not rebuild dependent `.cu`
+objects — an incremental `make` could silently leave ABI-mismatched objects
+(e.g. `gpucore.o` keeping an old `GPUMode` layout after `gpumode.cuh` changed,
+reading members at wrong offsets). The rule now emits `-MMD -MF $(@:.o=.d)` and
+`-include`s the resulting `.d` files (added `CU_DEPFILES`/`CLEANFILES`), so
+`.cu` TUs track header deps like the `.cpp` TUs. A plain `make` after a header
+change is now safe. Confirmed: incremental rebuild after a `gpumode.cuh` layout
+change now recompiles `gpucore.o` and PASSes run-local (was 5/5 FAIL before).
+
+**Cautionary tale that motivated it.** A lot of effort went into chasing an
+apparent "flaky PIPELINE=1 tail-overlap race" that corrupted GPU
+cross-correlations (gpu0 PASS / gpu1 FAIL). It was NOT a race — it was the
+stale-object ABI mismatch above, created by incremental rebuilds while
+adding/removing a `GPUMode` member during the item-4 experiments. It was
+masked by compute-sanitizer and ASan (allocator/timing shifts) and looked
+intermittent on tiny-sample runs. The tail-overlap code (§8) is correct.
+Reproduced deterministically: stale `gpucore.o` → 5/5 gross FAIL, clean
+rebuild → 5/5 PASS. (Aside: GPU-vs-GPU diffDiFX at 10 stations shows ~0.04%
+XMAC-atomic noise — use a looser threshold or it reads as failure.)
+
+**Item 4 (`gpu_resultsrotatorMultiply`) investigated, no change.** It is
+memory-bound and already optimal as a single fused pass; splitting it is ~2×
+slower (cold global re-reads) and a `gFracSlope` precompute is neutral. Left
+fused. See gpu-plan.md item 4.

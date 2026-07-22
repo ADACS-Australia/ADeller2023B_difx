@@ -32,6 +32,11 @@ there, so precision work leans on the 2070).
 
 Completed work has moved to `gpu-changes.md`; the queue below is what remains.
 
+**Next action: item 1 (fuse unpack + fringe rotation).** Item 4 was investigated
+and closed with no change (memory-bound, already optimal fused). The remaining
+GPU-busy targets are item 1 (unpack+fringe fusion, the largest kernel on the
+cluster) and item 8 (occupancy audit, incl. the `<<<1,1>>>` `gpu_sum_weights`).
+
 ## Work queue (underway + future)
 
 1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
@@ -70,11 +75,17 @@ Completed work has moved to `gpu-changes.md`; the queue below is what remains.
    else is float (the precompute can then emit `bigB_reduced` as float
    too, halving the gBigBred traffic). Not bit-identical; validate with
    diffDiFX/SPECDEBUG.
-4. **Check why fractional sample correction is so slow** - currently
-   this is running almost 2x more slowly than fringe rotation, but 
-   really should be of similar speed. I suspect the issue is the 
-   auto-correlation calculation, probably the calculation of the 
-   indices for that or something. Should check that kernel.
+4. **DONE (investigated 2026-07-22, no change made): fractional sample
+   correction / `gpu_resultsrotatorMultiply`.** It runs ~2× a fringe-rotation
+   kernel, but that is because it is **memory-bound**, not because of the
+   autocorr index math (that guess was wrong). It is already optimal as a
+   **single fused pass** (rotate → conjugate → autocorrelate while the sample
+   is hot in registers/L1). Two changes were tried and both rejected on a
+   clean build: (a) splitting it into rotate/conj + autocorr kernels is ~2×
+   SLOWER (the autocorr kernels re-read fftd/conj COLD from global — fission
+   breaks the single-pass locality); (b) a `gFracSlope` precompute is
+   NEUTRAL (14.2 vs 14.4 s — the kernel isn't ALU-bound, so hoisting the FP64
+   recompute buys nothing). Left fused as-is. See gpu-changes.md.
 5. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
