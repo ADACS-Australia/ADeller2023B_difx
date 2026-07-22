@@ -103,35 +103,43 @@ FP64 cheap there, so precision work still leans desktop (2070).
   fallback. Design: gpu-tailoverlap-design.md. **Benchmark (2026-07-21):
   desktop T5-T1 flat (2070 is compute-bound); A100 re-profile did NOT
   collapse the idle** (GPU span 10.5 -> 8.8 s, idle ~48% -> ~42%
-  kernels-only). The residual idle turned out to be a per-station cuFFT
-  synchronisation (below), not the host tail the overlap moved - so the
-  overlap is a small net win but the between-subints gap is still there.
+  kernels-only). The residual idle turned out to be a per-station
+  whole-stream drain in `Mk5_GPUMode::unpack_all` (item 0 below), NOT
+  cuFFT as first suspected - see the correction there.
   Analysis: BENCHMARKS.md (A100 cluster profiling), gpu-changes.md.
 
 ## Work queue (underway + future)
 
-0. **Eliminate the per-station cuFFT stream synchronisation (NEW TOP
-   PRIORITY, 2026-07-21).** The A100 re-profile showed the process thread
-   blocks in ~10 `cudaStreamSynchronize`/subint (5.58 s total over the
-   400-subint run) - the single largest source of GPU idle, dwarfing the
-   host tail. The count (and the matched `cuStreamIsCapturing` /
-   `cuLaunchKernel` counts) pins it on cuFFT: `runFFT()` ->
-   `cufftExecC2C()` appears to synchronise the compute stream on every
-   call, one per (station, subint), serialising host and GPU exactly where
-   the tail-overlap pipeline is trying to keep them concurrent. **First
-   confirm the mechanism** (nsys `--cudabacktrace=sync` or ncu, or a quick
-   bisect: comment the FFT and watch the syncs vanish), then remove it.
-   Candidate fixes, cheapest first: (a) give each plan its own explicit
-   work area - `cufftSetAutoAllocation(fft_plan, false)` +
-   `cufftSetWorkArea` with a per-Mode buffer allocated once in the
-   constructor (the plans are built with default auto-allocation today at
-   gpumode.cu ~451, and a shared/managed cuFFT work area is a known cause
-   of per-exec syncs); (b) batch the 10 per-station FFTs into fewer plans /
-   a single larger `cufftPlanMany` so there are fewer plan switches; (c) if
-   cuFFT insists on syncing, replace it with a hand-rolled or cuFFTDx FFT
-   on the stream. This attacks the idle directly and is the prerequisite
-   for the tail-overlap pipeline to actually pay off. Verify with the
-   Synthetic CPU-vs-GPU suite and re-run benchprof-profile.sbatch.
+0. **DONE (2026-07-22): eliminate the per-station whole-stream drain in
+   `Mk5_GPUMode::unpack_all`.** The A100 re-profile showed the process
+   thread blocking in ~10 `cudaStreamSynchronize`/subint (5.58 s on the
+   A100, 13 s on the 2070 - the single largest source of GPU idle).
+   **This was first misattributed to cuFFT** because the sync count matched
+   the `cufftExecC2C` count (both ~1 per station per subint - unpack and the
+   FFT sit in the same per-station tofft iteration). The `utilities/fft-
+   profiling/fftbench.cu` microbenchmark had already shown cuFFT is async on
+   both the 2070 and the A100 cluster; two decisive checks nailed the real
+   source: (i) stubbing out `cufftExecC2C` left the sync count unchanged
+   (4021), (ii) an nsys `--cudabacktrace=sync` stack pointed at
+   `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`. That drain exists
+   only so the host-weights fallback can read `valid_frames` on the host;
+   on the default device path `gpu_set_weights` reads it via `->gpuPtr()`,
+   so the copy+drain is pure overhead. Removing it on the device path broke
+   PIPELINE=1 (weights wrong, cross-baselines garbage) because the drain
+   was also an *implicit barrier*: the four per-mode host-staging buffers
+   (`nearestSamples`, `gFracSampleError`, `gValidFlags`, `gInterpolator`,
+   plus `gValidSamples` on the invalid path) are single-buffered, and the
+   overlap lets the host fill subint N+1's copy while subint N's async H2D
+   from it is still queued behind the GPU backlog. **Fix:** RING-deep
+   (RECEIVE_RING_LENGTH) the HOST side of those buffers (device stays single
+   - device reads are stream-ordered) via `GpuMemHelper::enableHostRing` +
+   `GPUMode::setProcSlot`, then drop the drain on the device path. Result:
+   `cudaStreamSynchronize` 4021 -> 31 (13.1 s -> 0.002 s), PASS CPU-vs-GPU
+   in both pipeline modes + host-weights fallback; desktop T5-T1 flat
+   (compute-bound), A100 wall win to be confirmed on the cluster. cuFFT
+   batching (old fix (b)) is a separate, smaller FFT-efficiency idea, now a
+   future item (see cufftdx note below); it does NOT touch this idle.
+   Design/analysis: gpu-changes.md, BENCHMARKS.md.
 
 1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
    writes the unpacked samples to global memory and the fringe-rotation
@@ -251,6 +259,9 @@ will ease the eventual merge and put GPU code where it belongs:
   Needs an accuracy assessment against the correlator's dynamic range.
 - **Templating the unpack**: Can we make the unpack on the GPU neater 
   (possibly in conjunction with fusing with fringe rotation).
+- **Use cufftdx to fuse the FFT and fractional sample correction**: 
+  If stalls at the end of FFTs continues to be a problem causing 
+  GPU idle time.
 - **Compute/H2D overlap across datastreams (the "Option A / Option B"
   ideas)**: overlap the input H2D with GPU compute - Option A intra-subint
   (datastream j+1's H2D during datastream j's compute), Option B

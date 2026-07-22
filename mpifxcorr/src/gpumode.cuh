@@ -106,6 +106,15 @@ public:
      */
     int process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
                           int numblocks);
+
+    /**
+     * Tell this Mode which procslot (0..RECEIVE_RING_LENGTH-1) the next
+     * process_gpu_tofft belongs to. Selects the RING-deep host-staging slot so
+     * that filling subint N+1's host buffers cannot clobber subint N's still-
+     * in-flight async H2D uploads (the tail-overlap pipeline runs the host ~1
+     * subint ahead of the GPU). Called by GPUCore::issue_tofft.
+     */
+    void setProcSlot(int slot) { procSlot = slot; }
     /**
      * Second half: gpu_sum_weights + gTotalWeight D2H, pcal extraction +
      * copyToHost, fractionalRotation (autocorrelations) + autocorr copyToHost.
@@ -226,6 +235,9 @@ protected:
     //GpuMemHelper<int> *counts_gpu;
 private:
     cufftHandle fft_plan;
+    /// Current procslot (0..RECEIVE_RING_LENGTH-1), set by setProcSlot before
+    /// each process_gpu_tofft; indexes the RING-deep host-staging buffers.
+    int procSlot = 0;
     int pcalResetDataSec = INVALID_SUBINT;
     int pcalResetDataNs = 0;
 

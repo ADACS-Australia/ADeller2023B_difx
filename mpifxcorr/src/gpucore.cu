@@ -966,6 +966,12 @@ GPUCore::issue_tofft(int index, int threadid, int startblock, int numblocks, Mod
         if (scratchspace->dumpkurtosis)
             modes[j]->zeroKurtosis();
 
+        // Tell the Mode which procslot this subint occupies so it stages its
+        // per-subint host uploads into the matching RING-deep host slot - the
+        // overlap issues this tofft while the previous subint's async H2Ds may
+        // still be draining (see GPUMode::enableHostRing / setProcSlot).
+        ((GPUMode *) modes[j])->setProcSlot(index);
+
         // First half of station processing (see process_gpu_afterfft for the rest).
         ((GPUMode *) modes[j])->process_gpu_tofft(0, numblocks, startblock, numblocks);
 

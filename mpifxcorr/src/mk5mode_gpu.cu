@@ -212,11 +212,17 @@ void Mk5_GPUMode::unpack_all(int framestounpack) {
 
 
     
-    // Unfortunately we have to block here since we need the valid frames to find the correct dataweights
-    // OPTIMIZATION: Removed first redundant sync. copyToHost() + single sync waits for both kernel and copy.
-    valid_frames->copyToHost();
-    auto copy_queued = high_resolution_clock::now();
-    valid_frames->sync();  // Single sync waits for kernel and async copy to complete
+    // valid_frames is consumed either on the DEVICE (default: gpu_set_weights
+    // reads valid_frames->gpuPtr() directly, stream-ordered after this unpack)
+    // or on the HOST (only the DIFX_GPU_WEIGHTS_HOST fallback, whose per-window
+    // set_weights() loop reads valid_frames->ptr()). Only the host fallback
+    // needs the D2H copy + whole-stream drain; on the device path both are pure
+    // overhead. This drain was the dominant per-subint GPU idle - one
+    // cudaStreamSynchronize per station per subint (see gpu-profiling notes).
+    if (!GPUMode::useGpuWeights()) {
+        valid_frames->copyToHost();
+        valid_frames->sync();  // Single sync waits for kernel and async copy to complete
+    }
     auto sync_done = high_resolution_clock::now();
     //cudaFree(tmp_mk5stream);
 

@@ -106,7 +106,15 @@ public:
 //              cpuData = nullptr;
 //          }
 //      }
-        if (cpuData) {
+        if (cpuRing) {
+            // Host ring owns all its (pinned, managed) buffers; cpuData just
+            // points at the active one, so free the ring, not cpuData separately.
+            for (int i = 0; i < nHostSlots; i++)
+                if (cpuRing[i]) checkCuda(cudaFreeHost(cpuRing[i]));
+            delete[] cpuRing;
+            cpuRing = nullptr;
+            cpuData = nullptr;
+        } else if (cpuData) {
             if (managed) {
                 checkCuda(cudaFreeHost(cpuData));
                 cpuData = nullptr;
@@ -119,6 +127,29 @@ public:
             checkCuda(cudaFreeAsync(gpuData, cuStream));
             gpuData = nullptr;
         }
+    }
+
+    // Enable RING-deep HOST staging: allocate nSlots pinned host buffers so the
+    // host can fill slot (subint+1) while an async H2D from slot (subint) is
+    // still queued behind the GPU's compute backlog (the tail-overlap pipeline
+    // runs the host ~1 subint ahead). The DEVICE buffer stays single - device
+    // reads are stream-ordered, so only the host source needs duplicating. Call
+    // once after construction on a MANAGED helper (cpuData from cudaMallocHost).
+    void enableHostRing(int nSlots) {
+        if (nSlots <= 1 || cpuRing)
+            return;
+        nHostSlots = nSlots;
+        cpuRing = new T*[nHostSlots];
+        cpuRing[0] = cpuData;   // reuse the ctor's pinned buffer as slot 0
+        for (int i = 1; i < nHostSlots; i++)
+            checkCuda(cudaMallocHost(&cpuRing[i], nBytes));
+    }
+
+    // Select which host-ring slot ptr()/copyToDevice()/copyToHost() act on.
+    // No-op when the ring is not enabled.
+    inline void setHostSlot(int i) {
+        if (cpuRing)
+            cpuData = cpuRing[i % nHostSlots];
     }
 
     inline GpuMemHelper* copyToDevice() {
@@ -154,6 +185,8 @@ private:
     cudaStream_t cuStream;
     bool managed;
     size_t nBytes;
+    T** cpuRing = nullptr;   // RING-deep host staging (see enableHostRing); null = single-buffered
+    int nHostSlots = 1;
 
     void checkCpuData() {
         if (!cpuData) {

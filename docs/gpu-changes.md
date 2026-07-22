@@ -298,3 +298,59 @@ is why wall time barely changed. The overlap is still correct and a small
 net win; the next lever is eliminating the per-station FFT sync (new top
 work-queue item), not fusing kernels. Full analysis: BENCHMARKS.md
 (A100 cluster profiling) and gpu-plan.md.
+
+**CORRECTION (see §9): the "cuFFT is synchronising" conclusion above was
+wrong.** The per-station sync is a whole-stream drain in
+`Mk5_GPUMode::unpack_all`, not cuFFT; the count-match with `cufftExecC2C`
+was a coincidence (unpack and the FFT are in the same per-station tofft
+iteration). cuFFT is async.
+
+## 9. Per-station unpack drain removed; RING-deep host staging (2026-07-22)
+
+The residual per-station idle from §8 was traced to its real source and
+removed. **It was never cuFFT.** Evidence: (i) the
+`utilities/fft-profiling/fftbench.cu` microbenchmark shows `cufftExecC2C`
+returns in ~0 ms after a 50 ms stream backlog on both the 2070 (cuFFT
+12.2) and the A100 cluster (CUDA 12.8) - async, no per-exec sync; (ii)
+stubbing out the `cufftExecC2C` call left the ~4021 `cudaStreamSynchronize`
+(one per station per subint) unchanged; (iii) an nsys `--cudabacktrace=sync`
+stack resolved to `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`.
+
+That `valid_frames->copyToHost() + sync()` exists only so the
+`DIFX_GPU_WEIGHTS_HOST` fallback can read `valid_frames` on the host; on
+the default device path `gpu_set_weights` reads `valid_frames->gpuPtr()`
+directly (stream-ordered after the unpack kernel), so the copy and the
+whole-stream drain are pure overhead. It is now gated behind
+`!useGpuWeights()`.
+
+Removing the drain on the device path broke PIPELINE=1 (weights came out
+fractional - 0.9794 vs 1.0 - and cross-baselines were garbage) because the
+drain doubled as an **implicit barrier**. The four per-mode host-staging
+buffers uploaded each subint - `nearestSamples`, `gFracSampleError`,
+`gValidFlags`, `gInterpolator` (plus `gValidSamples` on the invalid-subint
+path) - are single-buffered. The tail-overlap pipeline runs the host ~1
+subint ahead, so `calculatePre_cpu(N+1)` overwrote a host buffer while
+subint N's tiny async H2D from it was still queued behind the GPU's compute
+backlog, corrupting N's upload (wrong `nearest`/flags -> wrong weights and
+wrong fringe-rotation sample indices). The drain had masked this by
+throttling the host to GPU pace.
+
+**Fix:** `GpuMemHelper` gained an optional RING-deep HOST buffer
+(`enableHostRing(n)` + `setHostSlot(i)`); the device buffer stays single
+(device reads are stream-ordered). `GPUMode` RING-deeps the five staging
+buffers to `RECEIVE_RING_LENGTH` and selects the slot per subint via
+`setProcSlot` (called from `GPUCore::issue_tofft` with the procslot index).
+`gInterpolator` changed from wrapping the `interpolator[]` member to a
+managed helper (its host slot is filled by `memcpy` each subint).
+Additional pinned host memory: ~3 KB (benchprof), <1 MB worst case.
+
+**Result:** `cudaStreamSynchronize` 4021 -> 31 (13.1 s -> 0.002 s on the
+2070). PASS CPU-vs-GPU (usb, usb-complex, complex-complex, multi) in BOTH
+pipeline modes AND the `DIFX_GPU_WEIGHTS_HOST` fallback. Desktop T5-T1 flat
+(23.7 s pipeline=1 / 22.9 s pipeline=0 - the 2070 is compute-bound +
+oversubscribed, so the removed host-serialisation has no idle to convert);
+the A100 wall win (the 5.58 s of idle) is to be confirmed on the cluster.
+Files: `gpumode_kernels.cuh` (GpuMemHelper host ring), `gpumode.cu`/`.cuh`
+(procSlot + ring setup + gInterpolator staging), `gpucore.cu` (setProcSlot
+in issue_tofft), `mk5mode_gpu.cu` (gate the drain). Full analysis:
+gpu-plan.md work-queue item 0.

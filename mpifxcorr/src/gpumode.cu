@@ -1,4 +1,5 @@
 #include "gpumode.cuh"
+#include "core.h"   // Core::RECEIVE_RING_LENGTH for the host-staging ring depth
 #include "alert.h"
 #include <cuda_runtime.h>
 #include <string>
@@ -350,7 +351,12 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     gValidSamples = new GpuMemHelper<bool>(cfg_numBufferedFFTs, cuStream);
 
 
-    gInterpolator = new GpuMemHelper<double>(interpolator, 3, cuStream);
+    // gInterpolator was previously constructed wrapping the host interpolator[]
+    // member (register-an-existing-pointer ctor). It is now a managed helper so
+    // it can carry a RING-deep host staging buffer (see enableHostRing below);
+    // process_gpu_tofft copies interpolator[] into its active host slot each
+    // subint before uploading.
+    gInterpolator = new GpuMemHelper<double>(3, cuStream);
     gFracSampleError = new GpuMemHelper<float>(cfg_numBufferedFFTs, cuStream);
     gLoFreqs = new GpuMemHelper<double>(numrecordedbands, cuStream);
     counts_gpu = new GpuMemHelper<int>(numrecordedfreqs, cuStream); 
@@ -468,6 +474,21 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
 
     // precalc
     nearestSamples = new GpuMemHelper<int>(cfg_numBufferedFFTs, cuStream);
+
+    // RING-deep the HOST side of every per-subint host-staging buffer that the
+    // device path uploads. The tail-overlap pipeline (DIFX_GPU_PIPELINE=1) runs
+    // the host ~1 subint ahead, so subint N+1 fills these host buffers while
+    // subint N's tiny async H2D from them may still be queued behind the GPU's
+    // compute backlog. Without per-slot host buffers, N+1's fill corrupts N's
+    // upload (was masked by the whole-stream drain in Mk5_GPUMode::unpack_all,
+    // now removed on the device path). Device buffers stay single: device reads
+    // are stream-ordered. RECEIVE_RING_LENGTH-deep matches the procslot ring.
+    nearestSamples->enableHostRing(Core::RECEIVE_RING_LENGTH);
+    gFracSampleError->enableHostRing(Core::RECEIVE_RING_LENGTH);
+    gInterpolator->enableHostRing(Core::RECEIVE_RING_LENGTH);
+    gValidFlags->enableHostRing(Core::RECEIVE_RING_LENGTH);
+    gValidSamples->enableHostRing(Core::RECEIVE_RING_LENGTH);
+
     checkCuda(cudaStreamSynchronize(cuStream));
 
     // Cross-check the start-up VRAM estimator against what was actually
@@ -788,6 +809,16 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
         checkCuda(cudaEventCreate(&ev_frac));
     }
 
+    // Select this subint's RING-deep host-staging slot before any host write to
+    // / upload from these buffers (invalid-subint path, calculatePre_cpu, the
+    // device set_weights block). Keeps subint N+1's host fills off subint N's
+    // in-flight async H2D source buffers under tail-overlap. See enableHostRing.
+    nearestSamples->setHostSlot(procSlot);
+    gFracSampleError->setHostSlot(procSlot);
+    gInterpolator->setHostSlot(procSlot);
+    gValidFlags->setHostSlot(procSlot);
+    gValidSamples->setHostSlot(procSlot);
+
 
 
     // Copy packed data to device, needed to refactor this since we moved packed data allocation to the constructor.
@@ -894,7 +925,10 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
     // (The temp_autocorrelations device reset moves to process_gpu_afterfft,
     // immediately before fractionalRotation accumulates into it.)
 
-    // Update the interpolator
+    // Update the interpolator: gInterpolator is now a managed helper with a
+    // RING-deep host buffer, so stage the current interpolator[] into its active
+    // host slot before uploading (previously it wrapped interpolator[] directly).
+    memcpy(gInterpolator->ptr(), interpolator, 3 * sizeof(double));
     gInterpolator->copyToDevice();
     cudaEventRecord(ev_copy1, cuStream);
 

@@ -1,9 +1,10 @@
 # GPU correlator profiling — method & reference numbers
 
 How to profile the GPU idle, and the reference numbers from the
-2026-07-21 A100 investigation that found the between-subints idle is a
-per-station cuFFT synchronisation (not the host tail). Companion to
-`gpu-plan.md` (what to do next) and `BENCHMARKS.md` (the ledger).
+2026-07-21/22 A100 investigation that found the between-subints idle is a
+per-station whole-stream drain in `Mk5_GPUMode::unpack_all` (first
+misattributed to cuFFT — see the corrected finding below; fixed 2026-07-22).
+Companion to `gpu-plan.md` (what to do next) and `BENCHMARKS.md` (ledger).
 
 ## How to capture
 
@@ -75,29 +76,45 @@ station_processing ~446 us, host_finalize ~337 us; set_weights /
 calculatePre_cpu / h2d_stage fire ~10×/subint at tens of us each. The
 whole host tail is ~900 us/subint — small.
 
-### The finding: per-station cuFFT stream sync
+### The finding: per-station whole-stream drain in `unpack_all` (NOT cuFFT)
 
 The process (kernel-issuing) thread spends **5.58 s in
-`cudaStreamSynchronize`** — 3947 calls ≈ **10 per subint**, one per
-station. The count matches cuFFT's per-`cufftExecC2C` driver footprint
-exactly: `cuStreamIsCapturing` (3948), driver `cuLaunchKernel` (3948),
-`cudaStreamSynchronize` (3947), all ≈ 10 stations × 400 subints. So
-**cuFFT synchronises the compute stream on every FFT exec**, serialising
-host and GPU at station granularity. Per subint: the first sync (in the
-tofft loop) backs up behind the whole XMAC phase (~7 ms); the other nine
-each wait one station's kernels (~720 us).
+`cudaStreamSynchronize`** (A100; ~13 s on the 2070) — ~3947 calls ≈ **10
+per subint**, one per station. Per subint: the first sync (in the tofft
+loop) backs up behind the whole XMAC phase (~7 ms); the other nine each
+wait one station's kernels (~720 us).
 
-Corroboration: our device-path source has **no** per-subint sync (every
-`GpuMemHelper::sync()` / explicit `cudaStreamSynchronize` in gpumode.cu /
-gpucore.cu is one-time setup or gated on `!useGpuWeights()` / SPECDEBUG,
-and pipelining was ENABLED). The Core **main** thread's 6.2 s of
-`pthread_mutex_lock` (waiting to reuse a procslot) is a *symptom* — it
-waits on the FFT-sync-throttled process thread — not the cause. cuFFT
-plans are built with default auto work-area allocation (gpumode.cu ~451,
-`cufftPlanMany` + `cufftSetStream`, no `cufftSetAutoAllocation` /
-`cufftSetWorkArea`), a known trigger for per-exec syncs.
+**First misattributed to cuFFT** because the count matched
+`cufftExecC2C`'s footprint (`cuStreamIsCapturing` 3948, driver
+`cuLaunchKernel` 3948, `cudaStreamSynchronize` 3947). That match was a
+coincidence — unpack and the FFT are in the same per-station tofft
+iteration. **The real source is `Mk5_GPUMode::unpack_all` ->
+`valid_frames->sync()`**, established three ways (2026-07-22):
 
-Consequence for the plan: the host-tail overlap (7b8e31104) could not
-collapse this idle because the tail was never the bottleneck. Killing the
-FFT sync is work-queue item 0 in `gpu-plan.md`; kernel fusion (item 1)
-only attacks the ~14 ms/subint busy half and is deferred behind it.
+1. `utilities/fft-profiling/fftbench.cu` — a faithful standalone cuFFT
+   microbench — shows `cufftExecC2C` returns ~0 ms after a 50 ms stream
+   backlog on both the 2070 (cuFFT 12.2) and the A100 (CUDA 12.8): async,
+   no per-exec sync.
+2. Stubbing out the `cufftExecC2C` call left the sync count unchanged
+   (4021 on the 2070).
+3. `nsys profile --sample=cpu --backtrace=dwarf --cudabacktrace=sync:1000`
+   then joining `CUDA_CALLCHAINS` (stackDepth) to the sync rows resolves the
+   caller to `Mk5_GPUMode::unpack_all`.
+
+To find a sync's caller: run with `--cudabacktrace=sync` **and**
+`--sample=cpu` (the unwinder needs sampling active; `--sample=none` leaves
+`callchainId=0`), export sqlite, then
+`SELECT sd.value, mo.value FROM CUPTI_ACTIVITY_KIND_RUNTIME r JOIN
+CUDA_CALLCHAINS c ON c.id=r.callchainId JOIN StringIds sd ON c.symbol=sd.id
+JOIN StringIds mo ON c.module=mo.id WHERE ... ORDER BY c.stackDepth`. Also
+useful: `CUPTI_ACTIVITY_KIND_SYNCHRONIZATION.syncType` (via
+`ENUM_CUPTI_SYNC_TYPE`) tells stream-sync vs event-sync vs wait-event.
+
+The drain existed only so the `DIFX_GPU_WEIGHTS_HOST` fallback could read
+`valid_frames` on the host; on the device path `gpu_set_weights` reads
+`valid_frames->gpuPtr()` directly. **Fixed 2026-07-22** (gpu-changes.md
+§9): gated to the fallback, with RING-deep host staging so the tail-overlap
+pipeline stays correct without the drain's implicit barrier.
+`cudaStreamSynchronize` dropped 4021 -> 31. The Core **main** thread's
+`pthread_mutex_lock` time was a *symptom* (waiting on the drain-throttled
+process thread), not a separate cause.

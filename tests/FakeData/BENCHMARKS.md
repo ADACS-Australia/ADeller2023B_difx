@@ -30,6 +30,8 @@ Rules:
 | 2026-07-21 | 80f6e291a | gpu | 12.7 | 35.6 | 22.9 | fringe-rotation interpolator hoisted out of the per-sample loop (~29%) |
 | 2026-07-21 | 7b8e31104 | gpu | 12.8 | 35.6 | 22.8 | host-tail overlap (intra-subint half-split); flat on the 2070 |
 | 2026-07-21 | 7b8e31104 | gpu DIFX_GPU_PIPELINE=0 | 12.7 | 35.3 | 22.6 | synchronous, no overlap; ≈ pipeline=1 ⇒ no idle to hide on the 2070 (GPU-compute-bound). The overlap targets the ~48% idle measured on the A100, so the win is expected on the cluster re-profile, not here. |
+| 2026-07-22 | (unpack-drain fix) | gpu DIFX_GPU_PIPELINE=1 | 11.8 | 35.5 | 23.7 | RING-deep host staging + drop per-station `unpack_all` drain; `cudaStreamSynchronize` 4021→31 (13.1 s→0.002 s). Flat on the 2070 (compute-bound + oversubscribed ⇒ no idle to convert). A100 wall win TBC on the cluster. |
+| 2026-07-22 | (unpack-drain fix) | gpu DIFX_GPU_PIPELINE=0 | 12.6 | 35.5 | 22.9 | same build, no overlap; ≈ pipeline=1 on the 2070. |
 
 ## A100 cluster profiling (benchprof-profile.sbatch, 400 subints, 10 stations)
 
@@ -55,6 +57,17 @@ Synchronize` all ~3948). cuFFT is synchronising the compute stream on
 every FFT exec, serialising host and GPU at station granularity. The
 host tail the overlap moved (~900 us/subint) was never the bottleneck.
 See gpu-plan.md work queue.
+
+**CORRECTION (2026-07-22): the sync is NOT cuFFT.** The
+`cudaStreamSynchronize` count matched `cufftExecC2C` only because unpack
+and the FFT sit in the same per-station tofft iteration. cuFFT is async
+(the fftbench probe returns ~0 ms after a 50 ms backlog on this A100);
+stubbing the FFT left the sync count unchanged; an nsys sync-backtrace
+resolved the caller to `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`.
+Removed on the device path (gated to the host-weights fallback) with
+RING-deep host staging to keep the tail-overlap safe - see gpu-changes.md
+§9 and gpu-plan.md work-queue item 0. This A100 profile should be re-run
+to confirm the idle now converts to wall-time.
 
 ## Pre-protocol reference points (15 s of data, tInt 2 s, whole-run wall)
 
