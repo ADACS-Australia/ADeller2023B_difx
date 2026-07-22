@@ -4,7 +4,6 @@
 #SBATCH --output=benchprof-profile.%j.mpilog
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
-#SBATCH --exclusive
 #SBATCH --gres=gpu:1
 #SBATCH --mem-per-cpu=4000
 #SBATCH --time=15:00
@@ -36,7 +35,7 @@ WORKDIR=/fred/oz168/adeller/claude/testing/benchprof        # scratch, shared fi
 # -----------------------------------------------------------------------------
 
 . "$SETUP"
-module load nsight-systems 2>/dev/null || true              # ensure nsys is on PATH
+module load nsight-systems/2022.2.1 2>/dev/null || true              # ensure nsys is on PATH
 
 # Restrict difxmessage multicast to this node so parallel jobs don't cross-talk.
 export DIFX_MESSAGE_GROUP=$(hostname -i)
