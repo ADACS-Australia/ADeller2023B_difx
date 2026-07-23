@@ -47,14 +47,19 @@ class Mk5_GPUMode : public GPUMode
   virtual ~Mk5_GPUMode();
 
   protected:
- /** 
-   * Uses mark5access library to unpack multiplexed, quantised data into the separate float arrays
-   * @return The fraction of samples returned
-   * @param sampleoffset The offset in number of time samples into the data array
-   * @param subloopindex The "subloop" index that is currently being unpacked for (need to know to save weights in the right place)
+ /**
+   * Compute per-frame validity (valid_frames) for this subint using the
+   * mark5access blanker. The actual sample decode is fused into the fringe
+   * rotation (launchFusedRotate), so this is all that survives of the old
+   * unpack_all. @param framestounpack Number of frames in the delivered buffer.
   */
-    virtual float unpack(int sampleoffset, int subloopindex);
-    virtual void unpack_all(int framestounpack);
+    void blankFrames(int framestounpack) override;
+ /**
+   * Launch the fused decode + fringe-rotation kernel (needs the mark5_stream and
+   * packed data to decode samples on the fly; folds in phase cal when active).
+  */
+    void launchFusedRotate(dim3 grid, dim3 block, int fftloop, int startblock,
+                           int numblocks, int framestounpack) override;
 
     int framesamples, framebytes, samplestounpack, fanout;
     struct mark5_stream *mark5stream;

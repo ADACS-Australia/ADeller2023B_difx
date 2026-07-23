@@ -31,36 +31,31 @@ family ~45%, unpack 24%, fused XMAC 16%, FFT 8%, weights ~7% (FP64 cheap
 there, so precision work leans on the 2070).
 
 Completed work has moved to `gpu-changes.md`; the queue below is what remains.
+Recently landed and no longer in the queue: the **unpack+fringe fusion**
+(2026-07-23, gpu-changes.md §12 — unpack now decodes straight from packed data
+inside the fringe kernel, no unpacked-buffer round-trip, pcal folded in via
+`template<bool DOPCAL>`; 2070 T5-T1 14.0→12.3, ~12%, larger A100 gain
+expected), and the **fractional-sample-correction investigation** (2026-07-22,
+§11 — left fused, no change).
 
-**Next action: item 1 (fuse unpack + fringe rotation).** Item 4 was investigated
-and closed with no change (memory-bound, already optimal fused). The remaining
-GPU-busy targets are item 1 (unpack+fringe fusion, the largest kernel on the
-cluster) and item 8 (occupancy audit, incl. the `<<<1,1>>>` `gpu_sum_weights`).
+**Next GPU-busy targets:** the occupancy audit (item 6, incl. the `<<<1,1>>>`
+`gpu_sum_weights`) and the FP16 / precision-drop items (items 1, 2) that build
+on the fused decode. (The DataStream corner-turn above remains the real
+production bottleneck — see Longer-term.)
 
 ## Work queue (underway + future)
 
-1. **Fuse the unpack and fringe-rotation kernels.** Today `gpu_unpack`
-   writes the unpacked samples to global memory and the fringe-rotation
-   kernel reads them straight back; fusing keeps samples in
-   registers/shared memory and saves that global-memory round-trip.
-   Motivated by the 2026-07-21 profiles: `gpu_unpack` is the single
-   largest kernel on the cluster (34.9% of GPU time vs 19.9% on the 2070)
-   now that fringe rotation is cheap on fast-FP64 cards, so the memory
-   round-trip between them is the thing to cut. Fusing also removes two
-   kernel launches per (datastream, subint) - a minor secondary benefit
-   (launch overhead is only ~3-4% of host time). Interacts with the FP16
-   and precision-drop items below. NOTE: this attacks GPU-busy time, which
-   is not the current bottleneck (see "Where we are").
-2. **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
+1. **Optional FP16 unpack + fringe rotation** (with 16-bit -> 32-bit
    FFT): an opt-in reduced-precision path that carries the unpacked
    samples and the fringe rotation in FP16, with the FFT taking FP16 in
    and producing FP32 output. Roughly halves the memory traffic for those
    stages (and the compute on cards with fast FP16). Needs an accuracy
    assessment against the correlator's dynamic range; gated so the
    full-precision path stays the default. Combines naturally with the
-   kernel fusion (item 1), and subsumes the per-sample precision drop
-   (item 3) - if FP16 lands, item 3 is moot.
-3. **Fringe-rotation per-sample precision drop** (follow-up to the
+   completed unpack+fringe fusion (gpu-changes.md §12 — the fused decode is
+   its natural seam), and subsumes the per-sample precision drop (item 2) -
+   if FP16 lands, item 2 is moot.
+2. **Fringe-rotation per-sample precision drop** (follow-up to the
    completed hoisting; changes results at FP level, so its own accuracy
    check; a cheaper stepping-stone that the FP16 item above would
    subsume). After the hoisting, the per-sample math is `exponent =
@@ -75,37 +70,28 @@ cluster) and item 8 (occupancy audit, incl. the `<<<1,1>>>` `gpu_sum_weights`).
    else is float (the precompute can then emit `bigB_reduced` as float
    too, halving the gBigBred traffic). Not bit-identical; validate with
    diffDiFX/SPECDEBUG.
-4. **DONE (investigated 2026-07-22, no change made): fractional sample
-   correction / `gpu_resultsrotatorMultiply`.** It runs ~2× a fringe-rotation
-   kernel, but that is because it is **memory-bound**, not because of the
-   autocorr index math (that guess was wrong). It is already optimal as a
-   **single fused pass** (rotate → conjugate → autocorrelate while the sample
-   is hot in registers/L1). Two changes were tried and both rejected on a
-   clean build: (a) splitting it into rotate/conj + autocorr kernels is ~2×
-   SLOWER (the autocorr kernels re-read fftd/conj COLD from global — fission
-   breaks the single-pass locality); (b) a `gFracSlope` precompute is
-   NEUTRAL (14.2 vs 14.4 s — the kernel isn't ALU-bound, so hoisting the FP64
-   recompute buys nothing). Left fused as-is. See gpu-changes.md.
-5. **perbandweights on GPU** — currently unused on the GPU path but
+3. **perbandweights on GPU** — currently unused on the GPU path but
    should be active, in analogy with CPUMode/Mk5Mode's interlaced-VDIF
    handling (identified in the de-serialization design review). Shape
    the device weights kernel (de-serialization Increment 1) so
    per-(window, band) weights are a natural extension.
-6. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
-7. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
+4. **LSB on GPU** — unblocks the lsb/lsb-complex/dsb scenarios.
+5. **CODIF on GPU** — format-aware frame-validity hook (FIXME in
    `blanker_vdif_gpu`) + widen the `getMode` format gate. MUST add the
    `datalengthbytes <= getMaxDataBytes` clamp in `process_gpu` first:
    non-VDIF datastreams keep the base class's guard-scaled sendbytes,
    which can exceed the packed-data buffer (latent, unreachable today).
-8. **Kernel launch-configuration / occupancy audit.** Verify every GPU
+6. **Kernel launch-configuration / occupancy audit.** Verify every GPU
    kernel launches an appropriate grid/block size - enough threads to
    fill the device, a block shape with good occupancy, and no accidental
    under- or over-subscription. Several kernels were written with ad-hoc
-   launch dims (one thread per (window, band, channel) in fringe rotation;
-   one thread per accumulator in the weight reductions; single-thread
-   reductions like `gpu_sum_weights`); check each with nsys/`ncu` and fix
-   any that are badly sized. Cheap, and a natural companion to the
-   fusion/occupancy work in items 1-3.
+   launch dims (one thread per (window, band, channel) in the fused
+   decode+fringe kernel; one thread per accumulator in the weight
+   reductions; single-thread reductions like the `<<<1,1>>>`
+   `gpu_sum_weights`); check each with nsys/`ncu` and fix any that are
+   badly sized. Cheap, and a natural companion to the fused-decode and
+   precision work (items 1-2). (The old unpack-layout question is moot -
+   `gpu_unpack` was deleted in the fusion.)
 
 ## Standing process (adopted 2026-07-18)
 
@@ -173,8 +159,6 @@ will ease the eventual merge and put GPU code where it belongs:
   complex GEMM at heart, a natural tensor-core target (Turing: FP16
   multiply / FP32 accumulate; data-centre cards add TF32/FP64 paths).
   Needs an accuracy assessment against the correlator's dynamic range.
-- **Templating the unpack**: Can we make the unpack on the GPU neater 
-  (possibly in conjunction with fusing with fringe rotation).
 - **Use cufftdx to fuse the FFT and fractional sample correction**: 
   If stalls at the end of FFTs continues to be a problem causing 
   GPU idle time.
@@ -192,4 +176,7 @@ will ease the eventual merge and put GPU code where it belongs:
   dedicated H2D stream, no double-buffering).
 - NUMA/affinity audit (mattered on the cluster, less on the desktop).
 - Profile the fftsPerChunk XMAC grid split if atomics show up.
-- GPU pcal regression coverage (currently untested by diffDiFX).
+- GPU pcal regression coverage (currently untested by diffDiFX; now also
+  covers the pcal-fused `DOPCAL` path added in the unpack+fringe fusion,
+  which is validated by construction/review only - the agreed follow-up is a
+  phaseCalInt>0 synthetic scenario for run-local.sh).

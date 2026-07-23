@@ -432,3 +432,69 @@ XMAC-atomic noise — use a looser threshold or it reads as failure.)
 memory-bound and already optimal as a single fused pass; splitting it is ~2×
 slower (cold global re-reads) and a `gFracSlope` precompute is neutral. Left
 fused. See gpu-plan.md item 4.
+
+## 12. Fused unpack + fringe rotation (2026-07-23)
+
+**What changed (gpu-plan.md item 1).** The GPU station path used to run two
+kernels back to back: `gpu_unpack` decoded every sample into a global
+per-band unpacked buffer (`unpackeddata_gpu` / `complex_unpackeddata_gpu`),
+and `gpu_fringeRotation` immediately read those samples straight back to apply
+the fringe rotator. That is a full global-memory round-trip of the largest
+data array in the pipeline, and `gpu_unpack` was the single largest kernel on
+the cluster (24.5–34.9% of GPU time; ~20% on the 2070). The two kernels are
+now **fused** into one (`gpu_fused_fringe` / `gpu_fused_fringe_complex`, in
+`gpudecode.cu`): each thread owns one (FFT window, band, channel), decodes
+exactly the one sample it needs directly from the packed VDIF frame payload
+into a register, applies the precomputed rotator and writes the complex FFT
+input. **No unpacked buffer, no round-trip** — the unpacked-sample buffers and
+their pointer arrays are gone entirely (also freeing that VRAM).
+
+**Phase cal fused in too.** The standalone `gpu_pcalextraction` kernel read
+the same raw unpacked samples; its only real work was folding each sample into
+a phase-cal bin (the offset/phase assembly is host-side). That folding is now
+done inside the fused kernel, gated by a `template<bool DOPCAL>` so the common
+(pcal-off) instantiation compiles all of it away. `gpu_unpack`, the unpacked
+buffers, the tail-zeroing memset, and the standalone pcal kernels were all
+deleted, so there is no reason left to keep or optimise the old unpack layout
+(gpu-plan.md item 1's "templating the unpack" and the layout half of item 8
+are moot).
+
+**Design / structure.**
+- `decode_one_gpu` / `decode_one_complex_gpu` (device primitives) are the
+  per-(band, sample) decode extracted from the old `mk5_decode_sample_gpu`;
+  same bit-offset arithmetic, so the decoded values are identical.
+- `gpu_blank_frames` (one thread per frame, runs the existing
+  `blanker_vdif_gpu`) produces `valid_frames`, which used to be a by-product
+  of `gpu_unpack`. `gpu_set_weights` and the fused kernel both read it.
+- Blanking/tail parity: a sample whose frame is invalid (`!valid_frames`) or
+  past the delivered data (`frame >= framestounpack`) decodes to 0 — exactly
+  what the old per-frame blankzone zeroing and the explicit unpacked-tail
+  memset produced.
+- The fused launch needs the `mark5_stream`/packed data, so it lives in
+  `Mk5_GPUMode` behind two new virtuals (`blankFrames`, `launchFusedRotate`);
+  the format-agnostic per-(window,band) coefficient precompute
+  (`gpu_precompute_fringe_rotator`) stays in `GPUMode::fringeRotation`. This
+  matches the direction of the planned Mk5Mode virtual-hierarchy refactor.
+- Kernels + the four template instantiations live in `gpudecode.cu` (with the
+  mark5access includes and decode LUTs); `mk5mode_gpu.cu` calls them through
+  plain `launch_*` wrappers declared in `gpudecode.cuh`.
+
+**Correctness.** run-local.sh usb / usb-complex / complex-complex / multi PASS
+CPU-vs-GPU in BOTH pipeline modes, and PASS again under the
+`DIFX_GPU_WEIGHTS_HOST=1` fallback (which `blankFrames` still lands
+`valid_frames` on the host for). An independent line-by-line parity review
+against the old kernels found no correctness divergence (bit layout, per-frame
+validity, tail zeroing, rotator constant `TWO_PI`, and the pcal bin residue
+all match). The pcal-fused path itself is exercised by no test (phaseCalInt=0
+everywhere, as before) and is validated by construction/review only — a
+phaseCalInt>0 regression test is the agreed follow-up.
+
+**Benchmark (2070, T5−T1, single-thread VDIF).** 14.0 s → **12.3 s (~12%)** —
+the busy-half win expected from removing the round-trip. The A100 gain should
+be larger since `gpu_unpack` was a bigger fraction there. See BENCHMARKS.md.
+
+**Not addressed (deliberately):** the fused decode still reads the packed byte
+per thread (good locality: consecutive channels are consecutive time samples
+in one band's bitstream) but the FP16 path (item 2), per-sample precision drop
+(item 3), and the occupancy audit (item 8, e.g. `gpu_sum_weights` `<<<1,1>>>`)
+remain open.

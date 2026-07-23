@@ -64,7 +64,7 @@ Mk5_GPUMode::Mk5_GPUMode(Configuration * conf, int confindex, int dsindex, int r
         this->framesamples = mark5stream->framesamples;
       }
       /*
-      * Currently not using perbandweights - to be added 
+      * Currently not using perbandweights - to be added
       */
       /*
       if(format == Configuration::INTERLACEDVDIF)
@@ -95,146 +95,51 @@ Mk5_GPUMode::~Mk5_GPUMode()
   }
 }
 
-float Mk5_GPUMode::unpack(int sampleoffset, int subloopindex)
+// Compute per-frame validity (valid_frames) for this subint - one GPU thread
+// per frame runs the VDIF blanker. This is all that survives of the old
+// unpack_all: the actual sample decode is fused into the fringe rotation
+// (launchFusedRotate below), which decodes straight from the packed payload.
+void Mk5_GPUMode::blankFrames(int framestounpack)
 {
-  float goodsamples = 0;
-  int mungedoffset = 0;
+  const int tpb = 256;
+  launch_blank_frames(
+      dim3((framestounpack + tpb - 1) / tpb), dim3(tpb), cuStream,
+      *mark5stream, packeddata_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
 
-  //work out where to start from
-
-  unpackstartsamples = sampleoffset - (sampleoffset % mark5stream->samplegranularity);
-
-  //unpack one frame plus one FFT size worth of samples
-  //if(usecomplex) 
-  //{
-  //  NOT_SUPPORTED("unpack - usecomplex");
-  //}
-  if(mark5stream->samplegranularity > 1)
-    { // CHRIS not sure what this is mean to do
-      // WALTER: unpacking of some mark5 modes (those with granularity > 1) must be unpacked not as individual samples but in groups of sample granularity
-    int erasedsamples = 0;
-
-    mungedoffset = sampleoffset % mark5stream->samplegranularity;
-    for(int i = 0; i < mungedoffset; i++) {
-      for(int b = subloopindex * numrecordedbands; b < subloopindex * numrecordedbands + mark5stream->nchan; ++b) {
-        if(unpackedarrays_gpu->ptr()[b][i] != 0.0) {
-            unpackedarrays_gpu->ptr()[b][i] = 0.0;
-          erasedsamples++;
-        }
-      }
-    }
-    for(int i = unpacksamples + mungedoffset; i < samplestounpack; i++) {
-      for(int b = subloopindex * numrecordedbands; b < subloopindex * numrecordedbands + mark5stream->nchan; ++b) {
-        if(unpackedarrays_gpu->ptr()[b][i] != 0.0) {
-            unpackedarrays_gpu->ptr()[b][i] = 0.0;
-          erasedsamples++;
-        }
-      }
-    }
-    goodsamples -= erasedsamples/(float)(mark5stream->nchan);
+  // Host-weights fallback (DIFX_GPU_WEIGHTS_HOST=1): set_weights() reads
+  // valid_frames on the host, so land it and drain - the historic behaviour the
+  // old unpack_all provided. The device-weights path reads valid_frames->gpuPtr()
+  // directly (stream-ordered after this kernel), so no copy/drain is needed there.
+  if (!GPUMode::useGpuWeights()) {
+    valid_frames->copyToHost();
+    valid_frames->sync();
   }
-  if(perbandweights)
-  {
-      //if(usecomplex)
-      //{
-      //    NOT_SUPPORTED("unpack - usecomplex");
-      //}
-      //else
-      //{
-      //    blank_vdif_EDV4(data, unpackstartsamples, &unpackedarrays_gpu->ptr()[subloopindex * numrecordedbands], samplestounpack, invalid);
-      //}
-      blank_vdif_EDV4(data, unpackstartsamples, &unpackedarrays_gpu->ptr()[subloopindex * numrecordedbands], samplestounpack, invalid);
-      int totalinvalid = 0;
-      for(int b = 0; b < mark5stream->nchan; ++b)
-      {
-          perbandweights[subloopindex][b] = (goodsamples - invalid[b])/(float)unpacksamples;
-          totalinvalid += invalid[b];
-      }
-
-      goodsamples -= (float)totalinvalid/(float)(mark5stream->nchan);
-  }
-
-  if(goodsamples < 0)
-  {
-    cerror << startl << "Error trying to unpack Mark5 format data at sampleoffset " << sampleoffset << " from data seconds " << datasec << " plus " << datans << " ns!!!" << endl;
-    goodsamples = 0;
-    for(int b = 0; b < mark5stream->nchan; ++b)
-      invalid[b] = 0;
-  }
-
-  return goodsamples/(float)unpacksamples;
 }
 
-void Mk5_GPUMode::unpack_all(int framestounpack) {
-  
-    auto total_start = high_resolution_clock::now();
-   
-    // Hacky little workaround to get the stream struct back !! May not be needed !!
-    //mark5_stream *tmp_mk5stream;
-    //cudaMallocManaged(&tmp_mk5stream, sizeof(mark5_stream));
-    //*tmp_mk5stream = *mark5stream;
-    
-    auto setup_done = high_resolution_clock::now();
-    
+// Launch the fused decode + fringe-rotation kernel. Lives here (not in
+// GPUMode::fringeRotation) because it needs the mark5_stream and packed data to
+// decode samples on the fly. When phase cal is active the same kernel folds the
+// raw samples into pcal_output (the DOPCAL template path); otherwise the pcal
+// arguments are unused.
+void Mk5_GPUMode::launchFusedRotate(dim3 grid, dim3 block, int fftloop,
+                                    int startblock, int numblocks, int framestounpack)
+{
+  const bool dopcal = (config->getDPhaseCalIntervalMHz(configindex, datastreamindex) != 0);
+  void *pcalout = nullptr;
+  const int *nbins = nullptr;
+  if (dopcal) {
+    pcalout = usecomplex ? (void *)pcal_output_complex->gpuPtr()
+                         : (void *)pcal_output_real->gpuPtr();
+    nbins = N_pcal_bins->gpuPtr();
+  }
 
-    // 2D block: x=frames, y=samples
-    dim3 unpack_threads(32, 32);  // 1024 threads/block, tunable
-    dim3 unpack_blocks(
-        (framestounpack + unpack_threads.x - 1) / unpack_threads.x,
-        (framesamples + unpack_threads.y - 1) / unpack_threads.y
-    );
-
-    //std::cout << "framesamples: " << framesamples << ", framestounpack: " << framestounpack << std::endl; 
-    // unpackstartsamples may be needed for pcal extractions
-    int sampleoffset = datasamples;
-
-
-    size_t maxframes = config->getMaxDataBytes() / config->getMultiplexedFrameBytes(configindex, datastreamindex);
-    //    std::cout << "DS=" << datastreamindex
-    //      << " framestounpack=" << framestounpack
-    //      << " maxframes="      << maxframes
-    //      << " framesamples="   << framesamples
-    //      << " numrecordedbands=" << numrecordedbands
-    //      << " ms.nchan="       << mark5stream->nchan
-    //      << std::endl;
-    
-    // This will need to know which if any of the bands are LSB.
-    // This will presumably need to be passed in as a vector of bools, one per band, based on info in Config
-    auto kernel_start = high_resolution_clock::now();
-    if (usecomplex) {
-      gpu_unpack_complex<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), complex_unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
-    } else {
-      gpu_unpack<<<unpack_blocks, unpack_threads, 0, cuStream>>>(*mark5stream, packeddata_gpu->gpuPtr(), unpackedarrays_gpu->gpuPtr(), framestounpack, valid_frames->gpuPtr());
-    }
-    auto kernel_queued = high_resolution_clock::now();
-
-    //valid_frames->sync();  // Explicit sync
-
-
-    
-    // valid_frames is consumed either on the DEVICE (default: gpu_set_weights
-    // reads valid_frames->gpuPtr() directly, stream-ordered after this unpack)
-    // or on the HOST (only the DIFX_GPU_WEIGHTS_HOST fallback, whose per-window
-    // set_weights() loop reads valid_frames->ptr()). Only the host fallback
-    // needs the D2H copy + whole-stream drain; on the device path both are pure
-    // overhead. This drain was the dominant per-subint GPU idle - one
-    // cudaStreamSynchronize per station per subint (see gpu-profiling notes).
-    if (!GPUMode::useGpuWeights()) {
-        valid_frames->copyToHost();
-        valid_frames->sync();  // Single sync waits for kernel and async copy to complete
-    }
-    auto sync_done = high_resolution_clock::now();
-    //cudaFree(tmp_mk5stream);
-
-    auto cleanup_done = high_resolution_clock::now();
-    //printf("Unpack breakdown:\n");
-    //printf("  Setup:        %ld μs\n", duration_cast<microseconds>(setup_done - total_start).count());
-    //printf("  Kernel queue: %ld μs\n", duration_cast<microseconds>(kernel_queued - kernel_start).count());
-    //printf("  Copy queue:   %ld μs\n", duration_cast<microseconds>(copy_queued - kernel_queued).count());
-    //printf("  Sync:         %ld μs\n", duration_cast<microseconds>(sync_done - copy_queued).count());
-    //printf("  Cleanup:      %ld μs\n", duration_cast<microseconds>(cleanup_done - sync_done).count());
-    //printf("  Total:        %ld μs\n", duration_cast<microseconds>(cleanup_done - total_start).count());
-
-
+  launch_fused_fringe(
+      grid, block, cuStream, usecomplex, dopcal,
+      complex_fringe_rotated_gpu->gpuPtr(), gSampleIndexes->gpuPtr(), gValidSamples->gpuPtr(),
+      gBigA->gpuPtr(), gBigBred->gpuPtr(),
+      fftloop, startblock, numblocks, fftchannels,
+      *mark5stream, packeddata_gpu->gpuPtr(), valid_frames->gpuPtr(),
+      framestounpack,
+      pcalout, nbins, datasamples, pcal_bin_stride_length);
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

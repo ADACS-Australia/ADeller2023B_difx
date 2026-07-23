@@ -130,10 +130,18 @@ public:
 
     void process_unpack(int index, int subloopindex);
     void set_weights(int subloopindex, int nframes, int *counts, int numBufferedFFTs);
-    virtual void unpack_all(int) {}
+    /// Compute per-frame validity (valid_frames) for this subint. Format-specific
+    /// (needs the mark5_stream), so overridden in Mk5_GPUMode; base is a no-op.
+    /// Replaces the validity side of the old unpack_all.
+    virtual void blankFrames(int framestounpack) {}
+    /// Launch the fused decode+fringe-rotation kernel (see launch_fused_fringe).
+    /// Format-specific (needs the mark5_stream + packed data), so overridden in
+    /// Mk5_GPUMode; base is a no-op. Called by GPUMode::fringeRotation after the
+    /// (format-agnostic) per-window coefficient precompute.
+    virtual void launchFusedRotate(dim3 grid, dim3 block, int fftloop,
+                                   int startblock, int numblocks, int framestounpack) {}
     void runFFT();
-    void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
-    void pcalExtraction(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
+    void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, int framestounpack);
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int *counts);
 
@@ -165,10 +173,11 @@ public:
 protected:
     int cudaMaxThreadsPerBlock;
     int cfg_numBufferedFFTs;
-    GpuMemHelper<float*> *unpackedarrays_gpu;
-    GpuMemHelper<float> *unpackeddata_gpu;
-    GpuMemHelper<cuFloatComplex*> *complex_unpackedarrays_gpu;
-    GpuMemHelper<cuFloatComplex> *complex_unpackeddata_gpu;
+    // The unpacked-sample buffers (unpackeddata_gpu / complex_unpackeddata_gpu
+    // and their pointer arrays) were removed when unpack was fused into the
+    // fringe-rotation kernel: samples are now decoded straight from the packed
+    // frame payload into registers (see gpu_fused_fringe), so there is no
+    // global unpacked buffer to round-trip through.
     GpuMemHelper<cuFloatComplex> *complex_fringe_rotated_gpu;
     GpuMemHelper<cuFloatComplex> *temp_autocorrelations_gpu;
     GpuMemHelper<char> *packeddata_gpu;
