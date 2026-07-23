@@ -46,10 +46,14 @@ Rules:
 
 ## A100 cluster profiling (benchprof-profile-nsys-5s.sbatch, 10 stations)
 
-Note: the rows below are the original ~4 s / 400-subint window; since
-2026-07-22 the sbatch profiles a ~20 s / ~2000-subint window (spans scale
-accordingly, idle % is the comparable quantity) and defaults to single-thread
-VDIF.
+Note on windows: subints are 10 ms, so the profiling window scales linearly
+(4 s = 400 subints/station, 5 s = 500, 20 s = 2000). Rows here span a mix of
+4 s and (2026-07-23) 5 s windows, so absolute ms are NOT directly comparable
+across rows - the **per-subint** figures in the fused-row note below, and idle
+%, are the window-independent quantities. All default to single-thread VDIF. A
+~20 s capture is NOT usable under nsys 2022.2.1 (its injection library
+segfaults ~13 s in - see gpu-profiling.md); the 20 s soak run is nsys-free
+(benchprof-profile-nonsys-20s.sbatch).
 
 Clean GPU-bound profile: A100-SXM4-80GB, one rank/core `--exclusive`,
 fake data, Core rank wrapped with nsys (`.nsys-rep` + sqlite kept under
@@ -63,7 +67,24 @@ stream. This is a diagnostic ledger (idle %), not the T5-T1 metric.
 | 2026-07-21 | pre-overlap (80f6e291a) | 10497 | 5471 | 47.9% | — | — | reference (tooarrana clean profile, per gpu-plan notes) |
 | 2026-07-21 | 7b8e31104 | 8798 | 5088 | 42.2% | 5695 | 35.3% | host-tail overlap; idle did NOT collapse |
 | 2026-07-22 | unpack-drain fix, INTERLACED | 9858 | 5077 | 48.5% | 5731 | 41.9% | sync fix held (no `cudaStreamSynchronize` storm) but GPU still starved by the DataStream corner-turn — see §10 |
-| 2026-07-22 | + single-thread VDIF (genheaders) | 6050 | 5058 | 16.4% | 5614 | **7.2%** | corner-turn removed; kernel busy unchanged (5058≈5077) so the win is pure idle removal; wall (CUDA-API span) 12169 → 7886 ms (**~35%**); GPU now compute-bound |
+| 2026-07-22 | + single-thread VDIF (genheaders), 4 s | 6050 | 5058 | 16.4% | 5614 | **7.2%** | corner-turn removed; kernel busy unchanged (5058≈5077) so the win is pure idle removal; wall (CUDA-API span) 12169 → 7886 ms (**~35%**); GPU now compute-bound |
+| 2026-07-23 | fused unpack+fringe (619c273be), 5 s | 7032 | 4863 | 30.9% | 6337 | 9.9% | fused kernel replaces unpack+fringe; kernel-only idle rises (faster kernels ⇒ fixed tail is a bigger fraction) but the H2D copies now fill it (idle+copy 9.9%). See the per-subint comparison below. |
+
+**Fused unpack+fringe, per-subint (window-independent) vs the pre-fusion 4 s
+profile above** (normalising each kernel's total by its launch count, since the
+two captures cover 400 vs 500 subints/station):
+
+- unpack + fringe (the fused portion): **0.509 → 0.197 ms/subint (−61%)**
+- total GPU kernel busy: **1.28 → 0.98 ms/subint (−23%)**
+- wall (CUDA-API span ÷ launches): **2.00 → 1.83 ms/subint (−8%)**
+
+The GPU-busy win is large; wall gains less because the run is no longer
+GPU-busy-bound. New A100 kernel mix (% of kernel busy): `gpu_resultsrotatorMultiply`
+**39%** (now the #1 target - memory-bound, an FP16 candidate), `gpu_fuse_xmac_and_average`
+21%, `gpu_fused_fringe` 19.5%, `vector_fft` 10%, **`gpu_sum_weights` `<<<1,1>>>` 7.7%**
+(a single-thread reduction - trivially removable, next up), weights/precompute/blank
+<2% each. H2D is now ~12.9 GB / 1444 ms on the compute stream (~20% of span) - a
+new wall floor the fusion doesn't touch.
 
 The overlap shortened the GPU span ~16% (10.5 -> 8.8 s) and trimmed idle
 ~48% -> ~42% (kernels-only), but did **not** collapse the between-subints

@@ -11,7 +11,7 @@
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
 #
 # Clean GPU-bound Nsight Systems profile of the 10-antenna fake-data
-# "benchprof" job (source=fake, ~5 s window = ~250 x 20ms subints). Deliberately
+# "benchprof" job (source=fake, ~5 s window = ~500 x 10ms subints). Deliberately
 # removes the two things that muddied the earlier profiles:
 #   * source=fake  -> no VDIF disk I/O,
 #   * --cpus-per-task=1 over 12 ranks (1 manager + 10 datastreams + 1 core)
@@ -20,7 +20,7 @@
 # rank runs mpifxcorr bare, via the committed nsys-wrapper.sh.
 #
 # WHY ONLY ~5 s: nsys 2022.2.1's injection library (libToolsInjection64.so)
-# SEGFAULTS on a long/heavy capture - a ~20 s cuda,nvtx,osrt trace over ~1000
+# SEGFAULTS on a long/heavy capture - a ~20 s cuda,nvtx,osrt trace over ~2000
 # subints crashed its worker thread ~13 s in (backtrace entirely inside
 # libToolsInjection64.so; the correlator was fine). A short window keeps the
 # trace small enough to survive. For a full-length TIMING/soak run, use the

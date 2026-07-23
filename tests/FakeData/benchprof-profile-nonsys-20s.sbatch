@@ -18,7 +18,7 @@
 #
 # Why a separate no-nsys script: nsys 2022.2.1's injection library
 # (libToolsInjection64.so) segfaults on a long/heavy capture - a ~20 s
-# cuda,nvtx,osrt trace over ~1000 subints crashed its worker thread ~13 s into
+# cuda,nvtx,osrt trace over ~2000 subints crashed its worker thread ~13 s into
 # the run. The crash backtrace is ENTIRELY inside libToolsInjection64.so (no
 # DiFX frame on the stack) - the correlator itself is fine and had reached
 # near-real-time speed. So for a full-length timing/soak run, don't profile:
