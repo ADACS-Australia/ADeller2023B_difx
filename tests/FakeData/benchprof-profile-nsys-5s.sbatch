@@ -1,7 +1,7 @@
 #!/bin/bash
 #
-#SBATCH --job-name=difx_benchprof_gpu
-#SBATCH --output=benchprof-profile.%j.mpilog
+#SBATCH --job-name=difx_benchprof_nsys5s
+#SBATCH --output=benchprof-nsys-5s.%j.mpilog
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
@@ -11,17 +11,25 @@
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
 #
 # Clean GPU-bound Nsight Systems profile of the 10-antenna fake-data
-# "benchprof" job (source=fake, ~20 s = ~2000 x 10ms subints). Deliberately removes the
-# two things that muddied the earlier profiles:
+# "benchprof" job (source=fake, ~5 s window = ~250 x 20ms subints). Deliberately
+# removes the two things that muddied the earlier profiles:
 #   * source=fake  -> no VDIF disk I/O,
-#   * --exclusive + --cpus-per-task=1 over 12 ranks (1 manager + 10 datastreams
-#     + 1 core) -> one rank per core, no oversubscription.
+#   * --cpus-per-task=1 over 12 ranks (1 manager + 10 datastreams + 1 core)
+#     -> one rank per core, no oversubscription.
 # Only the Core rank (the last MPI rank = rank 11) is profiled; every other
 # rank runs mpifxcorr bare, via the committed nsys-wrapper.sh.
 #
+# WHY ONLY ~5 s: nsys 2022.2.1's injection library (libToolsInjection64.so)
+# SEGFAULTS on a long/heavy capture - a ~20 s cuda,nvtx,osrt trace over ~1000
+# subints crashed its worker thread ~13 s in (backtrace entirely inside
+# libToolsInjection64.so; the correlator was fine). A short window keeps the
+# trace small enough to survive. For a full-length TIMING/soak run, use the
+# nsys-free companion benchprof-profile-nonsys-20s.sbatch instead. If nsys still
+# falls over, drop osrt (NSYS_TRACE=cuda,nvtx) and/or use a newer nsys.
+#
 # Submit from the tests/FakeData directory of your DiFX checkout (which holds
 # benchprof.v2d, bd247c3.vex.obs and nsys-wrapper.sh):
-#     cd <checkout>/tests/FakeData && sbatch benchprof-profile.sbatch
+#     cd <checkout>/tests/FakeData && sbatch benchprof-profile-nsys-5s.sbatch
 #
 # The report lands at $WORKDIR/nsys/benchprof-cluster-clean.nsys-rep - scp it
 # to the desktop for analysis (login-node nsys is too old to `nsys stats` it).
@@ -48,11 +56,10 @@ cp "$SRCDIR/benchprof.v2d" "$SRCDIR/bd247c3.vex.obs" "$SRCDIR/nsys-wrapper.sh" "
 chmod +x "$WORKDIR/nsys-wrapper.sh"
 cd "$WORKDIR"
 
-# Profile a longer (~20 s) window than benchprof.v2d's quick-check default
-# (~4 s): now that the corner-turn is gone the run is fast, and a longer window
-# makes the headline wall time easier to read (startup/teardown is a smaller
-# fraction). mjdStart 59675.09606481 + 20 s = 59675.09629650.
-sed -i 's|^mjdStop .*|mjdStop  = 59675.09629650|' benchprof.v2d
+# Profile a short (~5 s) window - long enough for steady-state kernel-mix/idle
+# numbers, short enough that the nsys 2022.2.1 trace survives (see the header).
+# mjdStart 59675.09606481 + 5 s = 59675.09612270.
+sed -i 's|^mjdStop .*|mjdStop  = 59675.09612270|' benchprof.v2d
 
 vex2difx benchprof.v2d          # -> benchprof_1.input/.calc/.threads
 difxcalc benchprof_1.calc       # -> benchprof_1.im

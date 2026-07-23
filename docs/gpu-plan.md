@@ -148,8 +148,8 @@ will ease the eventual merge and put GPU code where it belongs:
   an unpacker path that handles interlaced VDIF by *reordering* the per-thread
   frames into time order (pure memcpy) + GPU channel de-interleave, instead of
   the CPU multiplex, so real interlaced recordings stop gating the GPU. (For
-  fake-data benchmarking, `benchprof-profile.sbatch` already rewrites the
-  `.input` `INTERLACEDVDIF/… → VDIF` to bypass the demux.)
+  fake-data benchmarking, the `benchprof-profile-*.sbatch` scripts already
+  rewrite the `.input` `INTERLACEDVDIF/… → VDIF` to bypass the demux.)
 - **Subints larger than GPU memory**: today a subint's full set of FFT
   windows must fit on the device, so large station counts or data rates
   force short subints — at the cost of a higher visibility rate from the

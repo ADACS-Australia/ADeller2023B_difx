@@ -8,9 +8,9 @@ Companion to `gpu-plan.md` (what to do next) and `BENCHMARKS.md` (ledger).
 
 ## How to capture
 
-`tests/FakeData/benchprof-profile.sbatch` runs a clean GPU-bound
-correlation (A100, one rank/core, `source=fake` so no disk I/O, ~20 s =
-~2000 x 10ms subints, 10 stations; defaults to single-thread VDIF via
+`tests/FakeData/benchprof-profile-nsys-5s.sbatch` runs a clean GPU-bound
+correlation (A100, one rank/core, `source=fake` so no disk I/O, ~5 s =
+~250 x 20ms subints, 10 stations; defaults to single-thread VDIF via
 `SINGLE_THREAD_VDIF=1` so it profiles the GPU rather than the DataStream
 interlaced-VDIF corner-turn) with `tests/FakeData/nsys-wrapper.sh`
 wrapping **only the Core rank** (the wrapper picks the Core rank via the
@@ -19,6 +19,15 @@ one correlator process. The `.nsys-rep` lands in `nsys/` under the run
 dir. The cluster login node's nsys is older than the capture and cannot
 `nsys stats`/`export` it — **scp the `.nsys-rep` to the desktop**
 (nsys 2025.6.3) to analyse.
+
+**Keep captures short.** nsys 2022.2.1's injection library
+(`libToolsInjection64.so`) segfaults on a long/heavy trace — a ~20 s
+`cuda,nvtx,osrt` capture over ~1000 subints crashed its worker thread
+~13 s in (the backtrace was entirely inside `libToolsInjection64.so`; the
+correlator was fine). Hence the ~5 s window; if it still falls over, drop
+`osrt` (`NSYS_TRACE=cuda,nvtx`) or use a newer nsys. For a full-length
+**timing/soak** run (no profile), use the nsys-free companion
+`benchprof-profile-nonsys-20s.sbatch`.
 
 The desktop `benchprof` (`run-bench.sh` config) is `source=fake` too and
 can be profiled the same way; the synthetic `multi` scenario reads VDIF

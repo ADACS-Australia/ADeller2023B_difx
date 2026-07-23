@@ -44,7 +44,7 @@ Rules:
 | 2026-07-22 | f3046d081 | gpu, INTERLACEDVDIF (SINGLE_THREAD_VDIF=0) | 12.2 | 35.4 | 23.2 | interlaced comparison at the same commit |
 | 2026-07-23 | (fused unpack+fringe) | gpu, single-thread VDIF | 8.4 | 20.7 | **12.3** | fused unpack into fringe rotation (gpu-plan.md item 1): decode straight from packed data, no unpacked-buffer round-trip; removes the largest kernel. 14.0→12.3 (~12%) on the 2070; larger A100 gain expected (unpack was a bigger fraction there). Both T1 and T5 down. |
 
-## A100 cluster profiling (benchprof-profile.sbatch, 10 stations)
+## A100 cluster profiling (benchprof-profile-nsys-5s.sbatch, 10 stations)
 
 Note: the rows below are the original ~4 s / 400-subint window; since
 2026-07-22 the sbatch profiles a ~20 s / ~2000-subint window (spans scale
