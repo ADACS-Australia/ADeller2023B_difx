@@ -34,9 +34,14 @@ inside the fringe kernel, no unpacked-buffer round-trip, pcal folded in via
 expected), and the **fractional-sample-correction investigation** (2026-07-22,
 §11 — left fused, no change).
 
-**Next GPU-busy targets:** the occupancy audit (item 6, incl. the `<<<1,1>>>`
-`gpu_sum_weights`) and the FP16 / precision-drop items (items 1, 2) that build
-on the fused decode. (The DataStream corner-turn above remains the real
+Also landed 2026-07-23: the `<<<1,1>>>` `gpu_sum_weights` reduction (was 7.7%
+of A100 GPU busy) was folded into `gpu_set_weights` and deleted (gpu-changes.md
+§13; part of item 6).
+
+**Next GPU-busy targets:** the **FP16 / precision-drop items (items 1, 2)**,
+whose clearest target is now `gpu_resultsrotatorMultiply` (39% of A100 GPU
+busy, memory-bound — halving its traffic helps directly), plus the rest of the
+occupancy audit (item 6). (The DataStream corner-turn above remains the real
 production bottleneck — see Longer-term.)
 
 ## Work queue (underway + future)
