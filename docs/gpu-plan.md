@@ -17,18 +17,14 @@ de-serializations — Lever A (pinned input), weights-on-device Increments
 history, rationale and the (now-corrected) cuFFT-sync misdiagnosis are in
 `gpu-changes.md` (§5-10); numbers in `BENCHMARKS.md`.
 
-**Current understanding (2026-07-22): the GPU path is no longer the
-bottleneck — the DataStream interlaced-VDIF corner-turn is.** Whole-pipeline
-profiling (Manager + DataStream + Core) showed the GPU is faster than the
-DataStream can feed it: the DataStream burns ~93% of its busy CPU
-multiplexing 16 interlaced VDIF threads into one (`VDIFMuxer`,
-`cornerturn_16thread_2bit`) at ~1.7 Gbps/core — at/below the record rate — so
-the GPU then idles ~42% on the procslot mutex. The Core-side work above was
-correct de-serialization but aimed at a non-bottleneck. Removing the
-corner-turn (single-thread VDIF) cut a 2-station job 8.0 → 4.8 s (~40%). See
-gpu-changes.md §10 and the Longer-term item below. Kernel mix (A100): fringe
-family ~45%, unpack 24%, fused XMAC 16%, FFT 8%, weights ~7% (FP64 cheap
-there, so precision work leans on the 2070).
+**Benchmarking note:** the DataStream interlaced-VDIF corner-turn
+(`VDIFMuxer`) is CPU-bound and, for interlaced data, feeds the GPU slower than
+the GPU can process it — so it caps what a GPU benchmark can show. We therefore
+benchmark with non-interlaced (single-thread) VDIF for now, which bypasses the
+corner-turn. (Full analysis in gpu-changes.md §10; the Longer-term item below
+tracks fixing it for production.) Kernel mix (A100, pre-fusion): fringe family
+~45%, unpack 24%, fused XMAC 16%, FFT 8%, weights ~7% (FP64 cheap there, so
+precision work leans on the 2070).
 
 Completed work has moved to `gpu-changes.md`; the queue below is what remains.
 Recently landed and no longer in the queue: the **unpack+fringe fusion**
@@ -92,6 +88,13 @@ production bottleneck — see Longer-term.)
    badly sized. Cheap, and a natural companion to the fused-decode and
    precision work (items 1-2). (The old unpack-layout question is moot -
    `gpu_unpack` was deleted in the fusion.)
+7. **GPU pcal regression coverage** — the GPU phase-cal path is untested by
+   diffDiFX (phaseCalInt=0 in every synthetic/FakeData scenario), and the
+   pcal-fused `DOPCAL` path added in the unpack+fringe fusion is validated by
+   construction/review only. Add a phaseCalInt>0 synthetic scenario to
+   run-local.sh so CPU-vs-GPU covers pcal extraction.
+8. **NUMA/affinity audit** — mattered on the cluster, less on the desktop;
+   check rank/thread placement and memory locality.
 
 ## Standing process (adopted 2026-07-18)
 
@@ -174,9 +177,4 @@ will ease the eventual merge and put GPU code where it belongs:
   dedicated H2D stream), and Option A is far simpler than Option B (the
   per-datastream buffers are already separate, so it needs only a
   dedicated H2D stream, no double-buffering).
-- NUMA/affinity audit (mattered on the cluster, less on the desktop).
 - Profile the fftsPerChunk XMAC grid split if atomics show up.
-- GPU pcal regression coverage (currently untested by diffDiFX; now also
-  covers the pcal-fused `DOPCAL` path added in the unpack+fringe fusion,
-  which is validated by construction/review only - the agreed follow-up is a
-  phaseCalInt>0 synthetic scenario for run-local.sh).
