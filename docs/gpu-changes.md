@@ -498,3 +498,39 @@ per thread (good locality: consecutive channels are consecutive time samples
 in one band's bitstream) but the FP16 path (item 2), per-sample precision drop
 (item 3), and the occupancy audit (item 8, e.g. `gpu_sum_weights` `<<<1,1>>>`)
 remain open.
+
+## 13. Total-weight reduction fused into set_weights; gpu_sum_weights deleted (2026-07-23)
+
+**Motivation.** The 2026-07-23 A100 profile of the fused-unpack binary showed
+`gpu_sum_weights` — the `<<<1,1>>>` single-thread reduction of the per-window
+`gDataWeights[w]` to the scalar `gTotalWeight` — at a startling **7.7% of GPU
+busy** (373 ms / 4952 launches). Once unpack+fringe shrank (§12), this trivial
+serial kernel became a top-5 cost purely from single-thread execution + launch
+overhead.
+
+**What changed.** The total weight is now a **free by-product of
+`gpu_set_weights`**, which already runs one thread per FFT window and computes
+each `dataweight[w]`: each window thread `atomicAdd`s its weight into
+`gTotalWeight` (zeroed with a `cudaMemsetAsync` on the stream just before the
+launch). `gpu_sum_weights` is deleted — no separate launch, no serial loop.
+Better than parallelising it into a standalone reduction kernel, which would
+still be an extra launch. The **compute** moved to tofft; the `gTotalWeight`
+**D2H stays in afterfft** (the tail-overlap constraint — the pinned host mirror
+must be written at drain time), and single-stream ordering keeps the device
+scalar stable between the tofft accumulate and the afterfft D2H, exactly as
+before.
+
+**Behaviour.** The atomic accumulation reorders the sum vs the old window-order
+loop, so the AC per-band weight total is now FP-level rather than bit-identical
+for multi-occurrence bands — within the acceptance bar (the final visibilities
+are not bit-reproducible run-to-run anyway). Device-weights and
+`DIFX_GPU_WEIGHTS_HOST` fallback are otherwise untouched (the fallback never
+entered this branch; invalid subints never read `gTotalWeight`).
+
+**Correctness.** run-local.sh usb / usb-complex / complex-complex / multi PASS
+CPU-vs-GPU in BOTH pipeline modes, and PASS under the host-weights fallback.
+
+**Benchmark (2070, T5−T1).** 12.3 → **11.8 s (~4%)**. On the A100 the win
+should be ~its 7.7% GPU-busy share (2070 has fewer/cheaper serial-kernel
+stalls). See BENCHMARKS.md. Part of gpu-plan.md item 6 (the occupancy audit);
+the rest of that audit — ad-hoc launch dims elsewhere — remains open.

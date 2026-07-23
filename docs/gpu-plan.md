@@ -83,11 +83,13 @@ production bottleneck — see Longer-term.)
    under- or over-subscription. Several kernels were written with ad-hoc
    launch dims (one thread per (window, band, channel) in the fused
    decode+fringe kernel; one thread per accumulator in the weight
-   reductions; single-thread reductions like the `<<<1,1>>>`
-   `gpu_sum_weights`); check each with nsys/`ncu` and fix any that are
+   reductions); check each with nsys/`ncu` and fix any that are
    badly sized. Cheap, and a natural companion to the fused-decode and
    precision work (items 1-2). (The old unpack-layout question is moot -
-   `gpu_unpack` was deleted in the fusion.)
+   `gpu_unpack` was deleted in the fusion.) **DONE so far (2026-07-23):**
+   the `<<<1,1>>>` `gpu_sum_weights` single-thread reduction (7.7% of A100
+   GPU busy) was eliminated by folding its sum into `gpu_set_weights`
+   (per-window atomicAdd) - see gpu-changes.md §13.
 7. **GPU pcal regression coverage** — the GPU phase-cal path is untested by
    diffDiFX (phaseCalInt=0 in every synthetic/FakeData scenario), and the
    pcal-fused `DOPCAL` path added in the unpack+fringe fusion is validated by

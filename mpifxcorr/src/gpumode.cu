@@ -137,13 +137,20 @@ static int specDebugFrom()
 // sampleIndexes[w] is nearestSamples[w] directly; nearestSamples == -1
 // (the calculatePre sentinel) marks the window invalid instead of
 // aborting; and a window spanning more than two frames gets weight 0.
+// Each thread also accumulates its weight into the single per-subint total
+// (Increment 2b, fused 2026-07-23): the old separate <<<1,1>>> gpu_sum_weights
+// reduction kernel is gone - the total is a free by-product of the per-window
+// work. `totalWeight` must be zeroed on the stream before this launch. The
+// atomicAdd reorders the sum vs the old window-order loop (FP-level, not
+// bit-identical for multi-occurrence bands - within the acceptance bar; the
+// final visibilities are not bit-reproducible anyway).
 __global__ void gpu_set_weights(const int *nearest, const bool *validFrames,
                                 const unsigned int *validFlagWords,
                                 float *dataweight, bool *validSamples,
                                 int *sampleIndexes,
                                 int numWindows, int nframes,
                                 int framesamples, int fftchannels,
-                                bool subintValid) {
+                                bool subintValid, float *totalWeight) {
     const int w = blockIdx.x * blockDim.x + threadIdx.x;
     if (w >= numWindows)
         return;
@@ -153,54 +160,34 @@ __global__ void gpu_set_weights(const int *nearest, const bool *validFrames,
 
     const bool flagged_ok =
         ((validFlagWords[w / FLAGS_PER_INT] >> (w % FLAGS_PER_INT)) & 1u) != 0u;
-    if (!subintValid || !flagged_ok || ns < 0) {
-        dataweight[w] = 0.0f;
-        validSamples[w] = false;
-        return;
-    }
+    float weight = 0.0f;
+    if (subintValid && flagged_ok && ns >= 0) {
+        // Frames at or beyond nframes were not delivered this subintegration
+        // (their buffers hold stale contents), so they count as invalid -
+        // identical to the host path's frame_ok().
+        const int start_frame = ns / framesamples;
+        const int end_frame = (w + 1 == numWindows)
+            ? (ns + fftchannels - 1) / framesamples
+            : (nearest[w + 1] - 1) / framesamples;
 
-    // Frames at or beyond nframes were not delivered this subintegration
-    // (their buffers hold stale contents), so they count as invalid -
-    // identical to the host path's frame_ok().
-    const int start_frame = ns / framesamples;
-    const int end_frame = (w + 1 == numWindows)
-        ? (ns + fftchannels - 1) / framesamples
-        : (nearest[w + 1] - 1) / framesamples;
-
-    const float ok_start =
-        (start_frame >= 0 && start_frame < nframes && validFrames[start_frame]) ? 1.0f : 0.0f;
-    float weight;
-    if (start_frame == end_frame) {
-        weight = ok_start;
-    } else if (start_frame + 1 == end_frame) {
-        const float ok_end =
-            (end_frame < nframes && validFrames[end_frame]) ? 1.0f : 0.0f;
-        const float frac_first =
-            (float)(end_frame * framesamples - ns) / (float)fftchannels;
-        weight = frac_first * ok_start + (1.0f - frac_first) * ok_end;
-    } else {
-        weight = 0.0f;
+        const float ok_start =
+            (start_frame >= 0 && start_frame < nframes && validFrames[start_frame]) ? 1.0f : 0.0f;
+        if (start_frame == end_frame) {
+            weight = ok_start;
+        } else if (start_frame + 1 == end_frame) {
+            const float ok_end =
+                (end_frame < nframes && validFrames[end_frame]) ? 1.0f : 0.0f;
+            const float frac_first =
+                (float)(end_frame * framesamples - ns) / (float)fftchannels;
+            weight = frac_first * ok_start + (1.0f - frac_first) * ok_end;
+        }
+        // (a window spanning >2 frames keeps weight 0)
     }
 
     dataweight[w] = weight;
     validSamples[w] = weight > 0.0f;
-}
-
-// Increment 2b: reduce the per-window data weights to a single scalar on the
-// device (totalW = sum over the subint's windows of dataweight[w]). The AC
-// per-band weight accumulation in finishWeights adds dataweight[w] to a
-// window-INDEPENDENT set of band slots, so it equals totalW times a static
-// per-band multiplicity - only totalW is per-subint. Summing sequentially in
-// window order matches the host loop's accumulation order (bit-identical for
-// single-occurrence bands). One thread suffices: numWindows is small and this
-// runs overlapped on the compute stream.
-__global__ void gpu_sum_weights(const float *dataweight, int numWindows, float *out) {
-    if (blockIdx.x != 0 || threadIdx.x != 0)
-        return;
-    float s = 0.0f;
-    for (int w = 0; w < numWindows; w++)
-        s += dataweight[w];
-    *out = s;
+    // Fused total-weight reduction (replaces gpu_sum_weights): sum_w dataweight[w].
+    atomicAdd(totalWeight, weight);
 }
 
 
@@ -943,10 +930,10 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
     // process_gpu_afterfft, so it lives in the member savedProcessCounts rather
     // than a process_gpu local. The gpu_set_weights kernel that produces the
     // per-window dataweights/sample-indices/validity stays here (fringe
-    // rotation below needs the indices); its reduction to a single total weight
-    // (gpu_sum_weights + the gTotalWeight D2H) moves to process_gpu_afterfft so
-    // gTotalWeight's pinned host mirror is written at drain time, not while the
-    // next subint's tail may still be reading it.
+    // rotation below needs the indices) and also accumulates the single total
+    // weight (fused reduction). Only the gTotalWeight D2H moves to
+    // process_gpu_afterfft, so its pinned host mirror is written at drain time,
+    // not while the next subint's tail may still be reading it.
     int *counts = savedProcessCounts;
     for (int i = 0; i < numrecordedfreqs; i++) counts[i] = 0;
 
@@ -974,6 +961,11 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
         const bool subintValid =
             (datalengthbytes > 1) && (offsetseconds != INVALID_SUBINT);
 
+        // Zero the per-subint total weight before gpu_set_weights accumulates
+        // into it (the fused reduction that replaced gpu_sum_weights). Stream-
+        // ordered, so all set_weights threads see 0. The gTotalWeight D2H stays
+        // in process_gpu_afterfft (drain-time write of the pinned mirror).
+        checkCuda(cudaMemsetAsync(gTotalWeight->gpuPtr(), 0, sizeof(float), cuStream));
         const int tpb = 128;
         gpu_set_weights<<<(numBufferedFFTs + tpb - 1) / tpb, tpb, 0, cuStream>>>(
             nearestSamples->gpuPtr(), valid_frames->gpuPtr(),
@@ -981,8 +973,8 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
             gDataWeights->gpuPtr(), gValidSamples->gpuPtr(),
             gSampleIndexes->gpuPtr(),
             numBufferedFFTs, framestounpack, framesamples, fftchannels,
-            subintValid);
-        // (gpu_sum_weights + gTotalWeight D2H moved to process_gpu_afterfft.)
+            subintValid, gTotalWeight->gpuPtr());
+        // (gTotalWeight D2H moved to process_gpu_afterfft.)
         weightsOnDevice = true;
         memcpy(counts, countsStatic, numrecordedfreqs * sizeof(int));
         DIFX_NVTX_POP();
@@ -1054,14 +1046,13 @@ int GPUMode::process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblo
                               sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
 
     if (useGpuWeights()) {
-        // Reduce the per-window weights (computed by gpu_set_weights in tofft)
-        // to a single scalar and bring back just that float (Increment 2b):
-        // finishWeights' AC per-band accumulation needs only the total. The
-        // full per-window array is D2H'd only under the WDEBUG gate. Placed
-        // here (not tofft) so gTotalWeight's pinned mirror is written at drain
-        // time, after which GPUCore's completegpudata reads it in the tail.
-        gpu_sum_weights<<<1, 1, 0, cuStream>>>(
-            gDataWeights->gpuPtr(), numBufferedFFTs, gTotalWeight->gpuPtr());
+        // Bring back the single total-weight scalar (Increment 2b): the sum was
+        // accumulated on the device by gpu_set_weights in tofft (fused reduction,
+        // replacing gpu_sum_weights); finishWeights' AC per-band accumulation
+        // needs only this total. The full per-window array is D2H'd only under
+        // the WDEBUG gate. The D2H stays HERE (not tofft) so gTotalWeight's
+        // pinned mirror is written at drain time, after which GPUCore's
+        // completegpudata reads it in the tail.
         checkCuda(cudaMemcpyAsync(gTotalWeight->ptr(), gTotalWeight->gpuPtr(),
                                   sizeof(float), cudaMemcpyDeviceToHost, cuStream));
         if (weightDebugFrom() >= 0 && datasec >= weightDebugFrom())

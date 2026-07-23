@@ -116,7 +116,8 @@ public:
      */
     void setProcSlot(int slot) { procSlot = slot; }
     /**
-     * Second half: gpu_sum_weights + gTotalWeight D2H, pcal extraction +
+     * Second half: gTotalWeight D2H (the sum itself is now fused into
+     * gpu_set_weights in tofft), pcal extraction +
      * copyToHost, fractionalRotation (autocorrelations) + autocorr copyToHost.
      * Produces every tail-consumed output. Enqueued on the compute stream after
      * tofft; must run before the NEXT subint's tofft (single-stream order keeps

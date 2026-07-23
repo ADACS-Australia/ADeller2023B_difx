@@ -43,6 +43,7 @@ Rules:
 | 2026-07-22 | f3046d081 | gpu, single-thread VDIF | 9.1 | 23.1 | **14.0** | benchmark now single-thread by default (no DataStream corner-turn); ~40% faster than the interlaced row below - the corner-turn cost the oversubscribed desktop too, not just the A100 |
 | 2026-07-22 | f3046d081 | gpu, INTERLACEDVDIF (SINGLE_THREAD_VDIF=0) | 12.2 | 35.4 | 23.2 | interlaced comparison at the same commit |
 | 2026-07-23 | (fused unpack+fringe) | gpu, single-thread VDIF | 8.4 | 20.7 | **12.3** | fused unpack into fringe rotation (gpu-plan.md item 1): decode straight from packed data, no unpacked-buffer round-trip; removes the largest kernel. 14.0→12.3 (~12%) on the 2070; larger A100 gain expected (unpack was a bigger fraction there). Both T1 and T5 down. |
+| 2026-07-23 | (fused sum_weights) | gpu, single-thread VDIF | 8.5 | 20.3 | **11.8** | fold the total-weight reduction into gpu_set_weights (per-window atomicAdd), delete the `<<<1,1>>>` gpu_sum_weights. 12.3→11.8 (~4%) on the 2070; on the A100 it should be ~its 7.7% GPU-busy share. |
 
 ## A100 cluster profiling (benchprof-profile-nsys-5s.sbatch, 10 stations)
 
@@ -82,9 +83,11 @@ The GPU-busy win is large; wall gains less because the run is no longer
 GPU-busy-bound. New A100 kernel mix (% of kernel busy): `gpu_resultsrotatorMultiply`
 **39%** (now the #1 target - memory-bound, an FP16 candidate), `gpu_fuse_xmac_and_average`
 21%, `gpu_fused_fringe` 19.5%, `vector_fft` 10%, **`gpu_sum_weights` `<<<1,1>>>` 7.7%**
-(a single-thread reduction - trivially removable, next up), weights/precompute/blank
-<2% each. H2D is now ~12.9 GB / 1444 ms on the compute stream (~20% of span) - a
-new wall floor the fusion doesn't touch.
+(a single-thread reduction), weights/precompute/blank <2% each. H2D is now
+~12.9 GB / 1444 ms on the compute stream (~20% of span) - a new wall floor the
+fusion doesn't touch. **Follow-up: `gpu_sum_weights` deleted** - its
+sum folded into `gpu_set_weights` (per-window atomicAdd), so that 7.7% should be
+gone from the next A100 profile (2070 T5-T1 12.3→11.8).
 
 The overlap shortened the GPU span ~16% (10.5 -> 8.8 s) and trimmed idle
 ~48% -> ~42% (kernels-only), but did **not** collapse the between-subints
