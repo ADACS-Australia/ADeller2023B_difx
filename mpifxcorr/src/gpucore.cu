@@ -461,10 +461,35 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
 
         int freqchannels = config->getFNumChannels(f);
         int channelstoaverage = config->getFChannelsToAverage(f);
-        int numPolarisationProducts = config->getBNumPolProducts(
-            configindex, 0, config->getBLocalFreqIndex(configindex, 0, f));
+
+        int numPolarisationProducts = 0;
+        // Temprorary variable to hold the local frequency index of the reference baseline.  
+        // varible localfreqindex is used later within a loop (same value)
+        int localfreqindex_ref = -1;
+
+        // Find the first baseline that has a local frequency index to use as a reference.
+        for (int ref_baseline = 0; ref_baseline < numbaselines; ++ref_baseline) {
+            localfreqindex_ref = config->getBLocalFreqIndex(configindex, ref_baseline, f);
+            if (localfreqindex_ref >= 0) {
+                // This baseline is active, use it to get the number of pol products.
+                numPolarisationProducts = config->getBNumPolProducts(configindex, ref_baseline, localfreqindex_ref);
+                break; // Exit the loop since we found a valid reference to obtain numPolarisationProducts.
+            }
+        }
 
         XmacFreqPlan plan;
+
+        // It is a fatal error if the frequency is marked 'used' but we found no active
+        // baselines or pol products for it.
+        if (numPolarisationProducts == 0) {
+            cerror << startl << "Error in buildXmacPlans: Frequency " << f 
+                   << " is marked as used, but no active baselines/polarisation products were found for it." 
+                   << endl;
+            // Depending on desired robustness, you could 'continue' to the next frequency
+            // or abort as the original code intended. Aborting is safer.
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
         plan.numPolarisationProducts = numPolarisationProducts;
         plan.num_averaged_channels = freqchannels / channelstoaverage;
         plan.channelstoaverage = channelstoaverage;
@@ -1165,18 +1190,26 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
             // chunks of fftsPerChunk FFTs whose partial sums the kernel combines
             // with an atomic add. Otherwise keep a single chunk, which preserves
             // the plain-store (no atomics) fast path for the many-channel case.
+
             const long long launchThreads =
                 (long long)numbaselines * plan.numPolarisationProducts *
                 numChanBlocks * threadsPerBlock;
+
+
             const long long targetThreads = (long long)cudaMultiProcessorCount * 2048;
             int numFftChunks = 1;
             if (launchThreads < targetThreads) {
+                
+
+                           
+                
                 numFftChunks = (int)((targetThreads + launchThreads - 1) / launchThreads);
                 if (numFftChunks > numBufferedFFTs)
                     numFftChunks = numBufferedFFTs;
                 // Respect the 65535 gridDim.z hardware limit.
+
                 if (numFftChunks > 65535 / numChanBlocks)
-                    numFftChunks = 65535 / numChanBlocks;
+                    numFftChunks = 65535 / numChanBlocks; 
                 if (numFftChunks < 1)
                     numFftChunks = 1;
             }
