@@ -101,7 +101,39 @@ one whose win should be visible on the 2070 (bandwidth-bound there, and this
 removes write traffic - so `run-bench.sh` can measure it locally instead of
 waiting for cluster time), and it frees memory rather than spending it.
 
-## Part 2 (next): window-group reduction
+## Part 2: window-group reduction - BUILT, MEASURED, NOT LANDED (2026-08-26)
+
+Implemented and validated correct, then measured as a net loss on the 2070 with
+only a speculative gain on the A100, so it is parked on branch
+`wip-window-group-reduction` (`f9e25513e`) rather than merged. The design below
+is kept because it is still the right shape if the A100 numbers justify it.
+
+**RTX 2070, `gpu_resultsrotatorMultiply` us/call, vs 396.9 for the kernel
+without any of this machinery:**
+
+| block (chan x windows) | threads | us/call | vs baseline |
+|---|---|---|---|
+| (64, 2) | 128 | 411.4 | +3.7% |
+| (32, 4) | 128 | 416.7 | +5.0% |
+| (128, 1) | 128 | 424.5 | +7.0% |
+| (16, 8) | 128 | 467.0 | +17.7% |
+| (128, 8) | 1024 | 576.7 | +45% |
+
+Two lessons. **Widening the block to fit a window group is the expensive part** -
+1024-thread blocks on a card with 1024 threads/SM leave one block per SM where
+there were eight; narrowing the channel dimension instead keeps the block at 128
+threads and makes the grouping nearly free. But **the machinery has a floor**:
+G=1 reduces nothing and still costs 7%, so the shared-memory round-trip and the
+two barriers per band are themselves the cost. On a bandwidth-saturated card the
+atomics being removed were free (probe 1: +0.0%), so nothing pays for that floor.
+
+The A100 is the opposite case - atomics are 24% of the kernel - so this could
+plausibly net ~13% of the kernel, ~5.5% of kernel busy. Unmeasured. But **Part 3
+subsumes it entirely and is worth ~3x more**, so the next increment should go
+there rather than chasing this. Correctness was never the problem: racecheck
+reports 0 hazards over a complete correlation, and every validation leg passed.
+
+## Part 2 design (as built, for reference)
 
 Cut the atomics without touching the thread count, the per-thread work, or the
 block->window mapping - the three things probe 3 shows are fragile.
