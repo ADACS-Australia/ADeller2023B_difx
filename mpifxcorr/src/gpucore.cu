@@ -131,11 +131,12 @@ __global__ void gpu_fuse_xmac_and_average(
             int fine_chan = avg_chan * channelstoaverage + c;
 
             cuFloatComplex v1 = gpuM1Freqs[baseline][base_idx1 + fine_chan];
-            // Note: v2 is pulled from conj_fftd_gpu, so it is already conjugated.
             cuFloatComplex v2 = gpuM2Freqs[baseline][base_idx2 + fine_chan];
 
-            // Cross-multiply: V1 * V2*
-            sum = cuCaddf(sum, cuCmulf(v1, v2));
+            // Cross-multiply: V1 * conj(V2). Both operands come from the
+            // rotated spectra and the conjugation happens here, in the
+            // multiply, at no instruction cost - see cuCmulConjf.
+            sum = cuCaddf(sum, cuCmulConjf(v1, v2));
         }
     }
 
@@ -509,7 +510,7 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         int ds1index = config->getBOrderedDataStream1Index(configindex, j);
         int ds2index = config->getBOrderedDataStream2Index(configindex, j);
         h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
-        h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->conj_fftd_gpu->gpuPtr();
+        h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->fftd_gpu->gpuPtr();
         h_v1_ptrs[j] = ((GPUMode*)modes[ds1index])->getGpuValidSamples();
         h_v2_ptrs[j] = ((GPUMode*)modes[ds2index])->getGpuValidSamples();
     }
@@ -956,65 +957,6 @@ void GPUCore::loopprocess(int threadid) {
 
 //    extern int calls;
 //    cout << "process calls: " << calls << endl;
-}
-
-__global__ void _gpu_processBaselineBased(
-        cuFloatComplex** const gpuM1Freqs,
-        cuFloatComplex** const gpuM2Freqs,
-        cuFloatComplex* const threadcrosscorrs_gpu,
-        const char* const stream1BandIndexes_gpu,
-        const char* const stream2BandIndexes_gpu,
-        int xmacpasses,
-        int numbaselines,
-        int xmacstridelength,
-        int fftloop,
-        int startblock,
-        int numblocks,
-        size_t fftchannels,
-        size_t numrecordedbands
-) {
-    // numBufferedFFTs(blockIdx.x) * (numrecordedbands(threadIdx.x) * fftchannels(threadIdx.y))
-
-    // blockIdx.x in this case is the subloopindex index [0 .. numBufferedFFTs]
-    // blockIdx.y in this case is the fftchannels_grid. The actual fftchannels value is calculated by fftchannels_grid idx * fftchannels_block size + fftchannels idx (blockIdx.y * blockDim.y) + threadIdx.y
-    // threadIdx.x in this case is the numPolarisationProducts index [0 .. numPolarisationProducts]
-    // threadIdx.y in this case is the fftchannels_block index [0 .. fftchannels_block]
-    // blockDim.x in this case is the numPolarisationProducts size
-    // blockDim.y in this case is the fftchannels_block size
-    // gridDim.x in this case is the numBufferedFFTs size
-    // gridDim.y in this case is the fftchannels_grid size
-
-    // Get the subloopindex
-    const size_t subloopindex = blockIdx.x;
-
-    // Check if we should bother processing this sample
-    size_t index = fftloop * gridDim.x + subloopindex + startblock;
-    if (index >= startblock + numblocks) {
-        // May not have to fully complete last fftloop, drop out
-        return;
-    }
-
-    const size_t polidx = threadIdx.x;
-    const size_t channelindex = (blockIdx.y * blockDim.y) + threadIdx.y;
-    const size_t numPolarisationProducts = blockDim.x;
-
-    if (channelindex >= xmacstridelength) {
-        return;
-    }
-
-    for (auto x = 0; x < xmacpasses; x++) {
-        for (auto j = 0; j < numbaselines; j++) {
-            size_t resultindex = (x * numbaselines + j) * numPolarisationProducts * xmacstridelength;
-            const size_t crosscorrIndex = resultindex + polidx * xmacstridelength + channelindex;
-
-            auto xmacstart = x * xmacstridelength;
-
-            const size_t freqIndex = (subloopindex * fftchannels * numrecordedbands) + (stream1BandIndexes_gpu[(subloopindex * numPolarisationProducts * numbaselines) + (j * numPolarisationProducts) + polidx] * fftchannels) + channelindex + xmacstart;
-            const size_t conjIndex = (subloopindex * fftchannels * numrecordedbands) + (stream2BandIndexes_gpu[(subloopindex * numPolarisationProducts * numbaselines) + (j * numPolarisationProducts) + polidx] * fftchannels) + channelindex + xmacstart;
-
-            atomicAddFloatComplex1(&threadcrosscorrs_gpu[crosscorrIndex], cuCmulf(gpuM1Freqs[j][freqIndex], gpuM2Freqs[j][conjIndex]));
-        }
-    }
 }
 
 void

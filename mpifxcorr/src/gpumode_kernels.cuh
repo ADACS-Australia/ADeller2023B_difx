@@ -5,6 +5,30 @@
 #include <cuComplex.h>
 #include <cufft.h>
 
+/**
+ * a * conj(b), for the cross-multiplies that make up the XMAC and the
+ * cross-polarisation autocorrelations.
+ *
+ * WHY THIS EXISTS: the GPU pipeline used to materialise a whole second array of
+ * conjugated spectra (conj_fftd_gpu) purely so consumers could read a
+ * pre-conjugated operand. That cost an 8-byte global write per spectral point -
+ * ~40% of the fractional-rotation kernel's DRAM traffic - plus a full duplicate
+ * of the spectra in VRAM, to save nothing: conjugating in the multiply has the
+ * SAME instruction count as a plain complex multiply.
+ *
+ *     (a+bi)(c+di) = (ac - bd) + (ad + bc)i
+ *     (a+bi)(c-di) = (ac + bd) + (bc - ad)i
+ *
+ * i.e. four multiplies and two adds either way - only the signs differ, and
+ * they fold into the FMA sign bits. Writing it out rather than composing
+ * cuCmulf(a, cuConjf(b)) keeps that explicit.
+ */
+__host__ __device__ static __inline__ cuFloatComplex cuCmulConjf(cuFloatComplex a, cuFloatComplex b)
+{
+    return make_cuFloatComplex(a.x * b.x + a.y * b.y,
+                               a.y * b.x - a.x * b.y);
+}
+
 // ---------------------------------------------------------------------------
 // Lightweight NVTX instrumentation.
 //

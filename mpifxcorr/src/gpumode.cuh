@@ -101,7 +101,7 @@ public:
      * reads (autocorr/gTotalWeight/pcal host mirrors), so the next subint's
      * process_gpu_tofft can run on the compute stream while the current
      * subint's outputs drain and its host tail runs. Returns numBufferedFFTs.
-     * On an invalid subint (datalengthbytes<=1) it zeros fftd/conj/gDataWeights
+     * On an invalid subint (datalengthbytes<=1) it zeros fftd/gDataWeights
      * /validity and returns early (no sync); process_gpu_afterfft then no-ops.
      */
     int process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
@@ -147,15 +147,11 @@ public:
     void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int *counts);
 
     [[nodiscard]] const cuFloatComplex* getGpuFreqs() const override { return fftd_gpu->gpuPtr(); }
-    [[nodiscard]] const cuFloatComplex* getGpuConjugatedFreqs() const override { return conj_fftd_gpu->gpuPtr(); }
     [[nodiscard]] const cf32* getGpuFreqsHost(int outputband, int subloopindex) const override {
         return (const cf32*) &fftd_gpu->ptr()[(subloopindex * fftchannels * numrecordedbands) + (outputband * fftchannels)];
     }
-    [[nodiscard]] const cf32* getGpuConjugatedFreqsHost(int outputband, int subloopindex) const override {
-        return (const cf32*) &conj_fftd_gpu->ptr()[(subloopindex * fftchannels * numrecordedbands) + (outputband * fftchannels)];
-    }
     /// Device-side per-FFT validity flags. Invalid FFT windows have stale
-    /// (never zeroed) spectra in fftd_gpu/conj_fftd_gpu - the mode kernels
+    /// (never zeroed) spectra in fftd_gpu - the mode kernels
     /// skip them - so consumers (the XMAC kernel) must exclude them; the CPU
     /// path instead zeroes such spectra so they contribute nothing.
     [[nodiscard]] const bool* getGpuValidSamples() const { return gValidSamples->gpuPtr(); }
@@ -168,8 +164,11 @@ public:
     /// this buffer).
     [[nodiscard]] const float* getGpuDataWeights() const { return gDataWeights->gpuPtr(); }
 
+    /// Rotated spectra: the FFT output with the fractional-sample rotation
+    /// applied in place. Consumers that need the conjugate (the XMAC, the
+    /// cross-pol autocorrelations) conjugate in the multiply via cuCmulConjf -
+    /// there is deliberately no second, pre-conjugated copy of this array.
     GpuMemHelper<cuFloatComplex> *fftd_gpu;
-    GpuMemHelper<cuFloatComplex> *conj_fftd_gpu;
 
 protected:
     int cudaMaxThreadsPerBlock;

@@ -149,8 +149,13 @@ private:
     const cuFloatComplex** d_m1_ptrs;
 
     /**
-     * @brief Device pointers to the conjugated FFT output buffers for Datastream 2 (one per baseline).
-     * In the CPU case, accessed via `modes[ds2index]->getConjugatedFreqs()`. See d_m1_ptrs.
+     * @brief Device pointers to the rotated FFT output buffers for Datastream 2 (one per baseline).
+     *
+     * These are the SAME (un-conjugated) buffers as d_m1_ptrs draws from - the
+     * XMAC kernel conjugates this operand in the multiply (cuCmulConjf). The
+     * CPU path's equivalent, `modes[ds2index]->getConjugatedFreqs()`, does hand
+     * back a materialised conjugate; the GPU path deliberately does not keep
+     * one. See d_m1_ptrs.
      */
     const cuFloatComplex** d_m2_ptrs;
 

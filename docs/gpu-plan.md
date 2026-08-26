@@ -13,11 +13,20 @@ complex-complex, and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both
 to get there, and why, is in `gpu-changes.md` (§5-14, one section per change);
 the numbers are in `BENCHMARKS.md`. The queue below is only what remains.
 
-**Current A100 kernel mix** (5 s profile, 4500 ms kernel busy):
+**Current A100 kernel mix** (5 s profile, 4500 ms kernel busy, before §15):
 `gpu_resultsrotatorMultiply` **42%**, `gpu_fuse_xmac_and_average` 23%,
 `gpu_fused_fringe` 21%, `vector_fft` 11%, everything else <2%. GPU busy-union
 is ~90% of span; residual idle is mostly sub-20 µs inter-kernel gaps. FP64 is
 cheap on the A100, so precision work leans on the 2070.
+
+**What actually limits `gpu_resultsrotatorMultiply`** — measured, not assumed
+(`tests/frac-probes/RESULTS.md`, four env-gated timing probes on the A100):
+atomics **24%**, cross-pol traffic **25%**, band traffic + compute ~50%. Two
+results worth carrying forward: the answer does **not** transfer between cards
+(atomics are 24% on the A100 and 0% on the bandwidth-saturated 2070), and
+giving every (window, band, channel) its own thread is **2.3-2.4× SLOWER** on
+both cards — do not move bands out of the in-thread loop. `docs/gpu-autocorr-
+design.md` holds the resulting three-step plan; §15 was step one.
 
 **Two benchmarking rules** (each cost a wrong conclusion once — §10, §14):
 - Benchmark with **single-thread VDIF**. The DataStream interlaced-VDIF
@@ -31,10 +40,18 @@ cheap on the A100, so precision work leans on the 2070.
   stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
   `node ownership:` verdict.
 
-**Next GPU-busy target:** the **FP16 / precision-drop items (1, 2)**, aimed at
-`gpu_resultsrotatorMultiply` — 42% of GPU busy and memory-bound, so halving its
-traffic helps directly. Then the rest of the occupancy audit (item 6). (The
-DataStream corner-turn remains the real *production* bottleneck — see
+**Next GPU-busy targets**, in order (see `gpu-autocorr-design.md`):
+1. the **window-group reduction** — cut the autocorrelation atomics ~G-fold by
+   putting G FFT windows in one block and reducing before the atomic, leaving
+   the thread count, per-thread work and block→window mapping untouched
+   (~10.7% of A100 kernel busy; flat on the 2070 by construction);
+2. **autocorrelations into Core/XMAC**, which subsumes (1) and also deletes a
+   whole host-tail data path (~17%, but invasive — see the design note);
+3. the **FP16 items (1, 2)**, now better founded: the probes put traffic
+   sensitivity at ~100 µs per 82 MB, so halving the spectra is worth ~11% —
+   comparable to (1) and largely additive.
+
+(The DataStream corner-turn remains the real *production* bottleneck — see
 Longer-term.)
 
 ## Work queue (underway + future)

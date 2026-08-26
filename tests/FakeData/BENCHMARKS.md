@@ -55,6 +55,7 @@ Rules:
 | 2026-07-22 | f3046d081 | gpu, INTERLACEDVDIF (SINGLE_THREAD_VDIF=0) | 12.2 | 35.4 | 23.2 | interlaced comparison at the same commit |
 | 2026-07-23 | (fused unpack+fringe) | gpu, single-thread VDIF | 8.4 | 20.7 | **12.3** | fused unpack into fringe rotation (gpu-plan.md item 1): decode straight from packed data, no unpacked-buffer round-trip; removes the largest kernel. 14.0→12.3 (~12%) on the 2070; larger A100 gain expected (unpack was a bigger fraction there). Both T1 and T5 down. |
 | 2026-07-23 | (fused sum_weights) | gpu, single-thread VDIF | 8.5 | 20.3 | **11.8** | fold the total-weight reduction into gpu_set_weights (per-window atomicAdd), delete the `<<<1,1>>>` gpu_sum_weights. 12.3→11.8 (~4%) on the 2070; on the A100 it should be ~its 7.7% GPU-busy share. |
+| 2026-08-26 | (conjugate array removed) | gpu, single-thread VDIF | 7.0 | 17.8 | **10.8** | delete `conj_fftd_gpu` and conjugate in the multiply instead (gpu-changes.md §15). 11.8→10.8 (~8.5%); `gpu_resultsrotatorMultiply` 536.3→396.9 us/call (−26%) on the 2070, and 82 MB/mode of VRAM freed. Larger A100 gain expected — that kernel is 42-44% of its kernel busy. |
 
 ## A100 cluster profiling (benchprof-profile-nsys-5s.sbatch, 10 stations)
 

@@ -637,3 +637,82 @@ transfer anomaly should go straight to the distribution, not the mean.
 **Consequence for the ledger.** The two 2026-07-23 A100 rows are not comparable
 on wall time — one of them was a contended run. Only the kernel-busy figures
 from that pair mean anything. BENCHMARKS.md carries the caveat.
+
+## 15. The materialised conjugate array is gone (2026-08-26)
+
+**What it was.** The pipeline kept a second full array of spectra,
+`conj_fftd_gpu`, holding nothing but `conj(fftd_gpu)`, so the XMAC and the
+cross-polarisation autocorrelations could read a pre-conjugated operand. The
+rationale was reuse: each station's conjugate is read by up to Nstations−1
+baselines, so conjugating once looked cheaper than conjugating per use.
+
+**Why that reasoning was wrong.** Conjugating inside the multiply is free:
+
+```
+(a+bi)(c+di) = (ac − bd) + (ad + bc)i      4 mul, 2 add
+(a+bi)(c−di) = (ac + bd) + (bc − ad)i      4 mul, 2 add
+```
+
+Same instruction count either way — only the signs differ, and they fold into
+the FMA sign bits. The array was therefore paying, for nothing:
+
+- **an 8-byte global write per spectral point** in `gpu_resultsrotatorMultiply`
+  — 82 MB per launch of its ~205 MB, i.e. ~40% of that kernel's DRAM traffic;
+- **82 MB of VRAM per Mode** (820 MB across benchprof's 10 datastreams);
+- **double the XMAC's working set** — 164 MB of spectra rather than 82 MB, on a
+  kernel measured at an effective 3.6 TB/s, i.e. served out of L2, where
+  footprint is precisely what matters;
+- a per-subint memset of the whole array on the invalid-subint path.
+
+**What changed.** `cuCmulConjf(a, b)` = `a * conj(b)` now lives in
+`gpumode_kernels.cuh`, shared by both translation units rather than duplicated
+(the existing `atomicAddFloatComplex`/`atomicAddFloatComplex1` pair is a
+standing example of what not to do again). Then:
+
+- the XMAC's `m2` pointer array points at `fftd_gpu`, and its product becomes
+  `cuCmulConjf(v1, v2)` — same orientation, `v1 * conj(v2)`;
+- the **band** autocorrelation is taken from the register the rotator already
+  holds, as `v.x*v.x + v.y*v.y`, accumulated into the real component only.
+  `v * conj(v)` is real by construction, so the second atomic per element was
+  adding a provably-zero imaginary part — this is the real-only optimisation
+  identified but left unapplied during the July item-4 investigation;
+- the **cross-pol** autocorrelations read both operands from `fftd_gpu`. Each
+  value was written by the same thread earlier in its own band loop (same
+  window, same channel, different band), so there is no new race — and they get
+  cheaper too: two cold reads from two different arrays become two reads from
+  one array the band loop has just touched.
+
+**Numerics.** The expressions are unchanged, so differences are at most 1 ulp
+from FMA grouping — the same class as the FMA-contraction differences already
+documented for this project, and well inside the acceptance bar. Verified
+bit-identical in a non-contracted host build across generic, sign-flipped and
+subnormal operands. The one real change: the band autocorrelation's imaginary
+component was accumulating FMA rounding residue (~1e-8 of the real part) around
+a physically-zero value, and is now exactly zero.
+
+**Measured (RTX 2070, benchprof2, 2500 windows x 16 bands x 128 channels).**
+`gpu_resultsrotatorMultiply` **536.3 → 396.9 us/call (−26%)**; total kernel busy
+1662.9 → 1557.9 ms (−6.3%). T5−T1 **11.8 → 10.8 s (−8.5%)**. Device-memory
+estimate for the 2-station `usb` scenario 197.09 → 132.12 MB of modes, exactly
+the third of the triple-array term that was removed. The A100 should gain more:
+that kernel is 42-44% of its kernel busy, and the probes put traffic
+sensitivity at ~100 us per 82 MB removed.
+
+The XMAC itself was flat on the 2070 (33.3 → 34.0 us/call) — it is only 7% of
+kernel busy at this scale, so the halved working set had nothing to show. Worth
+re-checking on the A100, where it is 23%.
+
+**Also removed, because this change made them wrong or dead:**
+`_gpu_processBaselineBased` (an unlaunched XMAC fallback whose `cuCmulf` was
+only correct while `m2` pointed at a pre-conjugated array — reviving it after
+this change would have silently produced `V1*V2`), and the
+`getGpuConjugatedFreqs`/`getGpuConjugatedFreqsHost` virtuals, whose only
+overrides went with the array and which would otherwise have returned a silent
+`nullptr` to any future caller.
+
+**Correctness.** run-local.sh usb / usb-complex / complex-complex / multi PASS
+CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes, and PASS under
+`DIFX_GPU_WEIGHTS_HOST=1` (verified genuinely engaged — the fallback's event
+timers report non-zero where the device path reports zeros).
+
+Design and the remaining two steps: `docs/gpu-autocorr-design.md`.

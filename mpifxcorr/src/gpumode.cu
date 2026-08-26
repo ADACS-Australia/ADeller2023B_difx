@@ -280,9 +280,6 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
     estimatedbytes_gpu += fftd_gpu->size();
 
-    conj_fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
-    estimatedbytes_gpu += conj_fftd_gpu->size();
-
     temp_autocorrelations_gpu = new GpuMemHelper<cuFloatComplex>(autocorrwidth * numrecordedbands * recordedbandchannels, cuStream);
     estimatedbytes_gpu += temp_autocorrelations_gpu->size();
 
@@ -470,7 +467,6 @@ GPUMode::~GPUMode() {
     delete packeddata_gpu;
     delete complex_fringe_rotated_gpu;
     delete fftd_gpu;
-    delete conj_fftd_gpu;
     delete temp_autocorrelations_gpu;
 
     delete gSampleIndexes;
@@ -575,7 +571,7 @@ size_t GPUMode::estimateDeviceBytes(Configuration *config, int configindex, int 
 
     size_t bytes = 0;
     bytes += maxdatabytes;                                                          // packeddata_gpu
-    bytes += 3 * (size_t)fftchannels * nFFTs * nbands * sizeof(cuFloatComplex);     // fringe rotated + fftd + conj_fftd
+    bytes += 2 * (size_t)fftchannels * nFFTs * nbands * sizeof(cuFloatComplex);     // fringe rotated + fftd
     const int acwidth = config->writeAutoCorrs(configindex) ? 2 : 1;
     bytes += (size_t)acwidth * nbands * recordedbandchan * sizeof(cuFloatComplex);  // temp_autocorrelations_gpu
     // (unpacked-sample buffer removed: unpack is fused into fringe rotation)
@@ -790,7 +786,6 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
 
       // set everything to zero and return
         checkCuda(cudaMemsetAsync(fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
-	    checkCuda(cudaMemsetAsync(conj_fftd_gpu->gpuPtr(), 0.0, fftchannels * cfg_numBufferedFFTs * numrecordedbands * sizeof(cuFloatComplex), cuStream));
 
         // We return before set_weights() runs, so explicitly invalidate every
         // FFT window and zero its data weight - otherwise stale values from
@@ -1020,7 +1015,7 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
     runFFT();
     cudaEventRecord(ev_fft, cuStream);
 
-    // End of process_gpu_tofft: fftd_gpu/conj_fftd_gpu now hold this subint's
+    // End of process_gpu_tofft: fftd_gpu now holds this subint's
     // spectra. No tail-consumed output buffer has been written, so the next
     // subint's process_gpu_tofft may run on the compute stream while this
     // subint's afterfft outputs drain and its host tail runs.
@@ -1596,7 +1591,6 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
 
 __global__ void gpu_resultsrotatorMultiply(
         cuFloatComplex* const gpufftd_gpu,
-        cuFloatComplex* const gpuconjfftd_gpu,
         cuFloatComplex* const autocorrelations,
         const float* const fracSampleError,
         const bool* const validSamples,
@@ -1680,30 +1674,36 @@ __global__ void gpu_resultsrotatorMultiply(
         exponent -= int(exponent);
         cuFloatComplex cr;
         __sincosf(TWO_PI * exponent, &cr.y, &cr.x);
-        gpufftd_gpu[dataIndex] = cuCmulf(gpufftd_gpu[dataIndex], cr);
+        const cuFloatComplex v = cuCmulf(gpufftd_gpu[dataIndex], cr);
+        gpufftd_gpu[dataIndex] = v;
 
-        // do the conjugation
-        gpuconjfftd_gpu[dataIndex] = cuConjf(gpufftd_gpu[dataIndex]);
-
-        // do the autocorrelation (skipping Nyquist channel)
-        // Calculate the destination index
+        // Autocorrelation, straight from the register: v * conj(v) is |v|^2,
+        // which is real by construction, so only the real component is
+        // accumulated (the imaginary one is provably zero and used to cost a
+        // second atomic on every element).
         const size_t autocorrIndex = (bandindex * recordedbandchannels) + channelindex;
-        atomicAddFloatComplex(&autocorrelations[autocorrIndex], cuCmulf(gpufftd_gpu[dataIndex], gpuconjfftd_gpu[dataIndex]));
+        atomicAdd(&((float*)&autocorrelations[autocorrIndex])[0],
+                  v.x * v.x + v.y * v.y);
     }
 
+    // Cross-polarisation autocorrelations. Both operands now come from the
+    // rotated spectra and the second is conjugated in the multiply
+    // (cuCmulConjf below) - there is no materialised conjugate array any more.
+    // Each value read here was written by THIS thread earlier in the band loop
+    // (same window, same channel, a different band), so there is no race.
     for (size_t recordedfreq = 0; recordedfreq < numrecordedfreqs; recordedfreq++) {
         if (calccrosspolautocorrs && counts_gpu[recordedfreq] > 1) {
+            const size_t bandA = indices[(recordedfreq * MAX_INDICIES) + 0];
+            const size_t bandB = indices[(recordedfreq * MAX_INDICIES) + 1];
+            const size_t windowBase = (subloopindex * fftchannels * numrecordedbands) + channelindex;
+            const size_t idxA = windowBase + (bandA * fftchannels);
+            const size_t idxB = windowBase + (bandB * fftchannels);
+            const size_t crossBase = (numrecordedbands * recordedbandchannels) + channelindex;
 
-            size_t fftIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 0] * fftchannels) + channelindex;
-
-	        size_t conjIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 1] * fftchannels) + channelindex;
-
-	        atomicAddFloatComplex(&autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 0] * recordedbandchannels) + channelindex], cuCmulf(gpufftd_gpu[fftIndex], gpuconjfftd_gpu[conjIndex]));
-	    
-            fftIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 1] * fftchannels) + channelindex;
-            conjIndex = (subloopindex * fftchannels * numrecordedbands) + (indices[(recordedfreq * MAX_INDICIES) + 0] * fftchannels) + channelindex;
-
-            atomicAddFloatComplex(&autocorrelations[(numrecordedbands * recordedbandchannels) + (indices[(recordedfreq * MAX_INDICIES) + 1] * recordedbandchannels) + channelindex], cuCmulf(gpufftd_gpu[fftIndex], gpuconjfftd_gpu[conjIndex]));
+            atomicAddFloatComplex(&autocorrelations[crossBase + (bandA * recordedbandchannels)],
+                                  cuCmulConjf(gpufftd_gpu[idxA], gpufftd_gpu[idxB]));
+            atomicAddFloatComplex(&autocorrelations[crossBase + (bandB * recordedbandchannels)],
+                                  cuCmulConjf(gpufftd_gpu[idxB], gpufftd_gpu[idxA]));
         }
     }
 }
@@ -1743,7 +1743,6 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
 	gpu_resultsrotatorMultiply<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(fftchannels_block), 0, cuStream>>>
            (
                     fftd_gpu->gpuPtr(),
-                    conj_fftd_gpu->gpuPtr(),
                     temp_autocorrelations_gpu->gpuPtr(),
                     gFracSampleError->gpuPtr(),
                     gValidSamples->gpuPtr(),
@@ -1762,7 +1761,7 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
 		    counts_gpu->gpuPtr()
             );
 
-    // We should zero the first channel (lowest frequency) of any LSB bands. Of both ffd_gpu and conj_fftd_gpu
+    // We should zero the first channel (lowest frequency) of any LSB bands of fftd_gpu.
     // In future, would be more efficient to do this at visibility.cpp, just prior to writing to disk (if either band in the baseline is LSB)
 
     // Start copying the autocorrelations back to the host
