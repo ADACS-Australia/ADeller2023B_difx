@@ -2,11 +2,15 @@
 #include "gpumode.cuh"
 #include "alert.h"
 #include "gpumode_kernels.cuh"
+#include "sysutil.h"
 #include <thread>
 //#include <iostream>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <set>
+#include <sstream>
+#include <unistd.h>
 
 using namespace std::chrono;
 
@@ -184,6 +188,70 @@ __global__ void gpu_baseline_weights(const float* const* dw1,
     out[a] = s;
 }
 
+// Report where this rank sits relative to the GPU it drives, and warn if the
+// two are on different NUMA nodes.
+//
+// WHY THIS IS WORTH A LOG LINE: the Core receive buffers are allocated (and so
+// first-touched, fixing their NUMA node) by the base Core constructor, then
+// page-locked below for direct H2D. If the rank was placed on a node remote
+// from the GPU, every input transfer crosses the inter-socket interconnect at
+// roughly half bandwidth, and nothing in the correlator can tell - it just
+// looks like a slow run. Two A100 profiles of the identical binary and job
+// differed 8.9 vs 18.9 GB/s of pinned H2D (12.9 GB moved either way), which is
+// how this check came to exist; see docs/gpu-changes.md.
+//
+// Placement is the launcher's job (SLURM --gres-flags=enforce-binding, or an
+// mpirun binding policy) - we only observe it, because by the time any GPU code
+// runs the buffers are already placed and the cpuset is already fixed.
+static void reportGpuNumaPlacement(int mpiid) {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        cudaGetLastError();
+        device = 0;
+    }
+    // Deliberately not checkCuda - a placement report must never abort a run.
+    char busid[32];
+    if (cudaDeviceGetPCIBusId(busid, sizeof(busid), device) != cudaSuccess) {
+        cudaGetLastError();
+        busid[0] = '\0';
+    }
+    const int gpunode = (busid[0] != '\0') ? getPciNumaNode(busid) : -1;
+
+    std::set<int> cpus, cpunodes;
+    const bool havecpus = getCpuAffinity(cpus);
+    const bool havenodes = havecpus && getNumaNodesOfCpus(cpus, cpunodes);
+
+    char host[256];
+    if (gethostname(host, sizeof(host)) != 0)
+        strcpy(host, "unknown");
+    host[sizeof(host) - 1] = '\0';
+
+    std::ostringstream msg;
+    msg << "GPU Core " << mpiid << " placement: host " << host << ", GPU " << device
+        << " (" << (busid[0] != '\0' ? busid : "PCI id unknown") << ") on NUMA node ";
+    if (gpunode >= 0)
+        msg << gpunode;
+    else
+        msg << "unknown";
+    msg << "; rank on CPU" << (cpus.size() == 1 ? " " : "s ");
+    if (havecpus)
+        msg << formatIdList(cpus);
+    else
+        msg << "unknown";
+    msg << ", NUMA node " << (havenodes ? formatIdList(cpunodes) : std::string("unknown"));
+
+    const bool remote = (gpunode >= 0 && havenodes && cpunodes.count(gpunode) == 0);
+    const bool local = (gpunode >= 0 && havenodes && cpunodes.size() == 1 && cpunodes.count(gpunode) == 1);
+    if (local)
+        msg << " - GPU-local";
+    cinfo << startl << msg.str() << endl;
+    if (remote)
+        cwarn << startl << "GPU Core " << mpiid << " is NOT on a NUMA node local to its GPU"
+              << " - pinned host-to-device transfers will cross the interconnect at reduced"
+              << " bandwidth. Bind the rank to the GPU's node (SLURM:"
+              << " --gres-flags=enforce-binding)." << endl;
+}
+
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)
         : Core(id, conf, dids, rcomm) {
     cudaDeviceProp prop;
@@ -195,6 +263,9 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
       cerr << "GPU DiFX must have 1 thread per Core process - had " << numprocessthreads << endl;
       exit(1);
     }
+
+    // Every Core rank reports its own placement (they can land differently).
+    reportGpuNumaPlacement(mpiid);
 
     // Initialize the compute stream and share it with every GPUMode this Core
     // will construct, so all station processing and the XMAC form a single

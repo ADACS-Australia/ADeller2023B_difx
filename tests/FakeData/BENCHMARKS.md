@@ -70,6 +70,42 @@ stream. This is a diagnostic ledger (idle %), not the T5-T1 metric.
 | 2026-07-22 | unpack-drain fix, INTERLACED | 9858 | 5077 | 48.5% | 5731 | 41.9% | sync fix held (no `cudaStreamSynchronize` storm) but GPU still starved by the DataStream corner-turn — see §10 |
 | 2026-07-22 | + single-thread VDIF (genheaders), 4 s | 6050 | 5058 | 16.4% | 5614 | **7.2%** | corner-turn removed; kernel busy unchanged (5058≈5077) so the win is pure idle removal; wall (CUDA-API span) 12169 → 7886 ms (**~35%**); GPU now compute-bound |
 | 2026-07-23 | fused unpack+fringe (619c273be), 5 s | 7032 | 4863 | 30.9% | 6337 | 9.9% | fused kernel replaces unpack+fringe; kernel-only idle rises (faster kernels ⇒ fixed tail is a bigger fraction) but the H2D copies now fill it (idle+copy 9.9%). See the per-subint comparison below. |
+| 2026-07-23 | fused sum_weights (d503b7708), 5 s | 5800 | 4500 | 22.4% | 5208 | 10.2% | `gpu_sum_weights` gone from the mix; kernel busy −7.4%, exactly its old share. Same 5 s window as the row above ⇒ directly comparable. Wall (CUDA-API span) 9064 → 7710 ms, but see the H2D caveat below — only the kernel-busy part is attributable. |
+
+**Weight-kernel elimination, measured against the row above** (both captures
+are 5 s / ~495 subints per station, so the totals compare directly). Capture +
+analyser output: `tests/23072026-weightkerneliminated/benchprof/nsys/`.
+
+| kernel | fused unpack+fringe | + fused sum_weights | Δ |
+|---|---|---|---|
+| `gpu_sum_weights` `<<<1,1>>>` | 373.2 ms (7.7%) | **absent** | −373.2 ms |
+| `gpu_set_weights` | 22.5 ms (0.5%) | 40.3 ms (0.9%) | +17.8 ms (the atomicAdd) |
+| **net kernel busy** | 4862.5 ms | 4500.5 ms | **−362 ms (−7.4%)** |
+
+Every other kernel is stable to <0.5% across the two captures
+(`gpu_resultsrotatorMultiply` 1894.9 → 1894.7 ms, `gpu_fused_fringe` 948.6 →
+946.8, `vector_fft` 484.0 → 482.0), which is the cross-check that the two runs
+are comparable and that nothing but the weight path moved.
+
+**⚠ H2D caveat — do not read the whole wall gain as ours.** The same volume of
+input moved far faster in the second capture: **12.90 GB / 1444.7 ms (8.9 GB/s)
+→ 12.88 GB / 683.0 ms (18.9 GB/s)**, at an unchanged copy count (~29.7k). No
+part of this change touches the transfer path, so that ~762 ms is node/affinity
+variation, not a code win. Corroborating: the host-side NVTX blocking merely
+moved (`h2d_stage` 26.8 → 2387 ms, `complete_d2h_wait` 4020 → 3328 ms). Of the
+~15% CUDA-API-span improvement, only the ~7.4% kernel-busy part is
+attributable. A 2× spread in achieved H2D bandwidth between two runs of the
+same job is itself the motivation for the NUMA/affinity item in
+`docs/gpu-plan.md`.
+
+New A100 kernel mix (% of kernel busy, 4500.5 ms): `gpu_resultsrotatorMultiply`
+**42.1%** (the #1 target — memory-bound, the FP16 candidate),
+`gpu_fuse_xmac_and_average` 22.7%, `gpu_fused_fringe` 21.0%, `vector_fft`
+10.7%, `gpu_baseline_weights` 1.4%, `gpu_set_weights` 0.9%, precompute 0.7%,
+`gpu_blank_frames` 0.6%. Busy-union (kernels+copies) is **89.8%** of the span,
+and 74% of the residual idle is now in sub-20 µs inter-kernel gaps — launch
+overhead, not host starvation. H2D at 683 ms is 11.8% of the span (the
+remaining wall floor under the FP16 work).
 
 **Fused unpack+fringe, per-subint (window-independent) vs the pre-fusion 4 s
 profile above** (normalising each kernel's total by its launch count, since the

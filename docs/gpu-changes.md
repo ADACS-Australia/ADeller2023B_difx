@@ -534,3 +534,84 @@ CPU-vs-GPU in BOTH pipeline modes, and PASS under the host-weights fallback.
 should be ~its 7.7% GPU-busy share (2070 has fewer/cheaper serial-kernel
 stalls). See BENCHMARKS.md. Part of gpu-plan.md item 6 (the occupancy audit);
 the rest of that audit — ad-hoc launch dims elsewhere — remains open.
+
+## 14. CPU/NUMA placement of the GPU Core: report it, and bind it (2026-08-26)
+
+**How it was found.** The A100 profile of the `gpu_sum_weights` removal (§13)
+showed the expected −7.4% of kernel busy, but the *wall* had improved ~15% —
+more than the change could explain. The difference was in the input transfers:
+the same 12.9 GB of pinned H2D took **1444.7 ms in the previous capture and
+683.0 ms in this one** (8.9 vs 18.9 GB/s), at an unchanged copy count, for a
+binary whose transfer path had not been touched at all. Kernel times across the
+two captures agree to <0.5% (`gpu_resultsrotatorMultiply` 1894.9 vs 1894.7 ms),
+so the device was healthy in both — only the copy engine differed.
+
+Every profile we have keeps `SCHED_EVENTS` in its nsys capture, and because
+`--cpu-bind=cores` pins the Core rank to exactly one CPU, each capture records
+which CPU that was:
+
+| capture | node | GPU | Core rank CPU | pinned H2D |
+|---|---|---|---|---|
+| 2026-07-20 after-unpackallfix | gina2 | 0000:01:00.0 | 31 | 18.0 GB/s |
+| 2026-07-21 after-processgpusplit | gina6 | 0000:41:00.0 | 58 | 19.3 GB/s |
+| 2026-07-22 non-interlaced VDIF | gina13 | 0000:01:00.0 | 52 | 19.2 GB/s |
+| 2026-07-23 fused unpack+fringe | gina8 | 0000:41:00.0 | 55 | **8.9 GB/s** |
+| 2026-07-23 fused sum_weights | gina15 | 0000:c1:00.0 | 31 | 18.9 GB/s |
+
+~19 GB/s is the normal rate; one run out of five got half of it. The runs use a
+different node each time and the job is not `--exclusive`, so the CPU the Core
+rank lands on — and therefore the NUMA node its host buffers live on — is
+effectively random from run to run.
+
+**Why placement can do this.** The Core receive buffers are allocated (and so
+first-touched, which fixes their NUMA node) by the base `Core` constructor, and
+`GPUCore` then `cudaHostRegister`s them for direct H2D. Page-locking does not
+move pages: it pins them wherever first touch put them. If the rank sits on a
+node remote from the GPU, every input transfer crosses the inter-socket
+interconnect, which costs about half the bandwidth — and nothing in the
+correlator can observe this. It is worth ~760 ms of a ~7.7 s wall, i.e. bigger
+than the last two kernel optimisations combined.
+
+We cannot prove from these captures alone that gina8's CPU 55 was remote from
+its GPU (that needs the node's topology, which we did not record, and PCIe
+contention from a co-tenant job is an alternative explanation for a single
+outlier). Both causes have the same fix and the same tell, so this change does
+two things: makes the placement **visible**, and makes it **deterministic**.
+
+**What changed.**
+- `sysutil.{h,cpp}` gained a small Linux/sysfs placement enquiry:
+  `getCpuAffinity` (the rank's cpuset), `getNumaNodesOfCpus`, `getPciNumaNode`
+  (a GPU's node, from its PCI address), plus `parseIdList`/`formatIdList` for
+  sysfs-style `"0-7,16"` lists. All of them report "unknown" rather than
+  failing on platforms that do not expose the information, and they read sysfs
+  with a plain `ifstream` — not `ifstreamOpen`, whose NFS retry-and-warn loop
+  would be wrong for an attribute that is legitimately absent.
+- `GPUCore`'s constructor logs one line per Core rank —
+  `GPU Core 11 placement: host gina15, GPU 0 (0000:C1:00.0) on NUMA node 3;
+  rank on CPU 31, NUMA node 3 - GPU-local` — and `cwarn`s if the rank is
+  definitively on a different node from its GPU. Diagnostics only: by the time
+  any GPU code runs, the buffers are placed and the cpuset is fixed, so this
+  reports the launcher's decision rather than trying to correct it.
+- Both cluster sbatch scripts request **`--gres-flags=enforce-binding`**, which
+  makes SLURM allocate only CPUs local to the selected GPU, and dump
+  `numactl -H` + `nvidia-smi topo -m` into the job log so a slow run can be
+  diagnosed after the fact. The cost is a potentially longer queue wait; the
+  scripts say so.
+
+**Consequence for the ledger.** The two 2026-07-23 A100 rows are not directly
+comparable on wall time: of the ~15% CUDA-API-span improvement, only the ~7.4%
+kernel-busy part is attributable to the code. BENCHMARKS.md now carries that
+caveat. Future profiles should quote the placement line before any wall claim.
+
+**Correctness.** Logging and job-script changes only — no correlator behaviour
+is affected. run-local.sh usb / usb-complex / complex-complex / multi PASS
+CPU-vs-GPU in BOTH pipeline modes. On the desktop (single-socket, RTX 2070) the
+line reads `on NUMA node unknown; rank on CPUs 0-7, NUMA node 0` and no warning
+fires — the intended graceful degradation where sysfs reports `numa_node = -1`.
+
+**Not done (deliberately).** In-process binding — having the rank move itself
+onto GPU-local CPUs — is the obvious follow-up, but it can only help if the
+launcher already handed us a cpuset that *contains* GPU-local CPUs, and it
+would have to happen before the base `Core` constructor allocates the receive
+buffers, i.e. in `mpifxcorr.cpp` rather than in `GPUCore`. Left until a profile
+with the placement line shows a case `enforce-binding` cannot fix.

@@ -38,11 +38,15 @@ Also landed 2026-07-23: the `<<<1,1>>>` `gpu_sum_weights` reduction (was 7.7%
 of A100 GPU busy) was folded into `gpu_set_weights` and deleted (gpu-changes.md
 §13; part of item 6).
 
+Also landed 2026-08-26: the **CPU/NUMA placement report + `enforce-binding`**
+(gpu-changes.md §14, item 8) — pinned H2D bandwidth was varying 2× run to run
+because the Core rank landed on an arbitrary CPU relative to its GPU.
+
 **Next GPU-busy targets:** the **FP16 / precision-drop items (items 1, 2)**,
-whose clearest target is now `gpu_resultsrotatorMultiply` (39% of A100 GPU
-busy, memory-bound — halving its traffic helps directly), plus the rest of the
-occupancy audit (item 6). (The DataStream corner-turn above remains the real
-production bottleneck — see Longer-term.)
+whose clearest target is now `gpu_resultsrotatorMultiply` (**42%** of A100 GPU
+busy after §13, memory-bound — halving its traffic helps directly), plus the
+rest of the occupancy audit (item 6). (The DataStream corner-turn above remains
+the real production bottleneck — see Longer-term.)
 
 ## Work queue (underway + future)
 
@@ -101,7 +105,19 @@ production bottleneck — see Longer-term.)
    construction/review only. Add a phaseCalInt>0 synthetic scenario to
    run-local.sh so CPU-vs-GPU covers pcal extraction.
 8. **NUMA/affinity audit** — mattered on the cluster, less on the desktop;
-   check rank/thread placement and memory locality.
+   check rank/thread placement and memory locality. **Largely DONE
+   2026-08-26** (gpu-changes.md §14): pinned H2D was measured at 8.9 GB/s in
+   one A100 capture vs ~19 GB/s in four others, traced to the Core rank
+   landing on an arbitrary CPU (the nsys `SCHED_EVENTS` table records which
+   one, since `--cpu-bind=cores` pins it to exactly one). `GPUCore` now logs
+   its CPU/NUMA placement relative to its GPU and warns when the two are on
+   different nodes, and both cluster sbatch scripts request
+   `--gres-flags=enforce-binding` so SLURM only allocates GPU-local CPUs.
+   **Remaining:** confirm on the next cluster profile that the placement line
+   reads GPU-local and the ~19 GB/s H2D rate is now consistent; and, only if
+   that shows a case the launcher cannot fix, add opt-in in-process binding
+   (which must run before the base `Core` constructor first-touches the
+   receive buffers, so it belongs in `mpifxcorr.cpp`, not `GPUCore`).
 
 ## Standing process (adopted 2026-07-18)
 

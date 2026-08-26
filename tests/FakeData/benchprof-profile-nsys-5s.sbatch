@@ -5,10 +5,22 @@
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
+#SBATCH --gres-flags=enforce-binding
 #SBATCH --mem-per-cpu=4000
 #SBATCH --time=15:00
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
+#
+# NUMA: --gres-flags=enforce-binding makes SLURM allocate only CPUs local to
+# the selected GPU. Without it the 12 ranks land on arbitrary cores, and if the
+# Core rank ends up on the far socket its page-locked receive buffers (first
+# touched there, then registered for direct H2D) feed the GPU across the
+# inter-socket link at about half bandwidth: two profiles of the identical
+# binary and job measured 8.9 vs 18.9 GB/s of pinned H2D for the same 12.9 GB,
+# ~760 ms of a ~7.7 s wall. It can lengthen the queue wait, since the scheduler
+# now needs free cores on the right node. mpifxcorr logs the resulting
+# placement ("GPU Core N placement: ... on NUMA node ...") and warns if the
+# rank still ends up remote - check the difxlog before trusting a profile.
 #
 # Clean GPU-bound Nsight Systems profile of the 10-antenna fake-data
 # "benchprof" job (source=fake, ~5 s window = ~500 x 10ms subints). Deliberately
@@ -81,6 +93,13 @@ if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
     sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|' benchprof_1.input
     echo "benchprof: rewrote INTERLACEDVDIF -> single-thread VDIF (set SINGLE_THREAD_VDIF=0 to disable)"
 fi
+
+# Record the node's CPU/GPU topology, so a slow profile can be diagnosed after
+# the fact (mpifxcorr's own placement line reports only the Core rank's view).
+echo "=== node topology ($(hostname)) ==="
+numactl -H 2>/dev/null || echo "numactl unavailable"
+nvidia-smi topo -m 2>/dev/null || echo "nvidia-smi topo unavailable"
+echo "=== end topology ==="
 
 date
 # Collect the correlator log; killed once mpifxcorr returns.

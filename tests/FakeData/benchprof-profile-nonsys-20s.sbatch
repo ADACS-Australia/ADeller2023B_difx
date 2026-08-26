@@ -5,6 +5,7 @@
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
+#SBATCH --gres-flags=enforce-binding
 #SBATCH --mem-per-cpu=4000
 #SBATCH --time=15:00
 #SBATCH --account=oz168
@@ -73,6 +74,15 @@ if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
     sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|' benchprof_1.input
     echo "benchprof: rewrote INTERLACEDVDIF -> single-thread VDIF (set SINGLE_THREAD_VDIF=0 to disable)"
 fi
+
+# Record the node's CPU/GPU topology, so a slow run can be diagnosed after the
+# fact (mpifxcorr's own placement line reports only the Core rank's view).
+# --gres-flags=enforce-binding above is what keeps the ranks on CPUs local to
+# the GPU; see the header of benchprof-profile-nsys-5s.sbatch for why it matters.
+echo "=== node topology ($(hostname)) ==="
+numactl -H 2>/dev/null || echo "numactl unavailable"
+nvidia-smi topo -m 2>/dev/null || echo "nvidia-smi topo unavailable"
+echo "=== end topology ==="
 
 # Collect the correlator log; killed once mpifxcorr returns.
 difxlog benchprof_1 "$WORKDIR/benchprof_1.difxlog" 4 &
