@@ -26,9 +26,13 @@ Rules:
   input copies and costs ~10% of wall with no other symptom (gpu-changes.md
   §14). tooarrana rejects `--exclusive`, so isolation comes from reserving most
   of the node: 5 × 12 tasks = 60 of gina's 64 cores. That does **not** start
-  more mpifxcorr ranks (the rank count is `--ntasks`). Each run prints a
-  `node ownership: N/M cores` verdict; anything under 90% does not belong in
-  this file.
+  more mpifxcorr ranks (the rank count is `--ntasks`). **Keep `--nodes=1`** —
+  without it SLURM satisfies a wide `--cpus-per-task` by splitting the ranks
+  across two nodes, which reserves a GPU per node and pushes some
+  DataStream→Core traffic onto the fabric instead of intra-node CMA (seen
+  2026-08-26). Each run prints a `node ownership: N/M cores` verdict and warns
+  if the allocation spanned more than one node; anything under 90%, or
+  multi-node, does not belong in this file.
 - Record every change that lands: benchmark at the commit that follows it.
 - Note the VDIF threading (single-thread default vs `SINGLE_THREAD_VDIF=0`).
 - FakeData output is NOT bit-reproducible run to run (see README) - this

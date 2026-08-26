@@ -2,6 +2,7 @@
 #
 #SBATCH --job-name=difx_benchprof_nonsys
 #SBATCH --output=benchprof-nonsys-20s.%j.mpilog
+#SBATCH --nodes=1
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
@@ -29,6 +30,11 @@
 # tasks = 60 of gina's 64 cores. It does NOT start more mpifxcorr ranks (that
 # is --ntasks). See the header of benchprof-profile-nsys-5s.sbatch and
 # gpu-changes.md sec 14.
+#
+# --nodes=1 is load-bearing: without it SLURM satisfies a wide --cpus-per-task
+# by splitting the 12 ranks over two nodes, which reserves a GPU per node and
+# pushes some DataStream->Core traffic onto the fabric instead of intra-node
+# CMA. See the header of benchprof-profile-nsys-5s.sbatch.
 #
 # Why a separate no-nsys script: nsys 2022.2.1's injection library
 # (libToolsInjection64.so) segfaults on a long/heavy capture - a ~20 s
@@ -93,6 +99,13 @@ fi
 # tooarrana forbids --exclusive ("please request the number of cores you need
 # per task with --cpus-per-task=x instead"), so isolation is measured as the
 # fraction of the node's cores this job reserved, not from OverSubscribe.
+nnodes="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
+if [ "$nnodes" != 1 ]; then
+    echo "=== WARNING: allocation spans $nnodes nodes (${SLURM_JOB_NODELIST:-?}) -" \
+         "TIMINGS ARE NOT COMPARABLE. --gres is per-node so this holds a GPU on each," \
+         "and some DataStream->Core traffic crosses the fabric instead of intra-node CMA." \
+         "Keep --nodes=1. ==="
+fi
 cores_alloc=$(( ${SLURM_CPUS_PER_TASK:-1} * ${SLURM_NTASKS:-1} ))
 cores_node=$(nproc --all)
 pct=$(( 100 * cores_alloc / cores_node ))

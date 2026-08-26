@@ -599,7 +599,18 @@ regression that crept in — the isolation was never there.
   x 12 tasks = 60 of gina's 64 cores. Widening it does **not** start more
   mpifxcorr ranks — the rank count is `--ntasks` and the roles come from the
   `.input`'s ACTIVE DATASTREAMS (rank 0 manager, 1-10 datastreams, 11 Core) —
-  so the extra cores are simply reserved and mostly idle.
+  so the extra cores are simply reserved and mostly idle. It does, however,
+  need **`--nodes=1`** alongside it: the first wide submission was scheduled
+  across *two* nodes, and none of these scripts had ever constrained the node
+  count. That matters twice over — `--gres` is a per-node request, so a 2-node
+  allocation reserves a GPU on each and uses one; and DataStream ranks on the
+  far node stop reaching the Core through intra-node CMA (`process_vm_readv`)
+  and go over the fabric, changing the very data-delivery path these
+  benchmarks exist to hold constant. All three sbatch scripts now pin
+  `--nodes=1` and warn in the log if the allocation spanned more than one node.
+  (The captures analysed so far were single-node — their Core ranks show
+  `process_vm_readv`, which is CMA and intra-node only — so the existing ledger
+  rows are unaffected.)
 - `--gres-flags=enforce-binding` is kept in both. On these nodes it is
   measurably worth nothing, but it costs nothing and would matter on hardware
   with a slower cross-socket link.

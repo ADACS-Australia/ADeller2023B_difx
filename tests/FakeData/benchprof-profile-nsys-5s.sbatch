@@ -2,6 +2,7 @@
 #
 #SBATCH --job-name=difx_benchprof_nsys5s
 #SBATCH --output=benchprof-nsys-5s.%j.mpilog
+#SBATCH --nodes=1
 #SBATCH --ntasks=12
 #SBATCH --cpus-per-task=1
 #SBATCH --gres=gpu:1
@@ -32,6 +33,15 @@
 # 11 Core); the extra cores are simply reserved and mostly idle. The cost is
 # queue time, which is the whole reason there are two modes. The run prints its
 # own "node ownership: N/M cores" verdict below - check it before quoting.
+#
+# --nodes=1 IS LOAD-BEARING, do not drop it. Without it SLURM will happily
+# satisfy a wide --cpus-per-task by SPLITTING the 12 ranks across two nodes,
+# which wrecks the measurement two ways: (1) --gres is a PER-NODE request, so a
+# 2-node allocation reserves a GPU on each node and uses one; (2) DataStream
+# ranks on the far node stop reaching the Core rank through intra-node CMA
+# (process_vm_readv) and go over the fabric instead, changing the data-delivery
+# path that these benchmarks exist to hold constant. Observed 2026-08-26 with
+# --cpus-per-task=5. If a single node cannot be found, the job SHOULD queue.
 # (--gres-flags=enforce-binding below keeps the ranks on CPUs local to the
 # selected GPU. Measured on these nodes it buys nothing - placements from
 # GPU-local to cross-socket all hit the same peak - but it is free and would
@@ -115,6 +125,13 @@ fi
 # tooarrana forbids --exclusive ("please request the number of cores you need
 # per task with --cpus-per-task=x instead"), so isolation is measured as the
 # fraction of the node's cores this job reserved, not from OverSubscribe.
+nnodes="${SLURM_JOB_NUM_NODES:-${SLURM_NNODES:-1}}"
+if [ "$nnodes" != 1 ]; then
+    echo "=== WARNING: allocation spans $nnodes nodes (${SLURM_JOB_NODELIST:-?}) -" \
+         "TIMINGS ARE NOT COMPARABLE. --gres is per-node so this holds a GPU on each," \
+         "and some DataStream->Core traffic crosses the fabric instead of intra-node CMA." \
+         "Keep --nodes=1. ==="
+fi
 cores_alloc=$(( ${SLURM_CPUS_PER_TASK:-1} * ${SLURM_NTASKS:-1} ))
 cores_node=$(nproc --all)
 pct=$(( 100 * cores_alloc / cores_node ))

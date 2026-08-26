@@ -26,9 +26,10 @@ cheap on the A100, so precision work leans on the 2070.
 - Give cluster runs **most of the node** for any number that reaches the
   ledger: `sbatch --cpus-per-task=5 …` (60 of gina's 64 cores). tooarrana
   rejects `--exclusive`, and widening `--cpus-per-task` does *not* start extra
-  mpifxcorr ranks — that is `--ntasks`. A co-tenant job stalls the input copies
-  and costs ~10% of wall, invisibly. Each run prints a `node ownership:`
-  verdict.
+  mpifxcorr ranks — that is `--ntasks`. Keep `--nodes=1`, or SLURM splits the
+  ranks over two nodes and the data path changes under you. A co-tenant job
+  stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
+  `node ownership:` verdict.
 
 **Next GPU-busy target:** the **FP16 / precision-drop items (1, 2)**, aimed at
 `gpu_resultsrotatorMultiply` — 42% of GPU busy and memory-bound, so halving its
