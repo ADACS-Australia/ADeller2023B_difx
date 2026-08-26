@@ -11,16 +11,23 @@
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
 #
-# NUMA: --gres-flags=enforce-binding makes SLURM allocate only CPUs local to
-# the selected GPU. Without it the 12 ranks land on arbitrary cores, and if the
-# Core rank ends up on the far socket its page-locked receive buffers (first
-# touched there, then registered for direct H2D) feed the GPU across the
-# inter-socket link at about half bandwidth: two profiles of the identical
-# binary and job measured 8.9 vs 18.9 GB/s of pinned H2D for the same 12.9 GB,
-# ~760 ms of a ~7.7 s wall. It can lengthen the queue wait, since the scheduler
-# now needs free cores on the right node. mpifxcorr logs the resulting
-# placement ("GPU Core N placement: ... on NUMA node ...") and warns if the
-# rank still ends up remote - check the difxlog before trusting a profile.
+# TWO WAYS TO RUN THIS - pick deliberately:
+#
+#   sbatch --exclusive benchprof-profile-nsys-5s.sbatch   # LEDGER-QUALITY
+#   sbatch             benchprof-profile-nsys-5s.sbatch   # quick look only
+#
+# ALWAYS use --exclusive for any number that goes in BENCHMARKS.md. On a shared
+# node a co-tenant job stalls the input copies: the same 12.9 GB of pinned H2D
+# took 1445 ms on one node and 589 ms on another, ~11% of wall, with an
+# IDENTICAL binary. Every node reaches the same 26 GB/s per-copy peak - what
+# differs is a tail of stalled copies, i.e. interference, not hardware. A run
+# without --exclusive can silently be 10% slow and looks like a regression.
+# The cost is queue time, which is the whole reason there are two modes.
+# (--gres-flags=enforce-binding below keeps the ranks on CPUs local to the
+# selected GPU. Measured on these nodes it buys nothing - placements from
+# GPU-local to cross-socket all hit the same peak - but it is free and would
+# matter on hardware with a slower cross-socket link. See gpu-changes.md
+# sec 14 for the measurements behind both statements.)
 #
 # Clean GPU-bound Nsight Systems profile of the 10-antenna fake-data
 # "benchprof" job (source=fake, ~5 s window = ~500 x 10ms subints). Deliberately
@@ -40,8 +47,8 @@
 # falls over, drop osrt (NSYS_TRACE=cuda,nvtx) and/or use a newer nsys.
 #
 # Submit from the tests/FakeData directory of your DiFX checkout (which holds
-# benchprof.v2d, bd247c3.vex.obs and nsys-wrapper.sh):
-#     cd <checkout>/tests/FakeData && sbatch benchprof-profile-nsys-5s.sbatch
+# benchprof.v2d, bd247c3.vex.obs and nsys-wrapper.sh) - see the two modes above:
+#     cd <checkout>/tests/FakeData && sbatch --exclusive benchprof-profile-nsys-5s.sbatch
 #
 # The report lands at $WORKDIR/nsys/benchprof-cluster-clean.nsys-rep - scp it
 # to the desktop for analysis (login-node nsys is too old to `nsys stats` it).
@@ -93,6 +100,15 @@ if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
     sed -i -E 's|(DATA FORMAT:[[:space:]]+)INTERLACEDVDIF/[0-9:]+|\1VDIF|' benchprof_1.input
     echo "benchprof: rewrote INTERLACEDVDIF -> single-thread VDIF (set SINGLE_THREAD_VDIF=0 to disable)"
 fi
+
+# Say in the log whether this run owns the node, so a number can be trusted (or
+# not) after the fact rather than from memory of how it was submitted.
+oversub=$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | grep -o 'OverSubscribe=[A-Za-z]*' | head -1)
+case "$oversub" in
+    *EXCLUSIVE*) echo "=== node ownership: EXCLUSIVE - ledger-quality ===" ;;
+    "")          echo "=== node ownership: UNKNOWN (scontrol unavailable) - verify before using for the ledger ===" ;;
+    *)           echo "=== node ownership: SHARED ($oversub) - NOT ledger-quality, a co-tenant can cost ~10% ===" ;;
+esac
 
 # Record the node's CPU/GPU topology, so a slow profile can be diagnosed after
 # the fact (mpifxcorr's own placement line reports only the Core rank's view).

@@ -17,6 +17,16 @@
 # full-length run completes and (b) measure wall time / speed vs real time
 # without any profiler overhead.
 #
+# TWO WAYS TO RUN THIS - pick deliberately:
+#
+#   sbatch --exclusive benchprof-profile-nonsys-20s.sbatch   # LEDGER-QUALITY
+#   sbatch             benchprof-profile-nonsys-20s.sbatch   # quick look only
+#
+# ALWAYS use --exclusive for any number that goes in BENCHMARKS.md - this
+# script's whole output is a wall time, and a co-tenant job on a shared node
+# costs ~10% of it (measured: identical binary, 1445 vs 589 ms of input H2D).
+# See the header of benchprof-profile-nsys-5s.sbatch and gpu-changes.md sec 14.
+#
 # Why a separate no-nsys script: nsys 2022.2.1's injection library
 # (libToolsInjection64.so) segfaults on a long/heavy capture - a ~20 s
 # cuda,nvtx,osrt trace over ~2000 subints crashed its worker thread ~13 s into
@@ -75,10 +85,17 @@ if [ "${SINGLE_THREAD_VDIF:-1}" != 0 ]; then
     echo "benchprof: rewrote INTERLACEDVDIF -> single-thread VDIF (set SINGLE_THREAD_VDIF=0 to disable)"
 fi
 
+# Say in the log whether this run owns the node, so a wall time can be trusted
+# (or not) after the fact rather than from memory of how it was submitted.
+oversub=$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | grep -o 'OverSubscribe=[A-Za-z]*' | head -1)
+case "$oversub" in
+    *EXCLUSIVE*) echo "=== node ownership: EXCLUSIVE - ledger-quality ===" ;;
+    "")          echo "=== node ownership: UNKNOWN (scontrol unavailable) - verify before using for the ledger ===" ;;
+    *)           echo "=== node ownership: SHARED ($oversub) - NOT ledger-quality, a co-tenant can cost ~10% ===" ;;
+esac
+
 # Record the node's CPU/GPU topology, so a slow run can be diagnosed after the
 # fact (mpifxcorr's own placement line reports only the Core rank's view).
-# --gres-flags=enforce-binding above is what keeps the ranks on CPUs local to
-# the GPU; see the header of benchprof-profile-nsys-5s.sbatch for why it matters.
 echo "=== node topology ($(hostname)) ==="
 numactl -H 2>/dev/null || echo "numactl unavailable"
 nvidia-smi topo -m 2>/dev/null || echo "nvidia-smi topo unavailable"

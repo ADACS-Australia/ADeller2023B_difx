@@ -188,21 +188,23 @@ __global__ void gpu_baseline_weights(const float* const* dw1,
     out[a] = s;
 }
 
-// Report where this rank sits relative to the GPU it drives, and warn if the
-// two are on different NUMA nodes.
+// Report where this rank sits relative to the GPU it drives.
 //
 // WHY THIS IS WORTH A LOG LINE: the Core receive buffers are allocated (and so
 // first-touched, fixing their NUMA node) by the base Core constructor, then
-// page-locked below for direct H2D. If the rank was placed on a node remote
-// from the GPU, every input transfer crosses the inter-socket interconnect at
-// roughly half bandwidth, and nothing in the correlator can tell - it just
-// looks like a slow run. Two A100 profiles of the identical binary and job
-// differed 8.9 vs 18.9 GB/s of pinned H2D (12.9 GB moved either way), which is
-// how this check came to exist; see docs/gpu-changes.md.
+// page-locked below for direct H2D, and page-locking does not move pages. So
+// the rank's placement silently determines where every input transfer starts
+// from, and nothing else in the correlator records it.
 //
-// Placement is the launcher's job (SLURM --gres-flags=enforce-binding, or an
-// mpirun binding policy) - we only observe it, because by the time any GPU code
-// runs the buffers are already placed and the cpuset is already fixed.
+// This is deliberately a plain report and NOT a warning: on the A100 cluster,
+// measured placements from GPU-local to cross-socket all reached the same
+// 26 GB/s per-copy peak, so NUMA distance did not predict transfer speed there
+// (what did: node contention - see docs/gpu-changes.md sec 14). The line earns
+// its keep by putting the placement in every difxlog, so a profile's transfer
+// numbers can be attributed after the fact instead of guessed at.
+//
+// Placement is the launcher's job - we only observe it, because by the time
+// any GPU code runs the buffers are placed and the cpuset is fixed.
 static void reportGpuNumaPlacement(int mpiid) {
     int device = 0;
     if (cudaGetDevice(&device) != cudaSuccess) {
@@ -240,16 +242,9 @@ static void reportGpuNumaPlacement(int mpiid) {
         msg << "unknown";
     msg << ", NUMA node " << (havenodes ? formatIdList(cpunodes) : std::string("unknown"));
 
-    const bool remote = (gpunode >= 0 && havenodes && cpunodes.count(gpunode) == 0);
-    const bool local = (gpunode >= 0 && havenodes && cpunodes.size() == 1 && cpunodes.count(gpunode) == 1);
-    if (local)
+    if (gpunode >= 0 && havenodes && cpunodes.size() == 1 && cpunodes.count(gpunode) == 1)
         msg << " - GPU-local";
     cinfo << startl << msg.str() << endl;
-    if (remote)
-        cwarn << startl << "GPU Core " << mpiid << " is NOT on a NUMA node local to its GPU"
-              << " - pinned host-to-device transfers will cross the interconnect at reduced"
-              << " bandwidth. Bind the rank to the GPU's node (SLURM:"
-              << " --gres-flags=enforce-binding)." << endl;
 }
 
 GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_Comm rcomm)

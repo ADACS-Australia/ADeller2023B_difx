@@ -6,47 +6,32 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 
 ## Where we are
 
-Correctness is **done** for the USB scenarios (usb, usb-complex,
-complex-complex, and the 5-station/4-subband `multi` scenario PASS
-CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes; LSB deliberately
-unimplemented). The **performance** phase has landed a series of Core-side
-de-serializations — Lever A (pinned input), weights-on-device Increments
-1/2/2b, fringe-rotation interpolator hoisting, host-tail overlap, the
-`Mk5_GPUMode::unpack_all` drain removal + RING-deep host staging, and the
-`gpuprocslot` refactor — taking the T5-T1 benchmark 66.7 → ~22.9 s. Full
-history, rationale and the (now-corrected) cuFFT-sync misdiagnosis are in
-`gpu-changes.md` (§5-10); numbers in `BENCHMARKS.md`.
+**Correctness: done** for the USB scenarios (usb, usb-complex,
+complex-complex, and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both
+`DIFX_GPU_PIPELINE` modes; LSB deliberately unimplemented). We are in the
+**performance** phase: T5−T1 is at **11.8 s**, down from 66.7 s. What landed
+to get there, and why, is in `gpu-changes.md` (§5-14, one section per change);
+the numbers are in `BENCHMARKS.md`. The queue below is only what remains.
 
-**Benchmarking note:** the DataStream interlaced-VDIF corner-turn
-(`VDIFMuxer`) is CPU-bound and, for interlaced data, feeds the GPU slower than
-the GPU can process it — so it caps what a GPU benchmark can show. We therefore
-benchmark with non-interlaced (single-thread) VDIF for now, which bypasses the
-corner-turn. (Full analysis in gpu-changes.md §10; the Longer-term item below
-tracks fixing it for production.) Kernel mix (A100, pre-fusion): fringe family
-~45%, unpack 24%, fused XMAC 16%, FFT 8%, weights ~7% (FP64 cheap there, so
-precision work leans on the 2070).
+**Current A100 kernel mix** (5 s profile, 4500 ms kernel busy):
+`gpu_resultsrotatorMultiply` **42%**, `gpu_fuse_xmac_and_average` 23%,
+`gpu_fused_fringe` 21%, `vector_fft` 11%, everything else <2%. GPU busy-union
+is ~90% of span; residual idle is mostly sub-20 µs inter-kernel gaps. FP64 is
+cheap on the A100, so precision work leans on the 2070.
 
-Completed work has moved to `gpu-changes.md`; the queue below is what remains.
-Recently landed and no longer in the queue: the **unpack+fringe fusion**
-(2026-07-23, gpu-changes.md §12 — unpack now decodes straight from packed data
-inside the fringe kernel, no unpacked-buffer round-trip, pcal folded in via
-`template<bool DOPCAL>`; 2070 T5-T1 14.0→12.3, ~12%, larger A100 gain
-expected), and the **fractional-sample-correction investigation** (2026-07-22,
-§11 — left fused, no change).
+**Two benchmarking rules** (each cost a wrong conclusion once — §10, §14):
+- Benchmark with **single-thread VDIF**. The DataStream interlaced-VDIF
+  corner-turn is CPU-bound and starves the GPU, capping what any GPU benchmark
+  can show. The Longer-term item below tracks fixing it for production.
+- Submit cluster runs **`sbatch --exclusive`** for any number that reaches the
+  ledger. A co-tenant job stalls the input copies and costs ~10% of wall,
+  invisibly. Each run now prints its own `node ownership:` verdict.
 
-Also landed 2026-07-23: the `<<<1,1>>>` `gpu_sum_weights` reduction (was 7.7%
-of A100 GPU busy) was folded into `gpu_set_weights` and deleted (gpu-changes.md
-§13; part of item 6).
-
-Also landed 2026-08-26: the **CPU/NUMA placement report + `enforce-binding`**
-(gpu-changes.md §14, item 8) — pinned H2D bandwidth was varying 2× run to run
-because the Core rank landed on an arbitrary CPU relative to its GPU.
-
-**Next GPU-busy targets:** the **FP16 / precision-drop items (items 1, 2)**,
-whose clearest target is now `gpu_resultsrotatorMultiply` (**42%** of A100 GPU
-busy after §13, memory-bound — halving its traffic helps directly), plus the
-rest of the occupancy audit (item 6). (The DataStream corner-turn above remains
-the real production bottleneck — see Longer-term.)
+**Next GPU-busy target:** the **FP16 / precision-drop items (1, 2)**, aimed at
+`gpu_resultsrotatorMultiply` — 42% of GPU busy and memory-bound, so halving its
+traffic helps directly. Then the rest of the occupancy audit (item 6). (The
+DataStream corner-turn remains the real *production* bottleneck — see
+Longer-term.)
 
 ## Work queue (underway + future)
 
@@ -104,20 +89,14 @@ the real production bottleneck — see Longer-term.)
    pcal-fused `DOPCAL` path added in the unpack+fringe fusion is validated by
    construction/review only. Add a phaseCalInt>0 synthetic scenario to
    run-local.sh so CPU-vs-GPU covers pcal extraction.
-8. **NUMA/affinity audit** — mattered on the cluster, less on the desktop;
-   check rank/thread placement and memory locality. **Largely DONE
-   2026-08-26** (gpu-changes.md §14): pinned H2D was measured at 8.9 GB/s in
-   one A100 capture vs ~19 GB/s in four others, traced to the Core rank
-   landing on an arbitrary CPU (the nsys `SCHED_EVENTS` table records which
-   one, since `--cpu-bind=cores` pins it to exactly one). `GPUCore` now logs
-   its CPU/NUMA placement relative to its GPU and warns when the two are on
-   different nodes, and both cluster sbatch scripts request
-   `--gres-flags=enforce-binding` so SLURM only allocates GPU-local CPUs.
-   **Remaining:** confirm on the next cluster profile that the placement line
-   reads GPU-local and the ~19 GB/s H2D rate is now consistent; and, only if
-   that shows a case the launcher cannot fix, add opt-in in-process binding
-   (which must run before the base `Core` constructor first-touches the
-   receive buffers, so it belongs in `mpifxcorr.cpp`, not `GPUCore`).
+8. **NUMA/affinity audit — CLOSED 2026-08-26** (gpu-changes.md §14). The 2×
+   run-to-run swing in input-transfer speed turned out to be **node
+   contention, not placement**: every measured placement, GPU-local through
+   cross-socket, reached the same 26 GB/s per-copy peak. Fixed by running
+   ledger benchmarks `--exclusive`; `GPUCore` now logs its CPU/NUMA placement
+   in every difxlog so transfer numbers can be attributed after the fact.
+   Reopen only if a profile shows a placement effect that survives an
+   exclusive node.
 
 ## Standing process (adopted 2026-07-18)
 
