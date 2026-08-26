@@ -226,11 +226,6 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
                              config->getDNumRecordedBands(confindex, dsindex));
     if (usecomplex) payloadsamples /= 2;   // mirror Mk5's complex framesamples
     
-    //std::cout << "ctor unpacked_size=" << unpacked_size
-    //          << " maxframes=" << maxframes
-    //          << " payloadsamples(=framesamples)=" << payloadsamples
-    //          << " maxframes*payloadsamples=" << maxframes * payloadsamples
-    //          << " usecomplex=" << usecomplex << std::endl;
 
 
     // Per-band capacity of the unpacked sample buffers; also the stride
@@ -448,18 +443,6 @@ GPUMode::GPUMode(Configuration *conf, int confindex, int dsindex, int recordedba
     constructor_time = high_resolution_clock::now();
 }
 
-// static long long avg_unpack = 0;
-// static long long avg_copyto = 0;
-// static long long avg_pcal = 0;
-// static long long avg_rotate = 0;
-// static long long avg_fft = 0;
-// static long long avg_fracrotate = 0;
-// static long long avg_postprocess = 0;
-// static long long processing_time = 0;
-// 
-// int calls = 0;
-//static int debug_dataweight_gpu_prints = 0;
-//static int debug_dataweight_gpu_invalid_prints = 0;
 
 GPUMode::~GPUMode() {
     auto start = high_resolution_clock::now();
@@ -610,65 +593,10 @@ size_t GPUMode::estimateDeviceBytes(Configuration *config, int configindex, int 
     return bytes;
 }
 
-__global__ void check_unpack(float** array, int nchan, int nsamp) {
-    printf("Unpacked data:\n");
-    for (int o = 0; o < 10; o++) {
-        for (int c = 0; c < nchan; c++) {
-            printf("%f\t", array[c][o]);
-        }
-        printf("\n");
-    }
-}
-
-__global__ void debug_print_unpack_window(float **array, int sample_index, int max_samples,
-                                          int ds, int idx, int sub, int band,
-                                          int nearest, int unpackstart, int sampleoffset, int datasamples) {
-    if (threadIdx.x != 0 || blockIdx.x != 0) {
-        return;
-    }
-
-    if (sample_index < 0 || sample_index + 7 >= max_samples) {
-        return;
-    }
-
-    const float *src = array[band];
-    printf("DEBUG_UNPACK_GPU_WINDOW ds=%d idx=%d sub=%d band=%d nearest=%d unpackstart=%d sampleIndex=%d sampleoffset=%d datasamples=%d values=%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f,%.9f\n",
-           ds,
-           idx,
-           sub,
-           band,
-           nearest,
-           unpackstart,
-           sample_index,
-           sampleoffset,
-           datasamples,
-           src[sample_index + 0],
-           src[sample_index + 1],
-           src[sample_index + 2],
-           src[sample_index + 3],
-           src[sample_index + 4],
-           src[sample_index + 5],
-           src[sample_index + 6],
-           src[sample_index + 7]);
-}
 
 
 
-// Little kernel to print out results of the FFT for debugging/checking
-__global__ void print_fft_window(cuFloatComplex* fftd_data, int nchan, int fftchannels, int nffts) {
-    for (int win = 0; win < nffts; win++) {
-        printf("---\tSample %i\t---\n", win);
-        for (int s = 0; s < fftchannels; s++) {
-            for (int c = 0; c < nchan; c++) {
-                int index = win * nchan * fftchannels + c * fftchannels + s;
-                printf("%f\t%f\t|\t", fftd_data[index].x, fftd_data[index].y);
-            }
-            printf("\n");
-        }
-        printf("\n---\t---\t---\n");
-    }
 
-}
 
 int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
                                int numblocks)  //frac sample error is in microseconds
@@ -843,13 +771,6 @@ int GPUMode::process_gpu_tofft(int fftloop, int numBufferedFFTs, int startblock,
  
  
  
-    //if (!(config->getDPhaseCalIntervalMHz(configindex, datastreamindex) == 0) &&
-    //        (datasec != pcalResetDataSec || datans != pcalResetDataNs)) {
-    //    checkCuda(cudaMemsetAsync(pcal_output_real->gpuPtr(), 0,
-    //                              sizeof(float) * numrecordedbands * pcal_bin_stride_length, cuStream));
-    //        pcalResetDataSec = datasec;
-    //        pcalResetDataNs = datans;
-    //}
 
     // (The temp_autocorrelations device reset moves to process_gpu_afterfft,
     // immediately before fractionalRotation accumulates into it.)
@@ -1192,31 +1113,12 @@ int GPUMode::process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblo
 }
 
 
-//int GPUMode::set_invalid_data(int fftloop, int numBufferedFFTs, int startblock,
-//                         int numblocks) {
-//
-//    size_t unpacked_size = buffer_payload_bytes * 8 / (config->getDNumBits(confindex, dsindex) * config->getDNumRecordedBands(confindex, dsindex));
-//    // What's the largest number of FFTs we can fit?
-//    cfg_numBufferedFFTs = (unpacked_size + fftchannels - 1) / fftchannels;	
-//    fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
-//    conj_fftd_gpu = new GpuMemHelper<cuFloatComplex>(fftchannels * cfg_numBufferedFFTs * numrecordedbands, cuStream, false);
-//    return numBufferedFFTs;
-//}	
 
 
 bool GPUMode::is_dataweight_valid(int subloopindex) {
     int status;
 
     if (dataweight[subloopindex] <= 0.0) {
-        //printf("Data weight for subloopindex %d is %f, which is invalid. Setting fft outputs to 0.\n", subloopindex, dataweight[subloopindex]);
-    //    for (int i = 0; i < numrecordedbands; i++) {
-    //        status = vectorZero_cf32(fftd_gpu[i][subloopindex], recordedbandchannels);
-    //        if (status != vecNoErr)
-    //            csevere << startl << "Error trying to zero fftd_gpu when data is bad!" << endl;
-    //        status = vectorZero_cf32(conjfftd_gpu[i][subloopindex], recordedbandchannels);
-    //        if (status != vecNoErr)
-    //            csevere << startl << "Error trying to zero fftd_gpu when data is bad!" << endl;
-    //    }
         return false;
     }
 
@@ -1236,15 +1138,6 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
     // Check the data is valid for this index
     if (reason_datalen || reason_subint || reason_validflag) {
    
-//        for (int i = 0; i < numrecordedbands; i++) {
-//            status = vectorZero_cf32(fftd_gpu[i][subloopindex], recordedbandchannels);
-//            if (status != vecNoErr)
-//                csevere << startl << "Error trying to zero fftd_gpuhen data is bad!" << endl;
-//            status = vectorZero_cf32(conjfftd_gpu[i][subloopindex], recordedbandchannels);
-//            if (status != vecNoErr)
-//                csevere << startl << "Error trying to zero fftd_gpu when data is bad!" << endl;
-//        }
-//        cerr << "Mode for DS " << datastreamindex << " is bailing out of index " << index << "/" << subloopindex << " which is scan " << currentscan << ", sec " << offsetseconds << ", ns " << offsetns << " because datalengthbytes is " << datalengthbytes << " and validflag was " << ((validflags[index/FLAGS_PER_INT] >> (index%FLAGS_PER_INT)) & 0x01) << endl;
         return false; //don't process crap data
     }
 
@@ -1253,14 +1146,6 @@ bool GPUMode::is_data_valid(int index, int subloopindex) {
         (((nearestSamples->ptr()[subloopindex] + fftchannels) / samplesperblock) * bytesperblocknumerator) / bytesperblockdenominator >
         datalengthbytes) {
  
-//        for (int i = 0; i < numrecordedbands; i++) {
-//            status = vectorZero_cf32(fftd_gpu[i][subloopindex], recordedbandchannels);
-//            if (status != vecNoErr)
-//                csevere << startl << "Error trying to zero fftd_gpu when data is bad!" << endl;
-//            status = vectorZero_cf32(conjfftd_gpu[i][subloopindex], recordedbandchannels);
-//            if (status != vecNoErr)
-//                csevere << startl << "Error trying to zero fftd_gpu when data is bad!" << endl;
-//        }
         return false;
     }
 
@@ -1289,15 +1174,8 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
 
     // Not sure if this is still needed. Set to zero for now.
      unpackstartsamples = 0;
-    // unpackstartsamples = nearestSamples->ptr()[subloopindex] - (nearestSamples->ptr()[subloopindex]% samplegranularity);
-    //std::cout << "subloopindex = " << subloopindex << ", unpackstartsamples = " << unpackstartsamples <<  ", samplegranularity = " << samplegranularity << std::endl;
-    //std::cout << "subloopindex = " << subloopindex << ", cfg_numBufferedFFTs = " << cfg_numBufferedFFTs << std::endl;
     // Clear the perbandweights for this subloopindex
 
-    //fprintf(stderr, "set_weights DS=%d sub=%d numBufferedFFTs(arg via caller)=? cfg=%d configNBF=%d perbandweights=%p\n",
-    //    datastreamindex, subloopindex, cfg_numBufferedFFTs,
-    //   config->getNumBufferedFFTs(configindex), (void*)perbandweights);    
-    //std::cout << "numrecordedbands = " << numrecordedbands << std::endl;
     if(perbandweights)
     {
         for(int b = 0; b < numrecordedbands; ++b)
@@ -1306,11 +1184,6 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
         }
     }
 
-    //std::cout << "fftloop = " << fftloop << ", subloopindex = " << subloopindex << ", numBufferedFFTs = " << numBufferedFFTs << ", startblock = " << startblock << std::endl;
-    //int validity_index =  subloopindex + startblock;
-    //if (startblock != 0) {
-        //std::cout << "subloopindex = " << subloopindex << ", validity_index = " << validity_index << std::endl;
-    //}
     if (!is_data_valid(subloopindex, subloopindex)) {
 
         // since these data weights can be retreived after this processing ends, reset them to a default of zero in case they don't get updated
@@ -1374,9 +1247,6 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
         //std::cout << "Data weight is not valid for subloopindex " << subloopindex << std::endl;
         gValidSamples->ptr()[subloopindex] = false;
     } else {
-	//printf("numrecordedfreqs = %d \n",numrecordedfreqs);
-        //printf("numrecordedbands  = %d \n",numrecordedbands);
-        //exit(0);	
         // Todo: This can definitely be cleaned up and improved
         for (int i = 0; i < numrecordedfreqs; i++) {
             // PWCR numrecordedbands = 2 for the test; but e.g. 8 is very realistical
@@ -1403,14 +1273,6 @@ void GPUMode::set_weights(int subloopindex, int nframes, int *counts, int numBuf
                     // 3. The last element of the array corresponds to the highest sky frequency minus the spectral resolution.
                     //    (i.e., the first element beyond the array bound corresponds to the highest sky frequency)
 
-                    //store the weight for the autocorrelations
-                    //fprintf(stderr, "set_weights ds=%d sub=%d perbandweights=%p\n",
-                    //        datastreamindex, subloopindex, (void*)perbandweights);
-//fprintf(stderr, "set_weights ds=%d sub=%d j=%d nbands=%d acw=%d w0=%p pbw=%p pbw[sub]=%p\n",
-//        datastreamindex, subloopindex, j, numrecordedbands, autocorrwidth,
-//        (void*)(weights ? weights[0] : nullptr),
-//        (void*)perbandweights,
-//        (void*)(perbandweights ? perbandweights[subloopindex] : nullptr));
                     if (perbandweights) {
                         weights[0][j] += perbandweights[subloopindex][j];
                     } else {
@@ -1727,12 +1589,6 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
             fftchannels_grid++;
         }
     }
-        //printf("fracRot indices[0] = %u \n",indices->ptr()[0]);
-	//printf("fracRot indices[1] = %u \n",indices->ptr()[1]);
-	//exit(0);
-        //gpu_resultsrotatorMultiply<<<1, 1, 0, cuStream>>>
-    //GpuMemHelper<int> *counts_gpu;
-    //counts_gpu = new GpuMemHelper<int>(numrecordedfreqs, cuStream); 
     for (int ii=0; ii < numrecordedfreqs; ii++) {
         counts_gpu->ptr()[ii] = counts[ii];
         //printf("counts[%d] = %d\n",ii,counts[ii]);

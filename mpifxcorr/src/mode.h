@@ -176,8 +176,6 @@ public:
   * @return Pointer to the FFT'd data (complex 32 bit float)
   */
   inline const cf32* getFreqs(int outputband, int subloopindex) const { return fftoutputs[outputband][subloopindex]; };
-  virtual const cuFloatComplex* getGpuFreqs() const { return nullptr; };
-  virtual const cf32* getGpuFreqsHost(int outputband, int subloopindex) const { return nullptr; };
 
  /**
   * Returns a pointer to the FFT'd and conjugated data of the specified product

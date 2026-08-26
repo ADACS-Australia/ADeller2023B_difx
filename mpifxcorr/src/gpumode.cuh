@@ -126,10 +126,6 @@ public:
     int process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblock,
                              int numblocks);
 
-//    int GPUMode::set_invalid_data(int fftloop, int numBufferedFFTs, int startblock,
-//                         int numblocks);
-
-    void process_unpack(int index, int subloopindex);
     void set_weights(int subloopindex, int nframes, int *counts, int numBufferedFFTs);
     /// Compute per-frame validity (valid_frames) for this subint. Format-specific
     /// (needs the mark5_stream), so overridden in Mk5_GPUMode; base is a no-op.
@@ -146,10 +142,6 @@ public:
     void calculatePre_cpu(int fftloop, int numBufferedFFTs, int startblock, int numblocks);
     void fractionalRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, bool calccrosspolautocorrs, int *counts);
 
-    [[nodiscard]] const cuFloatComplex* getGpuFreqs() const override { return fftd_gpu->gpuPtr(); }
-    [[nodiscard]] const cf32* getGpuFreqsHost(int outputband, int subloopindex) const override {
-        return (const cf32*) &fftd_gpu->ptr()[(subloopindex * fftchannels * numrecordedbands) + (outputband * fftchannels)];
-    }
     /// Device-side per-FFT validity flags. Invalid FFT windows have stale
     /// (never zeroed) spectra in fftd_gpu - the mode kernels
     /// skip them - so consumers (the XMAC kernel) must exclude them; the CPU
