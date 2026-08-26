@@ -23,9 +23,12 @@ cheap on the A100, so precision work leans on the 2070.
 - Benchmark with **single-thread VDIF**. The DataStream interlaced-VDIF
   corner-turn is CPU-bound and starves the GPU, capping what any GPU benchmark
   can show. The Longer-term item below tracks fixing it for production.
-- Submit cluster runs **`sbatch --exclusive`** for any number that reaches the
-  ledger. A co-tenant job stalls the input copies and costs ~10% of wall,
-  invisibly. Each run now prints its own `node ownership:` verdict.
+- Give cluster runs **most of the node** for any number that reaches the
+  ledger: `sbatch --cpus-per-task=5 …` (60 of gina's 64 cores). tooarrana
+  rejects `--exclusive`, and widening `--cpus-per-task` does *not* start extra
+  mpifxcorr ranks — that is `--ntasks`. A co-tenant job stalls the input copies
+  and costs ~10% of wall, invisibly. Each run prints a `node ownership:`
+  verdict.
 
 **Next GPU-busy target:** the **FP16 / precision-drop items (1, 2)**, aimed at
 `gpu_resultsrotatorMultiply` — 42% of GPU busy and memory-bound, so halving its
@@ -92,11 +95,11 @@ Longer-term.)
 8. **NUMA/affinity audit — CLOSED 2026-08-26** (gpu-changes.md §14). The 2×
    run-to-run swing in input-transfer speed turned out to be **node
    contention, not placement**: every measured placement, GPU-local through
-   cross-socket, reached the same 26 GB/s per-copy peak. Fixed by running
-   ledger benchmarks `--exclusive`; `GPUCore` now logs its CPU/NUMA placement
-   in every difxlog so transfer numbers can be attributed after the fact.
-   Reopen only if a profile shows a placement effect that survives an
-   exclusive node.
+   cross-socket, reached the same 26 GB/s per-copy peak. Fixed by giving
+   ledger benchmarks most of the node (`--cpus-per-task=5`; tooarrana rejects
+   `--exclusive`); `GPUCore` now logs its CPU/NUMA placement in every difxlog
+   so transfer numbers can be attributed after the fact. Reopen only if a
+   profile shows a placement effect that survives an isolated node.
 
 ## Standing process (adopted 2026-07-18)
 

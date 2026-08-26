@@ -19,13 +19,16 @@
 #
 # TWO WAYS TO RUN THIS - pick deliberately:
 #
-#   sbatch --exclusive benchprof-profile-nonsys-20s.sbatch   # LEDGER-QUALITY
-#   sbatch             benchprof-profile-nonsys-20s.sbatch   # quick look only
+#   sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch   # LEDGER-QUALITY
+#   sbatch                   benchprof-profile-nonsys-20s.sbatch   # quick look only
 #
-# ALWAYS use --exclusive for any number that goes in BENCHMARKS.md - this
-# script's whole output is a wall time, and a co-tenant job on a shared node
-# costs ~10% of it (measured: identical binary, 1445 vs 589 ms of input H2D).
-# See the header of benchprof-profile-nsys-5s.sbatch and gpu-changes.md sec 14.
+# Isolation matters for any number that goes in BENCHMARKS.md - this script's
+# whole output is a wall time, and a co-tenant job costs ~10% of it (measured:
+# identical binary, 1445 vs 589 ms of input H2D). tooarrana rejects
+# --exclusive, so reserve most of the node instead: --cpus-per-task=5 x 12
+# tasks = 60 of gina's 64 cores. It does NOT start more mpifxcorr ranks (that
+# is --ntasks). See the header of benchprof-profile-nsys-5s.sbatch and
+# gpu-changes.md sec 14.
 #
 # Why a separate no-nsys script: nsys 2022.2.1's injection library
 # (libToolsInjection64.so) segfaults on a long/heavy capture - a ~20 s
@@ -87,12 +90,18 @@ fi
 
 # Say in the log whether this run owns the node, so a wall time can be trusted
 # (or not) after the fact rather than from memory of how it was submitted.
-oversub=$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | grep -o 'OverSubscribe=[A-Za-z]*' | head -1)
-case "$oversub" in
-    *EXCLUSIVE*) echo "=== node ownership: EXCLUSIVE - ledger-quality ===" ;;
-    "")          echo "=== node ownership: UNKNOWN (scontrol unavailable) - verify before using for the ledger ===" ;;
-    *)           echo "=== node ownership: SHARED ($oversub) - NOT ledger-quality, a co-tenant can cost ~10% ===" ;;
-esac
+# tooarrana forbids --exclusive ("please request the number of cores you need
+# per task with --cpus-per-task=x instead"), so isolation is measured as the
+# fraction of the node's cores this job reserved, not from OverSubscribe.
+cores_alloc=$(( ${SLURM_CPUS_PER_TASK:-1} * ${SLURM_NTASKS:-1} ))
+cores_node=$(nproc --all)
+pct=$(( 100 * cores_alloc / cores_node ))
+if [ "$pct" -ge 90 ]; then
+    echo "=== node ownership: $cores_alloc/$cores_node cores (${pct}%) - near-exclusive, ledger-quality ==="
+else
+    echo "=== node ownership: $cores_alloc/$cores_node cores (${pct}%) - SHARED, NOT ledger-quality;" \
+         "a co-tenant can cost ~10% of wall. Raise --cpus-per-task. ==="
+fi
 
 # Record the node's CPU/GPU topology, so a slow run can be diagnosed after the
 # fact (mpifxcorr's own placement line reports only the Core rank's view).

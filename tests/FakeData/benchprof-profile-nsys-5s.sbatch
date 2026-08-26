@@ -13,16 +13,25 @@
 #
 # TWO WAYS TO RUN THIS - pick deliberately:
 #
-#   sbatch --exclusive benchprof-profile-nsys-5s.sbatch   # LEDGER-QUALITY
-#   sbatch             benchprof-profile-nsys-5s.sbatch   # quick look only
+#   sbatch --cpus-per-task=5 benchprof-profile-nsys-5s.sbatch   # LEDGER-QUALITY
+#   sbatch                   benchprof-profile-nsys-5s.sbatch   # quick look only
 #
-# ALWAYS use --exclusive for any number that goes in BENCHMARKS.md. On a shared
-# node a co-tenant job stalls the input copies: the same 12.9 GB of pinned H2D
-# took 1445 ms on one node and 589 ms on another, ~11% of wall, with an
-# IDENTICAL binary. Every node reaches the same 26 GB/s per-copy peak - what
-# differs is a tail of stalled copies, i.e. interference, not hardware. A run
-# without --exclusive can silently be 10% slow and looks like a regression.
-# The cost is queue time, which is the whole reason there are two modes.
+# ISOLATION MATTERS for any number that goes in BENCHMARKS.md. On a shared node
+# a co-tenant job stalls the input copies: the same 12.9 GB of pinned H2D took
+# 1445 ms on one node and 589 ms on another, ~11% of wall, with an IDENTICAL
+# binary. Every node reaches the same 26 GB/s per-copy peak - what differs is a
+# tail of stalled copies, i.e. interference, not hardware. A shared run can
+# silently be 10% slow and look like a regression.
+#
+# tooarrana REJECTS --exclusive ("Exclusive option not permitted, please request
+# the number of cores you need per task with --cpus-per-task=x instead"), so the
+# way to get isolation here is to reserve most of the node's cores:
+# --cpus-per-task=5 x 12 tasks = 60 of gina's 64 cores. This does NOT change
+# how many mpifxcorr ranks start - the rank count is --ntasks (12) and the roles
+# come from the .input's ACTIVE DATASTREAMS (rank 0 manager, 1-10 datastreams,
+# 11 Core); the extra cores are simply reserved and mostly idle. The cost is
+# queue time, which is the whole reason there are two modes. The run prints its
+# own "node ownership: N/M cores" verdict below - check it before quoting.
 # (--gres-flags=enforce-binding below keeps the ranks on CPUs local to the
 # selected GPU. Measured on these nodes it buys nothing - placements from
 # GPU-local to cross-socket all hit the same peak - but it is free and would
@@ -48,7 +57,7 @@
 #
 # Submit from the tests/FakeData directory of your DiFX checkout (which holds
 # benchprof.v2d, bd247c3.vex.obs and nsys-wrapper.sh) - see the two modes above:
-#     cd <checkout>/tests/FakeData && sbatch --exclusive benchprof-profile-nsys-5s.sbatch
+#     cd <checkout>/tests/FakeData && sbatch --cpus-per-task=5 benchprof-profile-nsys-5s.sbatch
 #
 # The report lands at $WORKDIR/nsys/benchprof-cluster-clean.nsys-rep - scp it
 # to the desktop for analysis (login-node nsys is too old to `nsys stats` it).
@@ -103,12 +112,18 @@ fi
 
 # Say in the log whether this run owns the node, so a number can be trusted (or
 # not) after the fact rather than from memory of how it was submitted.
-oversub=$(scontrol show job "${SLURM_JOB_ID:-0}" 2>/dev/null | grep -o 'OverSubscribe=[A-Za-z]*' | head -1)
-case "$oversub" in
-    *EXCLUSIVE*) echo "=== node ownership: EXCLUSIVE - ledger-quality ===" ;;
-    "")          echo "=== node ownership: UNKNOWN (scontrol unavailable) - verify before using for the ledger ===" ;;
-    *)           echo "=== node ownership: SHARED ($oversub) - NOT ledger-quality, a co-tenant can cost ~10% ===" ;;
-esac
+# tooarrana forbids --exclusive ("please request the number of cores you need
+# per task with --cpus-per-task=x instead"), so isolation is measured as the
+# fraction of the node's cores this job reserved, not from OverSubscribe.
+cores_alloc=$(( ${SLURM_CPUS_PER_TASK:-1} * ${SLURM_NTASKS:-1} ))
+cores_node=$(nproc --all)
+pct=$(( 100 * cores_alloc / cores_node ))
+if [ "$pct" -ge 90 ]; then
+    echo "=== node ownership: $cores_alloc/$cores_node cores (${pct}%) - near-exclusive, ledger-quality ==="
+else
+    echo "=== node ownership: $cores_alloc/$cores_node cores (${pct}%) - SHARED, NOT ledger-quality;" \
+         "a co-tenant can cost ~10% of wall. Raise --cpus-per-task. ==="
+fi
 
 # Record the node's CPU/GPU topology, so a slow profile can be diagnosed after
 # the fact (mpifxcorr's own placement line reports only the Core rank's view).

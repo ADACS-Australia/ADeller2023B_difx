@@ -22,10 +22,13 @@ interlaced and are NOT directly comparable to single-thread rows.
 
 Rules:
 - Machine otherwise idle (no builds, no nsys, no browser). **On the cluster
-  that means `sbatch --exclusive <script>`** — a co-tenant job stalls the input
-  copies and costs ~10% of wall with no other symptom (gpu-changes.md §14).
-  Each run prints a `node ownership: EXCLUSIVE / SHARED` verdict; a SHARED run
-  does not belong in this file.
+  that means `sbatch --cpus-per-task=5 <script>`** — a co-tenant job stalls the
+  input copies and costs ~10% of wall with no other symptom (gpu-changes.md
+  §14). tooarrana rejects `--exclusive`, so isolation comes from reserving most
+  of the node: 5 × 12 tasks = 60 of gina's 64 cores. That does **not** start
+  more mpifxcorr ranks (the rank count is `--ntasks`). Each run prints a
+  `node ownership: N/M cores` verdict; anything under 90% does not belong in
+  this file.
 - Record every change that lands: benchmark at the commit that follows it.
 - Note the VDIF threading (single-thread default vs `SINGLE_THREAD_VDIF=0`).
 - FakeData output is NOT bit-reproducible run to run (see README) - this
@@ -60,7 +63,8 @@ across rows - the **per-subint** figures in the fused-row note below, and idle
 segfaults ~13 s in - see gpu-profiling.md); the 20 s soak run is nsys-free
 (benchprof-profile-nonsys-20s.sbatch).
 
-Clean GPU-bound profile: A100-SXM4-80GB, one rank/core `--exclusive`,
+Clean GPU-bound profile: A100-SXM4-80GB, one rank/core (isolation via
+`--cpus-per-task`; see the Rules above),
 fake data, Core rank wrapped with nsys (`.nsys-rep` + sqlite kept under
 the run dir). "GPU span" = first-kernel to last-kernel; "busy (kernels)"
 = sum of kernel durations (single compute stream, so serial); "busy
@@ -75,7 +79,7 @@ stream. This is a diagnostic ledger (idle %), not the T5-T1 metric.
 | 2026-07-22 | + single-thread VDIF (genheaders), 4 s | 6050 | 5058 | 16.4% | 5614 | **7.2%** | corner-turn removed; kernel busy unchanged (5058≈5077) so the win is pure idle removal; wall (CUDA-API span) 12169 → 7886 ms (**~35%**); GPU now compute-bound |
 | 2026-07-23 | fused unpack+fringe (619c273be), 5 s | 7032 | 4863 | 30.9% | 6337 | 9.9% | fused kernel replaces unpack+fringe; kernel-only idle rises (faster kernels ⇒ fixed tail is a bigger fraction) but the H2D copies now fill it (idle+copy 9.9%). See the per-subint comparison below. |
 | 2026-07-23 | fused sum_weights (d503b7708), 5 s | 5800 | 4500 | 22.4% | 5208 | 10.2% | `gpu_sum_weights` gone from the mix; kernel busy −7.4%, exactly its old share. Same 5 s window as the row above ⇒ directly comparable. Wall (CUDA-API span) 9064 → 7710 ms, but see the H2D caveat below — only the kernel-busy part is attributable. |
-| 2026-08-26 | placement report (56eb3b4c3), 5 s | 5852 | 4545 | 22.3% | 5159 | 11.9% | SHARED node (submitted before the `--exclusive` rule) — kept because it is the run that **disproved** the NUMA hypothesis: definitively mis-placed (GPU node 1, rank node 2) yet the fastest H2D of any capture, 13.01 GB / 588.6 ms = **22.1 GB/s**. Kernel busy matches the row above to <1%, as expected for a logging-only change. See gpu-changes.md §14. |
+| 2026-08-26 | placement report (56eb3b4c3), 5 s | 5852 | 4545 | 22.3% | 5159 | 11.9% | SHARED node (1 core/task) — kept because it is the run that **disproved** the NUMA hypothesis: definitively mis-placed (GPU node 1, rank node 2) yet the fastest H2D of any capture, 13.01 GB / 588.6 ms = **22.1 GB/s**. Kernel busy matches the row above to <1%, as expected for a logging-only change. See gpu-changes.md §14. |
 
 **Weight-kernel elimination, measured against the row above** (both captures
 are 5 s / ~495 subints per station, so the totals compare directly). Capture +
@@ -99,9 +103,9 @@ part of this change touches the transfer path. The first of those runs was
 simply **contended** — it shared its node with another job, which stalls the
 input copies (gpu-changes.md §14 has the per-copy distributions that show it).
 Of the ~15% CUDA-API-span improvement, only the ~7.4% kernel-busy part is
-attributable to the code. **This is why ledger runs must be submitted
-`sbatch --exclusive`**, and why the two 2026-07-23 rows are comparable on
-kernel busy but not on wall.
+attributable to the code. **This is why ledger runs must reserve most of the
+node** (`sbatch --cpus-per-task=5 …`; tooarrana rejects `--exclusive`), and why
+the two 2026-07-23 rows are comparable on kernel busy but not on wall.
 
 New A100 kernel mix (% of kernel busy, 4500.5 ms): `gpu_resultsrotatorMultiply`
 **42.1%** (the #1 target — memory-bound, the FP16 candidate),

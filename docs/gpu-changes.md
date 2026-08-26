@@ -579,17 +579,27 @@ penalty. What differs is the tail:
 | gina15 (18.9) | 26.1 GB/s | 20.8 | 18.4 | 1.6 |
 | gina4 (22.1) | 26.1 GB/s | 25.0 | 22.7 | 8.4 |
 
-Stalled copies, not slow ones — interference from a co-tenant job. The benchmark
-sbatch stopped requesting `--exclusive` in `a55b6c12c`, which is what let this
-in.
+Stalled copies, not slow ones — interference from a co-tenant job. No benchmark
+run has ever been isolated: `a55b6c12c` ("can't use exclusive") dropped the
+`--exclusive` request back in July because tooarrana rejects the flag outright,
+so every profile in the ledger has been sharing its node. This was not a
+regression that crept in — the isolation was never there.
 
 **What changed.**
-- Both cluster sbatch scripts document **two modes**: `sbatch --exclusive
-  <script>` for anything that goes in BENCHMARKS.md, plain `sbatch <script>`
-  for a quick look. Each run prints its own verdict (`node ownership:
-  EXCLUSIVE - ledger-quality` / `SHARED - NOT ledger-quality`) plus
-  `numactl -H` and `nvidia-smi topo -m`, so a number can be trusted or
-  discarded after the fact rather than from memory of how it was submitted.
+- Both cluster sbatch scripts document **two modes**: `sbatch
+  --cpus-per-task=5 <script>` for anything that goes in BENCHMARKS.md, plain
+  `sbatch <script>` for a quick look. Each run prints its own verdict
+  (`node ownership: N/M cores`) plus `numactl -H` and `nvidia-smi topo -m`, so
+  a number can be trusted or discarded after the fact rather than from memory
+  of how it was submitted.
+  **Correction (2026-08-26, same day):** this first said `--exclusive`, which
+  tooarrana rejects outright ("Exclusive option not permitted, please request
+  the number of cores you need per task with `--cpus-per-task=x` instead").
+  Reserving most of the node is the supported equivalent: `--cpus-per-task=5`
+  x 12 tasks = 60 of gina's 64 cores. Widening it does **not** start more
+  mpifxcorr ranks — the rank count is `--ntasks` and the roles come from the
+  `.input`'s ACTIVE DATASTREAMS (rank 0 manager, 1-10 datastreams, 11 Core) —
+  so the extra cores are simply reserved and mostly idle.
 - `--gres-flags=enforce-binding` is kept in both. On these nodes it is
   measurably worth nothing, but it costs nothing and would matter on hardware
   with a slower cross-socket link.
