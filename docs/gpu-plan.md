@@ -40,19 +40,39 @@ design.md` holds the resulting three-step plan; §15 was step one.
   stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
   `node ownership:` verdict.
 
-**Next GPU-busy targets**, in order (see `gpu-autocorr-design.md`):
-1. the **window-group reduction** — cut the autocorrelation atomics ~G-fold by
-   putting G FFT windows in one block and reducing before the atomic, leaving
-   the thread count, per-thread work and block→window mapping untouched
-   (~10.7% of A100 kernel busy; flat on the 2070 by construction);
-2. **autocorrelations into Core/XMAC**, which subsumes (1) and also deletes a
-   whole host-tail data path (~17%, but invasive — see the design note);
-3. the **FP16 items (1, 2)**, now better founded: the probes put traffic
-   sensitivity at ~100 µs per 82 MB, so halving the spectra is worth ~11% —
-   comparable to (1) and largely additive.
+**Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
-(The DataStream corner-turn remains the real *production* bottleneck — see
-Longer-term.)
+1. **Autocorrelations into Core/XMAC.** Removes the atomics entirely rather than
+   reducing them, takes the cross-pol traffic with them, and deletes a whole
+   host-tail data path (device→host copy, `vectorCopy_cf32` mirror,
+   `averageFrequency`, the `vectorAdd_cf32_I` loop and `autocorrcopylock`).
+   ~17% of A100 kernel busy plus the tail. Invasive: `Mode`, `Core`,
+   `Configuration`, the results-buffer layout, and it must keep the CPU path's
+   Mode-based autocorrelations working alongside — the CPU/GPU divergence class
+   that has caused the most bugs here.
+2. **FP16 spectra**, in three stages, because stage (c) cannot be skipped:
+   (a) the standalone `fftbench` accuracy/speed probe — no correlator changes;
+   (b) the implementation, opt-in and gated;
+   (c) **the science-level accuracy gate — a PREREQUISITE, not a follow-up.**
+   FP16 changes results well beyond FP rounding, so `diffDiFX` cannot validate
+   it at any threshold. Adam asked for fringe-fitting S/N and image S/N tests
+   (2026-08-26); until they exist FP16 can be built and measured but not
+   landed. Worth starting (c) in parallel with (a).
+
+**Superseded:** the window-group reduction was built and measured as a net loss
+(gpu-changes.md/design note; branch `wip-window-group-reduction`). Item 1 above
+subsumes it — do not revisit unless an A100 measurement of that branch says
+otherwise.
+
+**Still the real production bottleneck: the DataStream corner-turn.** The
+2026-08-27 costing exercise made this concrete rather than theoretical: at the
+measured ~1.7 Gbps per core, a VGOS-rate 4 × 16 Gbps observation needs ~38 cores
+doing nothing but demultiplexing interlaced VDIF — more silicon than the
+correlation itself. Every GPU benchmark in this project deliberately bypasses it
+with single-thread VDIF, which is correct for measuring the correlator and
+misleading for specifying hardware. The frame-reorder + GPU de-interleave design
+is in Longer-term; on current evidence it gates real-world usefulness more than
+any remaining GPU-side optimisation.
 
 ## Work queue (underway + future)
 
