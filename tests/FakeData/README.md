@@ -55,3 +55,36 @@ Only the GPU core rank emits CUDA/NVTX activity, so tracing all ranks is
 cheap. If a profiling run is interrupted, orphaned `nsys --start-agent`
 daemons may be left spinning at 100% CPU - find them with
 `pgrep -af nsys` and kill them.
+
+## Profiling (Nsight Compute) and the fringe-tile shape sweep
+
+`ncu` works on ar313 since the 2026-08-27 reboot enabled unrestricted GPU
+performance counters. Two harnesses live here:
+
+```sh
+./ncu-frac.sh <tag> [metrics|detailed|full] [kernel-regex]
+```
+
+Nsight Compute over the 2-station `benchprof2` job (same kernel dimensions as
+the 10-station benchmark), `--target-processes all` over mpirun, warm-up skipped.
+`metrics` is a cheap fixed metric list; `detailed` adds ncu's rule verdicts;
+`full` adds Scheduler/Warp State, i.e. *why* a latency-bound kernel stalls -
+keep `full` to 1-2 launches, it replays ~20 passes each. Results land in
+`ncu-<tag>.ncu-rep` / `ncu-<tag>.log`.
+
+```sh
+./fringetile-sweep.sh 2500 30            # real sampling
+SWEEP_COMPLEX=1 ./fringetile-sweep.sh 2500 30   # complex twin
+```
+
+Sweeps the fused decode+fringe kernel over 13 (bands, channels) shapes, tiled
+(`DIFX_GPU_FRINGE_TILE=1`) versus untiled, and prints per-shape time plus an
+output hash. The two paths do identical arithmetic in identical order, so the
+hashes must match bit-exactly - that is the all-shapes correctness check, and it
+covers odd band counts and partial tiles that no DiFX scenario exercises. It
+`#include`s `mpifxcorr/src/gpudecode.cu`, so it measures the shipped kernel.
+
+**Pass `2500 30`, not the defaults.** At `numBufferedFFTs` = 10 the launch is
+latency-dominated and every shape looks like 1.0x; below ~30 reps the largest
+shape swings up to 18% on warm-up. Design and results:
+`docs/gpu-fringetile-design.md`.

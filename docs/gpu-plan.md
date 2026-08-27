@@ -40,6 +40,11 @@ design.md` holds the resulting three-step plan; §15 was step one.
   stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
   `node ownership:` verdict.
 
+**PENDING:** an A100 profile of `edad94b34` is queued on the cluster.
+When it lands, add the `BENCHMARKS.md` ledger row and refresh `gpu-payback.pdf`
+and its artifact, whose GPU columns are conservative by ~8% because the A100
+figure predates that commit (the conjugate-array deletion).
+
 **Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
 1. **Autocorrelations into Core/XMAC.** Removes the atomics entirely rather than
@@ -123,7 +128,15 @@ any remaining GPU-side optimisation.
    reductions); check each with nsys/`ncu` and fix any that are
    badly sized. Cheap, and a natural companion to the fused-decode and
    precision work (items 1-2). (The old unpack-layout question is moot -
-   `gpu_unpack` was deleted in the fusion.) **DONE so far (2026-07-23):**
+   `gpu_unpack` was deleted in the fusion.) **DONE 2026-08-27:** `ncu` (now
+   usable on ar313) found `gpu_fused_fringe` - 46.5% of 2070 kernel time, and
+   never examined because it is only 21% on the A100 - latency-bound on an
+   uncoalesced band-major write, with a 1024-thread block that left one
+   resident block per SM. Fixed with a shared-memory transpose and a
+   256-thread block: 1.35x on the kernel, 7.3% on T5-T1, 1.30-1.54x across 13
+   (bands, channels) shapes, gated by `DIFX_GPU_FRINGE_TILE`. See
+   gpu-changes.md §16 and gpu-fringetile-design.md; the A100 A/B is the open
+   half. **DONE so far (2026-07-23):**
    the `<<<1,1>>>` `gpu_sum_weights` single-thread reduction (7.7% of A100
    GPU busy) was eliminated by folding its sum into `gpu_set_weights`
    (per-window atomicAdd) - see gpu-changes.md §13.

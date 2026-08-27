@@ -62,6 +62,77 @@ kernel+memcpy intervals and "idle" = the gaps.
   (kernel-issuing) thread; the process-named thread doing `process_vm_readv`
   is the Core main thread (`receivedata`).
 
+## ncu on the 2070 (2026-08-27) — what each kernel is bound BY
+
+`ncu` became usable on ar313 on 2026-08-27, once the reboot picked up
+`NVreg_RestrictProfilingToAdminUsers=0` (before that: `ERR_NVGPUCTRPERM`, see
+`tests/FakeData/ncu-frac-baseline.log`). It answers in one run what the
+build-measure-revert stub probes answered one hypothesis at a time.
+
+Capture with `tests/FakeData/ncu-frac.sh <tag> [metrics|detailed|full] [regex]`
+— the ncu companion to `nsys-frac.sh`, same 2-station `benchprof2` job (identical
+kernel dimensions to the 10-station `benchprof`), `--target-processes all` over
+`mpirun`, `--launch-skip 60` past the warm-up. `metrics` is a cheap fixed metric
+list, `detailed` adds ncu's rule verdicts, `full` adds Scheduler/Warp State (the
+stall reasons) — keep `full` to 1-2 launches, it replays ~20 passes each.
+
+**Kernel time mix on the 2070 is nothing like the A100's** (nsys, same job,
+`frac-conjremoved` = current build):
+
+| kernel | 2070 share | us/call | A100 share |
+|---|---|---|---|
+| `gpu_fused_fringe` | **46.5%** | 908 | 21% |
+| `vector_fft` (cuFFT) | 22.8% | 444 | 11% |
+| `gpu_resultsrotatorMultiply` | 20.3% | 397 | **42%** |
+| `gpu_fuse_xmac_and_average` | 7.0% | 34 | 23% |
+
+**The ncu verdicts** (RTX 2070 SUPER, sm_75, 40 SMs; build = installed
+`edad94b34`+`d9ec61aeb`):
+
+| | `gpu_fused_fringe` | `gpu_resultsrotatorMultiply` | `gpu_fuse_xmac_and_average` |
+|---|---|---|---|
+| duration | 948 us | 430 us | 39 us |
+| Compute (SM) throughput | 53.6% | **83.5%** | 25.2% |
+| DRAM throughput | 21.1% | 46.3% | **77.7%** |
+| achieved occupancy | 84.2% | 94.5% | 90.2% |
+| launch | 10000 x 1024 | 2500 x 128 | 1252 x 64 |
+| ncu's verdict | latency-bound: 58.4% of warp stall cycles are L1TEX scoreboard, plus 29% excessive sectors from uncoalesced global access | FP64 pipe over-utilised at 83.4%, "likely a performance bottleneck" | DRAM-bound |
+
+Three things follow, and two of them correct beliefs this project was working from.
+
+**1. The 2070 is NOT bandwidth-saturated.** `frac-probes/RESULTS.md` explains the
+0% atomics result on this card as "bandwidth-saturated (~85% of its 448 GB/s)".
+Measured: `gpu_resultsrotatorMultiply` runs at **46% of DRAM peak** (202 GB/s),
+and it is the **FP64 pipe** that is at 83%. The probe result stands — removing
+the atomics on this card really does change nothing — but for a different
+reason: atomic and LSU work (Mem Pipes Busy 17%) hides behind FP64 issue, not
+behind memory stalls. Same observable, different mechanism, and the mechanism is
+what predicts the next optimisation.
+
+**2. Autocorrelations-into-XMAC (plan item 1) is an A100 optimisation, not a 2070
+one.** It targets a kernel that is 42% of A100 kernel busy but 20% here, and the
+work it removes (atomics, cross-pol traffic) is the work this card already gets
+for free. Its host-tail deletion is still worth having everywhere. This is the
+second instance of the recorded lesson: the answer does not transfer between
+cards.
+
+**3. The biggest 2070 prize is in `gpu_fused_fringe`, and it is a data-layout
+problem, not a precision one.** The kernel maps `threadIdx.x = bandindex`
+(16) and `threadIdx.y = channel` (64), while the destination is band-major
+(`destIndex = window*fftchannels*nbands + band*fftchannels + channel`). So the 32
+lanes of a warp write 8 bytes each into 16 regions 2 KB apart — 29% excessive
+sectors, and the L1TEX scoreboard stall that costs 58% of the kernel's stall
+cycles. Note the mapping is **right for the read side**: consecutive bands are
+adjacent bits of the same VDIF sample word, so band-on-lane is what makes
+`decode_one_gpu` coalesce. The fix that keeps both is a shared-memory transpose
+inside the block (16 x 64 samples = 8 KB) so each band's 64 contiguous channels
+leave as one 512-byte store. Second, independent issue: block size 1024 makes
+`Block Limit Warps = 1`, i.e. a single resident block per SM, so there is nothing
+to hide the remaining latency behind — worth testing 256/512.
+FP64 is the *secondary* cost here (one DFMA per thread; ncu's roofline estimates
+~19% from an FP32 conversion), which is consistent with the queued precision item
+being worth ~1% when tried on its own.
+
 ## Reference numbers — A100-SXM4-80GB, commit 7b8e31104 (host-tail overlap)
 
 400 subints, 10 stations. Pre-overlap reference (80f6e291a) in brackets.

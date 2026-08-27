@@ -58,7 +58,7 @@ class Mk5_GPUMode : public GPUMode
    * Launch the fused decode + fringe-rotation kernel (needs the mark5_stream and
    * packed data to decode samples on the fly; folds in phase cal when active).
   */
-    void launchFusedRotate(dim3 grid, dim3 block, int fftloop, int startblock,
+    void launchFusedRotate(int numBufferedFFTs, int fftloop, int startblock,
                            int numblocks, int framestounpack) override;
 
     int framesamples, framebytes, samplestounpack, fanout;

@@ -716,3 +716,99 @@ CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes, and PASS under
 timers report non-zero where the device path reports zeros).
 
 Design and the remaining two steps: `docs/gpu-autocorr-design.md`.
+
+## 16. Tiled fused fringe: a shared-memory transpose for the write (2026-08-27)
+
+`ncu` became usable on ar313 on 2026-08-27 (reboot picked up
+`NVreg_RestrictProfilingToAdminUsers=0`), and the first thing it said was that
+the 2070's kernel mix is nothing like the A100's: `gpu_fused_fringe` **46.5%**,
+`vector_fft` 22.8%, `gpu_resultsrotatorMultiply` 20.3%, xmac 7.0%, against the
+A100's 21/11/42/23. So the biggest kernel on this card had never been examined,
+and it turned out to be **latency-bound on an uncoalesced write**: 29% excessive
+sectors, and 58% of 38.6 warp-cycles-per-instruction stalled on L1TEX
+scoreboard.
+
+The cause is a genuine conflict between the kernel's two halves rather than an
+oversight. `decode_one_gpu` reads `band*nbit` bits into one sample word, so
+band-on-lane makes the decode read a single sector per warp (hence L1 hit 91%,
+DRAM 21%); but `dest` is band-major, because it is the cuFFT batched input, so
+band-on-lane scatters each warp's 8-byte stores across as many sectors as there
+are lanes. Neither mapping suits both sides, and which one loses depends on the
+band count.
+
+**The fix.** One block now owns `BT` bands x `CT` channels of one FFT window,
+with `BT*CT` = 256 threads. Phase 1 decodes and rotates with band on the lane
+into a padded shared tile; `__syncthreads()`; phase 2 stores with channel on the
+lane, so each warp writes 256 contiguous bytes. `BT` is the largest power of two
+<= 8 that *divides* the band count (a divisor, so no block carries idle band
+slots - a plain `pow2_floor` rule cost 0-3% at 3 and 6 bands), and `CT = 256/BT`,
+so every shape gets the same fully-coalesced 256-byte store run. Dropping the
+block from 1024 to 256 threads also took `Block Limit Warps` from **1 to 4**
+resident blocks per SM, which is the second half of the win: the remaining
+latency now has other warps to hide behind. Gated by
+**`DIFX_GPU_FRINGE_TILE`** (default on, `=0` keeps the untiled kernels), and the
+launch geometry moved out of `GPUMode::fringeRotation` into `launch_fused_fringe`
+where the kernel that needs it lives.
+
+**Results on the 2070.** Kernel 948 -> 703 us/call (**1.35x**), achieved
+occupancy 84.2 -> 95.4%, Compute (SM) throughput 53.6 -> 72.4%. End to end,
+same binary, same session: T5-T1 **10.9 -> 10.1 s (7.3%)**.
+
+A shared-memory detail worth recording, because the obvious choice was wrong:
+padding rows by **one** complex element (the reflex fix) leaves an 8-byte-access
+row stride of 1 mod 16 and a **2-way bank conflict on every phase-1 store** -
+ncu counted 640k conflicts across 320k store requests. An 8-byte shared access
+is serviced in half-warps of 16 lanes, and with `lane = band + BT*ch` the banks
+tile only if the row stride is congruent to `16/BT` mod 16, i.e. `PAD = 16/BT`.
+With that, conflicts are **0** - but the kernel time did not move (703 us either
+way), because it is L1TEX-latency bound, not shared-throughput bound. Kept
+anyway: it is free, and a card whose shared throughput binds would pay for it.
+
+**Verification.** All GPU-eligible Synthetic scenarios PASS CPU-vs-GPU in both
+`DIFX_GPU_PIPELINE` modes, tiled and untiled. Beyond that, the shape question
+("is this a win at every (bands, channels), or only at the benchmark's shape?")
+does not fit the DiFX test harness - a job per shape would mean vex surgery per
+shape - so `tests/FakeData/fringetile-sweep.{cu,sh}` drives the *real* launcher
+(it `#include`s `gpudecode.cu`, so there is no second copy to drift) over 13
+shapes from 1x4096 to 128x128 to 16x4096. Both paths do identical arithmetic in identical
+order **into `dest`**, so a hash per shape is an exact all-shapes correctness
+check there as well as a timing harness. That argument does *not* extend to
+`pcal_output`, which is accumulated with `atomicAdd`: the tiling changes the
+summation order, so `SWEEP_PCAL=1` dumps the phase-cal bins and the harness
+compares them with a tolerance instead (worst relative difference measured
+**3.1e-07**, i.e. FP reordering). Results:
+
+- **~1.2x - 1.5x, no shape slower**, and ~1.15x - 1.7x for the
+  complex-sampled twin (`SWEEP_COMPLEX=1`, which doubles the bits per sample and
+  so halves the samples per frame - a different read pattern for the same
+  tiling). Worst real 1.30x (8x256, 2x2048, 4x512); best 1.54x at 1x4096 - the
+  shape that was *already* coalesced, which gains from the occupancy half alone.
+- `dest` **bit-identical at all 15 shapes in both sampling modes**, including the
+  odd band counts (3, 6) that exercise the `BT` fallback, and the phase-cal bins
+  agree to **3.1e-07** under `SWEEP_PCAL=1` - which is the only coverage the
+  `DOPCAL` path has, since `phaseCalInt = 0` in every in-repo scenario.
+
+**Two things the code review caught, both then measured rather than argued.**
+First, the tile policy ignored the channel count, so a job narrower than `CT`
+wasted most of each block: at 1 band x 64 channels the tiled path measured
+**0.46x**. `CT` is now a template parameter clamped to
+`min(256/BT, pow2_floor(fftchannels))` with a floor of 32, so a warp still stores
+one contiguous run; that took the shape to 0.98x. Second, at `BT`=1 the two lane
+decompositions coincide, so the transpose is an identity and the shared
+round-trip is pure cost - `BT`=1 now stores straight to global and skips the
+barrier, which took the narrowest shape to 1.00x. Also from the review:
+`numBufferedFFTs` is passed explicitly instead of read back from `gridDim.x` (the
+`index` arithmetic depended on a grid dimension by convention only), and
+`DIFX_GPU_FRINGE_TILE` now disables only on an explicitly off-ish value - an
+`atoi(e) == 0` test made `=true` and `=yes` silently select the *old* path.
+
+Coverage note: the local `tests/Synthetic` v2d files are scaled down to
+`nChan=1024`, and `fftchannels` is exactly what selects the grid's y extent and
+the ragged tail block, so `usb` was also run end-to-end at the committed
+`nChan=4096` (PASS, both pipeline modes) before this was called done.
+
+Still to do: the same A/B on the A100. The design argument for
+architecture-independence (fewer excessive sectors, more resident blocks - both
+properties of NVIDIA memory hierarchies, not of Turing) is an argument, not a
+measurement, which is what the env gate is for.
+

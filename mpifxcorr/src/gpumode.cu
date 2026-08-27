@@ -29,12 +29,15 @@ bool GPUMode::inputBuffersPinned = false;
 static int weightDebugFrom();   // defined above set_weights
 
 bool GPUMode::useGpuWeights() {
-    static int cached = -1;
-    if (cached < 0) {
+    // Function-local static, so initialisation is thread-safe by the standard
+    // (C++11 6.7/4): this is called per subint from every Core processing
+    // thread, and the previous `static int cached = -1` read-modify-write was a
+    // formal data race (benign only because every writer stores the same value).
+    static const bool usegpu = []() {
         const char *e = getenv("DIFX_GPU_WEIGHTS_HOST");
-        cached = (e != NULL && atoi(e) != 0) ? 0 : 1;
-    }
-    return cached == 1;
+        return !(e != NULL && atoi(e) != 0);
+    }();
+    return usegpu;
 }
 
 void GPUMode::finishWeights(bool validsubint) {
@@ -1406,19 +1409,6 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
     // * BigA and BigB (computed just below)
     // * Which samples are valid - ie that we need to operate on
 
-    // numBufferedFFTs(blockIdx.x) * (numrecordedbands(threadIdx.x) * fftchannels(threadIdx.y))
-    size_t fftchannels_block = fftchannels;
-    size_t fftchannels_grid = 1;
-
-    size_t divisor = cudaMaxThreadsPerBlock / numrecordedbands;
-    if (fftchannels > divisor) {
-        fftchannels_block = divisor;
-        fftchannels_grid = (fftchannels / divisor);
-
-        if (fftchannels % divisor != 0) {
-            fftchannels_grid++;
-        }
-    }
     //  For LSB data, gLoFreqs needs to have already been corrected for the fact that we will convert to
     // USB in unpacking. This means than loFreq = loFreq - bandwidth.
 
@@ -1443,10 +1433,9 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
 
     // The fused decode+fringe-rotation kernel needs the mark5_stream/packed data
     // to decode samples on the fly, so its launch lives in Mk5_GPUMode.
-    launchFusedRotate(
-            dim3(numBufferedFFTs, fftchannels_grid),
-            dim3(numrecordedbands, fftchannels_block),
-            fftloop, startblock, numblocks, framestounpack);
+    // Launch geometry now lives with the kernel in launch_fused_fringe, which
+    // picks the tiled or untiled shape (docs/gpu-fringetile-design.md).
+    launchFusedRotate(numBufferedFFTs, fftloop, startblock, numblocks, framestounpack);
 }
 
 

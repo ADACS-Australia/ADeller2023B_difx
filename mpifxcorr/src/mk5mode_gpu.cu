@@ -121,7 +121,7 @@ void Mk5_GPUMode::blankFrames(int framestounpack)
 // decode samples on the fly. When phase cal is active the same kernel folds the
 // raw samples into pcal_output (the DOPCAL template path); otherwise the pcal
 // arguments are unused.
-void Mk5_GPUMode::launchFusedRotate(dim3 grid, dim3 block, int fftloop,
+void Mk5_GPUMode::launchFusedRotate(int numBufferedFFTs, int fftloop,
                                     int startblock, int numblocks, int framestounpack)
 {
   const bool dopcal = (config->getDPhaseCalIntervalMHz(configindex, datastreamindex) != 0);
@@ -134,7 +134,8 @@ void Mk5_GPUMode::launchFusedRotate(dim3 grid, dim3 block, int fftloop,
   }
 
   launch_fused_fringe(
-      grid, block, cuStream, usecomplex, dopcal,
+      cuStream, numBufferedFFTs, numrecordedbands, cudaMaxThreadsPerBlock,
+      usecomplex, dopcal,
       complex_fringe_rotated_gpu->gpuPtr(), gSampleIndexes->gpuPtr(), gValidSamples->gpuPtr(),
       gBigA->gpuPtr(), gBigBred->gpuPtr(),
       fftloop, startblock, numblocks, fftchannels,

@@ -21,10 +21,19 @@ all four, `vector_fft` 98 us in all four), so only the target kernel moved.
 24.4% of the kernel, ~97 us/launch, ~484 ms over the 5 s window = **10.7% of
 A100 kernel busy**. On the 2070 the identical probe measured 0.0%.
 
-The two are consistent, not contradictory: the 2070 is bandwidth-saturated
-(~85% of its 448 GB/s), so atomic latency sits entirely behind memory stalls
-and removing it changes nothing. The A100 has 4.5x the bandwidth, runs the same
-traffic at 26% of peak, and the atomic serialisation is therefore exposed.
+The two are consistent, not contradictory: on the 2070 the atomic latency sits
+entirely behind another saturated unit, so removing it changes nothing. The A100
+has 4.5x the bandwidth, runs the same traffic at 26% of peak, and the atomic
+serialisation is therefore exposed.
+
+> **Correction, 2026-08-27 (ncu):** this section originally explained the 2070
+> result as "the 2070 is bandwidth-saturated (~85% of its 448 GB/s)". That is
+> wrong. `ncu` measures the kernel at **46% of DRAM peak** on the 2070; the
+> 83-85% figure is its *compute* (SM) throughput, which ncu attributes to the
+> **FP64 pipe**. So the atomics are hidden behind FP64 issue, not behind memory
+> stalls (Mem Pipes Busy is 17%). Every probe *result* in this file stands as
+> measured - only the mechanism was misread. See `docs/gpu-profiling.md`,
+> "ncu on the 2070".
 
 **Lesson for this project: a "what is this kernel bound by?" answer does not
 transfer between these two cards.** The 2070 probes were not wrong, they were

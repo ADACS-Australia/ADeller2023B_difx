@@ -135,7 +135,7 @@ public:
     /// Format-specific (needs the mark5_stream + packed data), so overridden in
     /// Mk5_GPUMode; base is a no-op. Called by GPUMode::fringeRotation after the
     /// (format-agnostic) per-window coefficient precompute.
-    virtual void launchFusedRotate(dim3 grid, dim3 block, int fftloop,
+    virtual void launchFusedRotate(int numBufferedFFTs, int fftloop,
                                    int startblock, int numblocks, int framestounpack) {}
     void runFFT();
     void fringeRotation(int fftloop, int numBufferedFFTs, int startblock, int numblocks, int framestounpack);
