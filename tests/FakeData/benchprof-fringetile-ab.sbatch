@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --gres-flags=enforce-binding
 #SBATCH --mem-per-cpu=4000
-#SBATCH --time=30:00
+#SBATCH --time=45:00
 #SBATCH --account=oz168
 ## add a partition if your site needs one:  #SBATCH --partition=<gpu-partition>
 #
