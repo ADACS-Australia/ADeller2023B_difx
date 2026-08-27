@@ -57,6 +57,43 @@ Rules:
 | 2026-07-23 | (fused sum_weights) | gpu, single-thread VDIF | 8.5 | 20.3 | **11.8** | fold the total-weight reduction into gpu_set_weights (per-window atomicAdd), delete the `<<<1,1>>>` gpu_sum_weights. 12.3→11.8 (~4%) on the 2070; on the A100 it should be ~its 7.7% GPU-busy share. |
 | 2026-08-26 | (conjugate array removed) | gpu, single-thread VDIF | 7.0 | 17.8 | **10.8** | delete `conj_fftd_gpu` and conjugate in the multiply instead (gpu-changes.md §15). 11.8→10.8 (~8.5%); `gpu_resultsrotatorMultiply` 536.3→396.9 us/call (−26%) on the 2070, and 82 MB/mode of VRAM freed. Larger A100 gain expected — that kernel is 42-44% of its kernel busy. |
 
+## CPU baselines (added 2026-08-27, for the cost/benefit costing)
+
+These exist so the GPU numbers can be compared against something, and because
+the ar313 CPU leg is easy to misread. **On ar313 the CPU path is core-starved,
+not compute-limited**: the correlator competes with ten DataStream ranks for four
+physical cores, and halving the cores available cost only 1.41x rather than 2x.
+So the desktop CPU row says what that machine does and must NOT be scaled up to
+describe a CPU server - which is what the cluster rows are for.
+
+| machine | config | metric | result |
+|---|---|---|---|
+| ar313 (i7-6700, 4 cores) | CPU only, 2 physical cores | T5-T1 | 134.5 s |
+| ar313 | CPU only, 4 physical cores | T5-T1 | **95.5 s** |
+| ar313 | + RTX 2070 SUPER | T5-T1 | **10.8 s** (8.8x) |
+| dave13 (2 x EPYC 7543, 64 cores) | CPU only, 10 threads | wall, 20 s window | 96.6 s |
+| dave13 | CPU only, 20 threads | wall, 20 s window | 51.7 s (1.87x, 93% eff) |
+| dave37 | CPU only, 40 threads | wall, 20 s window | **32.4 s** (1.60x, 80% eff) |
+| gina4 (A100) | 12 cores + one A100 | wall, 20 s window | **24.5 s** |
+
+Run with `benchprof-cpu-20s.sbatch` (`--export=ALL,NTHREAD=n`) and, for the GPU
+row, `benchprof-profile-nonsys-20s.sbatch`. Note the two different metrics: the
+desktop rows are T5-T1 (start-up differenced away), the cluster rows are raw wall
+for a 20 s window (start-up included, so their steady-state rates are better than
+shown). To compare across the two, ar313's fitted line gives 481 s (CPU) and
+58.3 s (GPU) for a 20 s window.
+
+**The 20->40 thread efficiency drop from 93% to 80% is a configuration artefact,
+not a scaling limit:** each processor has 32 cores, so one Core process with 40
+threads spans both sockets. Two processes of 20 threads each, bound one per
+socket, would do better - so the 40-thread row is a worst case for a big CPU box.
+
+**Derived equivalences** (interpolating the cluster CPU curve): the used
+RTX 2070 SUPER is worth ~18 EPYC 7543 cores; one A100 is worth 50-60, i.e. most
+of a dual-socket node, while occupying 12 cores rather than 40. The full
+cost/benefit write-up, including August 2026 hardware prices and a VGOS-rate
+sizing exercise, is the artifact recorded in `docs/gpu-payback.pdf`.
+
 ## A100 cluster profiling (benchprof-profile-nsys-5s.sbatch, 10 stations)
 
 Note on windows: subints are 10 ms, so the profiling window scales linearly

@@ -10,7 +10,8 @@ largest A100 kernel (42-44% of kernel busy). Companion to `gpu-plan.md`
 `gpu_resultsrotatorMultiply` does four things in one kernel: the fractional
 sample rotation, the conjugation, the **per-band autocorrelation**, and the
 **cross-pol autocorrelation**. Four env-gated timing probes
-(branch `probe-frac-limits`, `DIFX_GPU_FRAC_PROBE=0..3`), run in one job on
+(`DIFX_GPU_FRAC_PROBE=0..3`, on the since-deleted `probe-frac-limits` branch),
+run in one job on
 gina13, decompose its 396 us/launch on the A100:
 
 | probe | A100 us/call | delta | RTX 2070 delta |
@@ -104,9 +105,11 @@ waiting for cluster time), and it frees memory rather than spending it.
 ## Part 2: window-group reduction - BUILT, MEASURED, NOT LANDED (2026-08-26)
 
 Implemented and validated correct, then measured as a net loss on the 2070 with
-only a speculative gain on the A100, so it is parked on branch
-`wip-window-group-reduction` (`f9e25513e`) rather than merged. The design below
-is kept because it is still the right shape if the A100 numbers justify it.
+only a speculative gain on the A100. The branch was **deleted on 2026-08-27**
+once Part 3 was agreed, because Part 3 removes these atomics outright rather
+than reducing them. The design below is therefore the only surviving record, and
+is deliberately detailed enough to rebuild from: the thread mapping, the barrier
+structure, the correctness hazard, and the measurements that killed it.
 
 **RTX 2070, `gpu_resultsrotatorMultiply` us/call, vs 396.9 for the kernel
 without any of this machinery:**

@@ -59,10 +59,12 @@ design.md` holds the resulting three-step plan; §15 was step one.
    (2026-08-26); until they exist FP16 can be built and measured but not
    landed. Worth starting (c) in parallel with (a).
 
-**Superseded:** the window-group reduction was built and measured as a net loss
-(gpu-changes.md/design note; branch `wip-window-group-reduction`). Item 1 above
-subsumes it — do not revisit unless an A100 measurement of that branch says
-otherwise.
+**Superseded:** the window-group reduction was built, measured as a net loss on
+the 2070, and its branch **deleted** (2026-08-27) once item 1 was agreed, since
+item 1 removes the atomics entirely rather than reducing them. The approach and
+every measurement are written up in `gpu-autocorr-design.md` — enough to rebuild
+it from the note if an A100 result ever justifies revisiting. Do not re-plan it
+from scratch.
 
 **Still the real production bottleneck: the DataStream corner-turn.** The
 2026-08-27 costing exercise made this concrete rather than theoretical: at the
