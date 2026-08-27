@@ -63,6 +63,9 @@ The install-difx options are:
 
    --withpython    Build Python bindings for certain libraries (requires ctypes)
 
+   --withcuda      Build GPU acceleration using CUDA for mpifxcorr
+                   (not enabled by default, even if nvcc is on PATH)
+
    --withdatasim   Build the datasim application (requires gsl)
 
    --noinstall     Don't install, only build.
@@ -169,7 +172,7 @@ For example Haystack usually builds with:
 try:
     opts, args = getopt.gnu_getopt(sys.argv[1:], "fhv",
         ["force", "help", "verb",
-         "help-options", "help-environment", "help-examples",
+         "help-options", "help-environment", "help-examples", "withcuda",
          "mk5daemon", "withmonitor", "withdatasim", "perl", "withfb",
          "withhops", "withm6support", "withguiserver", "withpython",
          "withpolconvert", "noinstall", "reconf", "noconf", "clean",
@@ -201,6 +204,7 @@ errors = []
 noconf = False
 pristine = False
 dodoc = True
+with_cuda = False
 dopybindings = False
 doipp = 0
 orgcwd = os.getcwd()
@@ -214,7 +218,7 @@ components = {"perl"          :False,
               "vdifio"        :True,
               "calcif2"       :False,
               "difxcalc11"    :True,
-              "difx2profile"  :True,
+              "difx2profile"  :False,
               "misc"          :True,
               "vis2screen"    :True,
               "calcserver"    :False,
@@ -357,6 +361,8 @@ if len(opts) > 0:
             components["guiServer"] = True
         if o == "--withpython":
             dopybindings = True
+        if o == "--withcuda":
+            with_cuda = True
         if o == "--noinstall":
             noinstall = True
         if o == "--reconf":
@@ -648,6 +654,13 @@ def auto_compile(doreconf, dolibtoolize, doautoheader, prefix, dompicxx):
         if dopybindings and check_configureAC_has(
             cfp+"/configure.ac", "with-python"):
                 configstring += " --with-python "
+        if check_configureAC_has(cfp+"/configure.ac", "enable-cuda"):
+            # Always state the choice explicitly. configure.ac autodetects CUDA
+            # from nvcc on PATH (AC_CHECK_PROG), so saying nothing means "GPU
+            # build iff nvcc happens to be visible" - and sourcing setup.bash
+            # puts it there. Passing --disable-cuda is what makes a CPU-only
+            # build requestable at all.
+            configstring += " --enable-cuda " if with_cuda else " --disable-cuda "
         run(configstring)
 
     run(MAKEcommand + target)
@@ -918,6 +931,8 @@ if components["mpifxcorr"]:
         configstring += " --prefix=" + difxroot
         if doipp<0:
             configstring += ' --disable-ipp '
+        # Explicit either way - see the note at the generic configure site above.
+        configstring += ' --enable-cuda ' if with_cuda else ' --disable-cuda '
         if cache != 'none':
             configstring += cache + "-CXX"
         run(configstring)
