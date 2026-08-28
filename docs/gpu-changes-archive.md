@@ -1,0 +1,385 @@
+# GPU correlator: archived change record (sections 1-9, 11)
+
+The settled part of the prose record - the port, the correctness campaign, the
+first performance push, and the desktop bring-up. Split out of
+`gpu-changes.md` on 2026-08-28 to keep the live file readable; nothing was
+edited on the way across, and the section numbers are unchanged so existing
+references (`gpu-changes.md §8`) still resolve. The sections still bearing on
+current work - §10, §12-16 - stayed in `gpu-changes.md`.
+
+## 1. Foundation
+
+The GPU path was hand-merged from earlier prototype work and extended
+with a GPU unpack testing framework, constructor-time memory allocation,
+parallelised unpacking, and fixes from testing against real data. Data
+weights were moved to CPU calculation with the GPU decoder tidied around
+them. Complex-sampled stations and interlaced VDIF became supported
+inputs.
+
+## 2. Pulse cal (PCal) on the GPU
+
+PCal extraction was implemented on the GPU in stages: real USB first,
+then LSB, then complex sampling, with the accumulation logic optimised
+and a long tail of correctness fixes — the milestone commit
+(`f3c0dbd9f`) fixed a decode bug that made CPU and GPU results diverge
+and got PCal extracting correctly. GPU pcal currently has no regression
+coverage (diffDiFX compares only visibilities); a CPU+GPU pcal refactor
+(PCal gaining a first-class "ingest folded bins" interface) is agreed
+but not started.
+
+## 3. The correctness campaign
+
+A sustained CPU-vs-GPU parity effort, driven by the synthetic test
+scenarios (deliberately including an end-of-recording boundary mid-job).
+The recurring bug class was frame validity and windows that straddle
+missing/invalid data. Landed fixes include:
+
+- treating undelivered frames as invalid and zeroing the stale unpacked
+  tail (`a1c6d2192`);
+- rejecting frames with the VDIF invalid bit, and frames with zero Data
+  Frame Length (`b3ebfd0f1`, `fbaf9c4e0`);
+- resetting weights/validity when a subint arrives with no data
+  (`e883f6bcc`), and restoring the autocorrelation flush into the
+  results buffer (`46c48622d`);
+- fused-XMAC correctness and occupancy fixes (`1713a5aa5`), and
+  per-stream FFT buffer strides in the fused XMAC kernel (`d30ce1e9c`) —
+  the identical-datastream half of that problem is fixed, heterogeneous
+  datastreams remain unsupported by the XMAC plans;
+- CPU-side bugs found along the way and hand-ported upstream (branch
+  `bugfix-complex` off dev): the complex samplegranularity erasure
+  (`ade81edb0`), the mark5access extra-blanker bug (`8c673cac7`), a
+  generateVDIF error check; plus the fork-specific configuration.cpp
+  double-halving fix (`695f8b08f`).
+
+Outcome (2026-07-09, cluster, CUDA 12.8): scenarios usb,
+complex-complex and usb-complex PASS bit-identical CPU-vs-GPU, in both
+`DIFX_GPU_PIPELINE` modes. (On the desktop's newer toolchain the
+acceptance bar is FP-level agreement at ~1e-7, judged by diffDiFX
+thresholds — bit-identity is toolchain-dependent, not a design goal.)
+LSB and DSB scenarios are excluded by design: `GPUMode` rejects lower
+sideband until LSB is implemented.
+
+## 4. Debug and test infrastructure
+
+Built in parallel with the campaign and still in the tree (env-gated):
+
+- `DIFX_WEIGHT_DEBUG` — identical per-window weight lines from both
+  paths, plus HDRDEBUG frame-class transition dumps (`ee26c7820`,
+  `fbaf9c4e0`);
+- `DIFX_SPEC_DEBUG` — format-identical spectral tracing every 128th
+  window to localise divergence to a pipeline stage (`f874f1ef1`);
+- `diffDiFX.py --diagnose` — per-record best-fit complex gain/residual
+  (amplitude error ⇒ weight bug, phase ⇒ timing bug), with separate
+  tolerances for header weight and u/v/w (`b40eb7722`, `9dc608040`,
+  `5d723be68`);
+- the SLURM CPU-vs-GPU regression harness (`154fe8b37`) and its local
+  no-SLURM equivalent `tests/Synthetic/run-local.sh` (`2a07491dc`);
+- NVTX ranges around the host-side phases for nsys profiling
+  (`1bf496b16`), and the `tests/FakeData` 10-station fake-data benchmark
+  with mpirun/nsys recipes (`dfe8f0d66`).
+
+## 5. Performance phase
+
+Diagnosis first: on a 10-station benchmark the GPU was gap-dominated —
+only ~15 s of GPU-busy inside ~70 s of correlation, because the single
+Core thread alternates host work and GPU work. Groundwork and levers:
+
+- fused XMAC grid enlarged, unnecessary atomics dropped, per-config
+  launch metadata cached (`d4877acf1`, `65672fa36`, `7a5979afd`);
+- one persistent compute stream shared by all modes, plus a start-up
+  VRAM budget check that refuses jobs that cannot fit (`8ed77b08a`);
+- visibility D2H transfer overlapped with the next subint
+  (`DIFX_GPU_PIPELINE`, `789eba445`);
+- first desktop NVTX profile (2026-07-17, RTX 2070, 10-station/10 ms
+  job): ~42% GPU-busy; `host_accumulate` is the dominant host cost
+  (71.6 ms per subint, 37% of wall); `fringeRotation` is 66% of GPU time
+  on GeForce because of its double-precision phase math (FP64 is 1/32 of
+  FP32 on Turing — a desktop-specific skew, but an optimisation target);
+- **Lever A** (`785bcaec0`): the Core receive buffers are page-locked
+  once at GPUCore construction and each mode's input H2D now DMAs
+  directly from the delivered buffer, eliminating the per-subint host
+  staging memcpy (formerly ~2250 us per datastream-subint on the cluster
+  against ~280 us of actual PCIe). Gated by `DIFX_GPU_PIN_INPUT` with a
+  warn-and-fall-back staging path; a per-slot `h2dInputDone` event makes
+  the buffer-reuse invariant explicit for the coming de-serialization.
+  Desktop benchmark: 269 s → 259 s (~4%); the cluster fraction was
+  larger. Verified 6/6 Synthetic PASS in both pipeline modes.
+
+- **De-serialization Increment 1 — set_weights on the device**
+  (2026-07-18): the per-window weight/validity/sample-index calculation
+  moved from a host loop (fed by a device-to-host copy of the frame
+  validity, and followed by re-uploads) into a small per-window kernel
+  that computes everything in place. All three per-datastream stream
+  drains inside process_gpu disappear on the default path
+  (`DIFX_GPU_WEIGHTS_HOST=1` restores the host path, which also carries
+  full-fidelity WDEBUG). The config-static band map is now built once at
+  construction. Verified: fractional boundary-window weights bit-identical
+  to the CPU (WDEBUG money grep), 8/8 scenarios PASS, benchmark
+  T5-T1 66.7 -> 62.4 s; nsys shows station_processing collapsed from
+  83.6 to 63.6 ms/subint (= its GPU kernel content). host_accumulate
+  (72 ms/subint, 48% of wall) is Increment 2's target. Design and audit
+  trail: docs/gpu-deserialization-design.md.
+
+- **De-serialization Increment 2 — baseline weights on the device**
+  (2026-07-20): the per-window baseline-weight loop that dominated
+  `host_accumulate` — summing `dataweight1[w]*dataweight2[w]` over the
+  subint's FFT windows for every (freq, baseline, polproduct),
+  O(windows x freqs x baselines x pols) on the host — moved to a device
+  reduction kernel (`gpu_baseline_weights`, one thread per accumulator,
+  sequential window sum matching the CPU order). A per-config plan built
+  in `buildXmacPlans` gathers each baseline's two device `gDataWeights`
+  arrays and records each accumulator's destination float offset into the
+  results buffer; the reduced weights are D2H'd (a few hundred floats)
+  and folded in by a flat, self-describing one-pass loop that cannot
+  diverge from the plan enumeration. The host per-window loop and nested
+  fold survive only on the `DIFX_GPU_WEIGHTS_HOST` fallback path. A code
+  review caught a latent correctness bug fixed here: the invalid-subint
+  early return zeroed the host `dataweight[]` but not the device
+  `gDataWeights` the reduction reads, so an out-of-data datastream at a
+  recording boundary would have contributed stale weights — the device
+  buffer is now zeroed there too. Verified: 8/8 Synthetic scenarios PASS
+  on the device path AND on the `DIFX_GPU_WEIGHTS_HOST` fallback, both
+  pipeline modes; boundary-window weights byte-identical CPU-vs-GPU
+  (WDEBUG); benchmark T5-T1 62.4 -> 32.4 s (~48%, from gutting the
+  dominant host loop). Design/audit trail:
+  docs/gpu-deserialization-design.md.
+
+- **De-serialization Increment 2b — autocorrelation weights on the
+  device, interim D2H dropped** (2026-07-21): the last routine bulk
+  device-to-host copy on the weights path (the per-subint full
+  `gDataWeights` array, kept through Increment 2 to feed the host AC
+  per-band weight accumulation) is gone. The AC-weight loop's band map
+  (`indices`/`countsStatic`) is window-independent, so the accumulation
+  equals `totalW = sum_w dataweight[w]` times a config-static per-band
+  multiplicity — only `totalW` is per-subint. A tiny reduction kernel
+  (`gpu_sum_weights`, single-thread sequential sum matching the host
+  window order) computes it on device, and only that one float is D2H'd
+  each subint; the host loop collapses from O(windows x freqs) to
+  O(freqs). The full per-window array is D2H'd only under the WDEBUG
+  gate. Bit-identical AC weights in the common (single-occurrence-band)
+  case — the device sum reproduces the host summation order — and
+  FP-level for the rare multi-occurrence band. `gTotalWeight` is only
+  read when `weightsOnDevice` is set (device branch only), so the
+  invalid-subint/fallback paths never read a stale scalar (no explicit
+  zeroing needed, unlike Increment 2's `gDataWeights`). Verified: 8/8
+  Synthetic PASS device + `DIFX_GPU_WEIGHTS_HOST` fallback, both pipeline
+  modes; boundary weights byte-identical (WDEBUG); benchmark T5-T1 flat
+  at 32.4 s (a cleanup/D2H-removal, not a perf lever — the win was
+  Increment 2). Design/audit trail: docs/gpu-deserialization-design.md.
+
+- **Fringe-rotation interpolator hoisting** (2026-07-21): the
+  `gpu_fringeRotation` / `gpu_complex_fringeRotation` kernels launched one
+  thread per (FFT window, band, channel) and recomputed the FP64
+  interpolator math — `d0`/`d1`/`d2` -> `a`/`b` (per window) and
+  `bigAval`/`bigB_reduced` (per (window, band)) — in *every* thread, i.e.
+  `numrecordedbands x fftchannels` times more than needed. A new
+  `gpu_precompute_fringe_rotator` kernel (one thread per (window, band))
+  computes `bigAval`/`bigB_reduced` once per subint into device arrays
+  (`gBigA`/`gBigBred`); the per-sample kernels now only read those two
+  values and form `exponent = bigAval*channel + bigB_reduced` -> FP32
+  `__sincosf` -> complex multiply. Same FP64 expressions, just hoisted out
+  of the inner loop, so it is numerically equivalent (the GPU final output
+  is not bit-reproducible run-to-run regardless, because the XMAC
+  accumulates with `atomicAdd`). This matters because `fringeRotation` was
+  ~66% of GPU time on GeForce, where FP64 runs at 1/32 of FP32.
+  Verified: 8/8 Synthetic PASS device + `DIFX_GPU_WEIGHTS_HOST` fallback,
+  both pipeline modes; benchmark **T5-T1 32.4 -> 22.9 s (~29%)** — the
+  largest single-change win since Increment 1. A per-sample precision drop
+  (keep only `bigAval*(double)channel` in FP64, `bigB_reduced` as float)
+  is a queued follow-up. Design: docs/gpu-fringerotation-design.md.
+
+## 6. Multi-station, multi-subband correctness coverage
+
+Until 2026-07-18 every correctness scenario was 2 stations with a single
+subband, so the multi-datastream / multi-band machinery (the XMAC plans,
+the per-datastream loops that the de-serialization work rewrites) was
+never exercised by the safety net. The `multi` scenario adds 5 stations
+(the two original test sites plus Parkes/Hobart/Ceduna-like southern
+sites) each recording 4 x 4 MHz USB subbands as 4-channel VDIF
+(`generateVDIF -C 4`, distinct seeds/tones per station). First run: PASS
+CPU-vs-GPU in both pipeline modes, 1440 records compared at ~4e-7
+relative difference. The local and SLURM harnesses now size their MPI
+rank counts per scenario instead of assuming 4.
+
+## 7. Desktop bring-up (2026-07-17/18)
+
+Development moved from Mac + SLURM cluster to a local RTX 2070 desktop
+(Fedora 43, CUDA 13.2, OpenMPI 5): the mpifxcorr `.cu.o` build rule and
+configure.ac were made portable (configure-derived flags, env-respected
+`NVCC`/`NVCCFLAGS`, CUDA include/lib paths derived from nvcc's location),
+GCC 15 / C23 breakage in difx2fits and the vex parser was fixed
+(`5c1a6f8d2`), and the local test/benchmark workflows above were
+established.
+
+## 8. Host-tail overlap (intra-subint half-split, 2026-07-21)
+
+The clean A100 profile settled the idle question: the GPU is ~48% idle,
+real (not oversubscription/IO), 70% of it a between-subints host tail.
+The cause was structural - `GPUCore::issuegpudata` enqueued a subint's
+GPU work, drained the compute stream (`cudaStreamSynchronize`), and only
+then ran the whole per-subint host tail (finishWeights, autocorrelation +
+baseline-weight fold, pcal copy, visibility memcpy) with the GPU idle,
+before the next subint's kernels launched.
+
+`GPUMode::process_gpu` is split at the FFT: `process_gpu_tofft` (input
+H2D, unpack, `gpu_set_weights`, fringe rotation, FFT) and
+`process_gpu_afterfft` (the `gpu_sum_weights` reduction + `gTotalWeight`
+D2H, pcal extraction + copy, fractional rotation / autocorrelations). The
+split point was chosen so the first half writes NONE of the buffers the
+host tail consumes - the weight reduction and pcal, though computed before
+the FFT in the old code, were moved into the after-FFT half for exactly
+this reason.
+
+`GPUCore` mirrors the split: `issuegpudata` becomes `issue_tofft` and
+`issue_afterfft_xmac_drain`, and the entire host tail moves into
+`completegpudata`. `loopprocess` software-pipelines at half granularity -
+a prologue issues subint 0's first half, then each iteration issues the
+current subint's second half + XMAC + output drain, pre-issues the NEXT
+subint's first half onto the compute stream, and only then completes the
+current subint (awaits its outputs and runs its host tail). The next
+subint's input half therefore executes on the GPU while the current
+subint's outputs drain and its host tail runs on the CPU.
+
+The mid-loop `cudaStreamSynchronize` is replaced by an `evComputeDone`
+event recorded on the compute stream; the d2h stream waits on it before
+the visibility D2H, and `completegpudata` waits `d2hDone` (which
+transitively covers the compute-stream output D2Hs). No buffer
+duplication is needed: single-compute-stream ordering keeps the fftd /
+gDataWeights buffers the second half reads valid across subints, and each
+subint's host tail runs (in the same loop iteration) before the next
+subint's second half overwrites the shared output mirrors.
+
+Correctness subtleties handled:
+- **Per-slot `validsubint[slot][ds]`** captures each datastream's subint
+  validity at issue time (`GPUMode::isSubintValid()`), because the
+  pipelined next-subint issue overwrites the Mode's
+  `datalengthbytes`/`offsetseconds`/`weightsOnDevice` before the deferred
+  tail folds this subint's weights/autocorrs. `finishWeights` takes the
+  validity as a parameter instead of reading the mutable member.
+- **`zeroAutocorrelations` / `resetpcal`** move out of the pre-GPU prep
+  into the tail (device path), just before `finishWeights` /
+  `copyPCalTones`.
+- **`DIFX_GPU_WEIGHTS_HOST` fallback**: it computes `weights[][]` on the
+  host in `set_weights` (in the first half) and copies autocorrelations in
+  the second half, both before the tail, so on that path
+  `zeroAutocorrelations` runs at `issue_tofft` start and the pipeline is
+  forced synchronous - its shared-mirror lifecycle is incompatible with
+  inserting the next subint's first half between afterfft and complete.
+- **`DIFX_WEIGHT_DEBUG`** now aborts unless `DIFX_GPU_PIPELINE=0` (its
+  per-window scalars would reflect the next subint under overlap).
+- The pipeline is broken (next first-half deferred until after complete)
+  across a config change and at end of data.
+
+Verified CPU-vs-GPU via run-local.sh on an RTX 2070: usb, usb-complex,
+complex-complex, multi all PASS in both `DIFX_GPU_PIPELINE` modes, plus
+usb/complex-complex/multi on the `DIFX_GPU_WEIGHTS_HOST` fallback.
+
+**Benchmark (measured 2026-07-21).** Desktop T5-T1 flat (22.8 s
+pipeline=1 vs 22.6 s pipeline=0 vs 22.9 s baseline) - the 2070 is
+GPU-compute-bound so there is no idle to hide. The A100 re-profile
+(benchprof-profile.sbatch, 400 subints, `.nsys-rep` under
+`tests/FakeData/cluster/benchprof-21072026-after-processgpusplit/`) shows
+the overlap **did not** collapse the between-subints idle: GPU span
+10497 -> 8798 ms (~16% shorter), idle ~48% -> ~42% (kernels-only) /
+~35% (counting compute-stream copies) - a modest gain, not the hoped-for
+collapse. Root cause of the residual idle: the process thread blocks in
+~10 `cudaStreamSynchronize`/subint (5.58 s total, one per station),
+matching cuFFT's per-`cufftExecC2C` driver footprint - **cuFFT is
+synchronising the compute stream on every FFT exec** (see runFFT ->
+`cufftExecC2C`, plan built with default auto work-area allocation in the
+GPUMode constructor). This serialises host and GPU at station granularity
+and dwarfs the ~900 us/subint host tail the overlap actually moved, which
+is why wall time barely changed. The overlap is still correct and a small
+net win; the next lever is eliminating the per-station FFT sync (new top
+work-queue item), not fusing kernels. Full analysis: BENCHMARKS.md
+(A100 cluster profiling) and gpu-plan.md.
+
+**CORRECTION (see §9): the "cuFFT is synchronising" conclusion above was
+wrong.** The per-station sync is a whole-stream drain in
+`Mk5_GPUMode::unpack_all`, not cuFFT; the count-match with `cufftExecC2C`
+was a coincidence (unpack and the FFT are in the same per-station tofft
+iteration). cuFFT is async.
+
+## 9. Per-station unpack drain removed; RING-deep host staging (2026-07-22)
+
+The residual per-station idle from §8 was traced to its real source and
+removed. **It was never cuFFT.** Evidence: (i) the
+`utilities/fft-profiling/fftbench.cu` microbenchmark shows `cufftExecC2C`
+returns in ~0 ms after a 50 ms stream backlog on both the 2070 (cuFFT
+12.2) and the A100 cluster (CUDA 12.8) - async, no per-exec sync; (ii)
+stubbing out the `cufftExecC2C` call left the ~4021 `cudaStreamSynchronize`
+(one per station per subint) unchanged; (iii) an nsys `--cudabacktrace=sync`
+stack resolved to `Mk5_GPUMode::unpack_all` -> `valid_frames->sync()`.
+
+That `valid_frames->copyToHost() + sync()` exists only so the
+`DIFX_GPU_WEIGHTS_HOST` fallback can read `valid_frames` on the host; on
+the default device path `gpu_set_weights` reads `valid_frames->gpuPtr()`
+directly (stream-ordered after the unpack kernel), so the copy and the
+whole-stream drain are pure overhead. It is now gated behind
+`!useGpuWeights()`.
+
+Removing the drain on the device path broke PIPELINE=1 (weights came out
+fractional - 0.9794 vs 1.0 - and cross-baselines were garbage) because the
+drain doubled as an **implicit barrier**. The four per-mode host-staging
+buffers uploaded each subint - `nearestSamples`, `gFracSampleError`,
+`gValidFlags`, `gInterpolator` (plus `gValidSamples` on the invalid-subint
+path) - are single-buffered. The tail-overlap pipeline runs the host ~1
+subint ahead, so `calculatePre_cpu(N+1)` overwrote a host buffer while
+subint N's tiny async H2D from it was still queued behind the GPU's compute
+backlog, corrupting N's upload (wrong `nearest`/flags -> wrong weights and
+wrong fringe-rotation sample indices). The drain had masked this by
+throttling the host to GPU pace.
+
+**Fix:** `GpuMemHelper` gained an optional RING-deep HOST buffer
+(`enableHostRing(n)` + `setHostSlot(i)`); the device buffer stays single
+(device reads are stream-ordered). `GPUMode` RING-deeps the five staging
+buffers to `RECEIVE_RING_LENGTH` and selects the slot per subint via
+`setProcSlot` (called from `GPUCore::issue_tofft` with the procslot index).
+`gInterpolator` changed from wrapping the `interpolator[]` member to a
+managed helper (its host slot is filled by `memcpy` each subint).
+Additional pinned host memory: ~3 KB (benchprof), <1 MB worst case.
+
+**Result:** `cudaStreamSynchronize` 4021 -> 31 (13.1 s -> 0.002 s on the
+2070). PASS CPU-vs-GPU (usb, usb-complex, complex-complex, multi) in BOTH
+pipeline modes AND the `DIFX_GPU_WEIGHTS_HOST` fallback. Desktop T5-T1 flat
+(23.7 s pipeline=1 / 22.9 s pipeline=0 - the 2070 is compute-bound +
+oversubscribed, so the removed host-serialisation has no idle to convert);
+the A100 wall win (the 5.58 s of idle) is to be confirmed on the cluster.
+Files: `gpumode_kernels.cuh` (GpuMemHelper host ring), `gpumode.cu`/`.cuh`
+(procSlot + ring setup + gInterpolator staging), `gpucore.cu` (setProcSlot
+in issue_tofft), `mk5mode_gpu.cu` (gate the drain).
+
+Same day, a follow-up refactor (`8cb18851b`) folded GPUCore's six parallel
+`std::vector<...>(RECEIVE_RING_LENGTH)` members (results_gpu, results_host,
+d2hDone, h2dInputDone, evComputeDone, validsubint) into a single
+`struct gpuprocslot` + `std::vector<gpuprocslot> gpuprocslots` (access
+`gpuprocslots[index].<field>`), complementing Core::procslots. Pure cleanup,
+no behaviour change, PASS both pipeline modes.
+
+## 11. Build: nvcc header-dependency tracking; item-4 investigation (2026-07-22)
+
+**Makefile.am fix.** The custom `.cu.o` rule ran nvcc with no dependency
+generation, so changing a shared `.cuh` did not rebuild dependent `.cu`
+objects — an incremental `make` could silently leave ABI-mismatched objects
+(e.g. `gpucore.o` keeping an old `GPUMode` layout after `gpumode.cuh` changed,
+reading members at wrong offsets). The rule now emits `-MMD -MF $(@:.o=.d)` and
+`-include`s the resulting `.d` files (added `CU_DEPFILES`/`CLEANFILES`), so
+`.cu` TUs track header deps like the `.cpp` TUs. A plain `make` after a header
+change is now safe. Confirmed: incremental rebuild after a `gpumode.cuh` layout
+change now recompiles `gpucore.o` and PASSes run-local (was 5/5 FAIL before).
+
+**Cautionary tale that motivated it.** A lot of effort went into chasing an
+apparent "flaky PIPELINE=1 tail-overlap race" that corrupted GPU
+cross-correlations (gpu0 PASS / gpu1 FAIL). It was NOT a race — it was the
+stale-object ABI mismatch above, created by incremental rebuilds while
+adding/removing a `GPUMode` member during the item-4 experiments. It was
+masked by compute-sanitizer and ASan (allocator/timing shifts) and looked
+intermittent on tiny-sample runs. The tail-overlap code (§8) is correct.
+Reproduced deterministically: stale `gpucore.o` → 5/5 gross FAIL, clean
+rebuild → 5/5 PASS. (Aside: GPU-vs-GPU diffDiFX at 10 stations shows ~0.04%
+XMAC-atomic noise — use a looser threshold or it reads as failure.)
+
+**Item 4 (`gpu_resultsrotatorMultiply`) investigated, no change.** It is
+memory-bound and already optimal as a single fused pass; splitting it is ~2×
+slower (cold global re-reads) and a `gFracSlope` precompute is neutral. Left
+fused. See gpu-plan.md item 4.

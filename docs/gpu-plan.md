@@ -6,52 +6,57 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 
 ## Where we are
 
-**Correctness: done** for the USB scenarios (usb, usb-complex,
-complex-complex, and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both
-`DIFX_GPU_PIPELINE` modes; LSB deliberately unimplemented). We are in the
-**performance** phase: T5−T1 is at **11.8 s**, down from 66.7 s. What landed
-to get there, and why, is in `gpu-changes.md` (§5-14, one section per change);
-the numbers are in `BENCHMARKS.md`. The queue below is only what remains.
+**Correctness: done** for the USB scenarios (usb, usb-complex, complex-complex
+and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both `DIFX_GPU_PIPELINE`
+modes; LSB deliberately unimplemented). We are in the **performance** phase:
+T5−T1 is at **10.1 s**, down from 66.7 s. Every change and why is in
+`gpu-changes.md` (settled sections in `gpu-changes-archive.md`); the numbers are
+in `tests/FakeData/BENCHMARKS.md`. The queue below is only what remains.
 
-**Current A100 kernel mix** (5 s profile at `edad94b34`, 3924 ms kernel busy,
-landed 2026-08-28 - job 15956983, capture in `tests/benchprof-28082026/`):
-`gpu_resultsrotatorMultiply` **34.9%** (277.9 µs/call), `gpu_fuse_xmac_and_average`
-24.7%, `gpu_fused_fringe` 24.1% (191.9 µs/call), `vector_fft` 12.3%, everything
-else <2%. GPU busy-union is **91.4%** of span; the residual 8.6% idle has **no
-gap over 500 µs at all** and 97% of it in sub-20 µs inter-kernel gaps, so the
-host/data-delivery stall that dominated the 2026-07 captures is gone and what is
-left on the host side is launch overhead (CUDA graphs). FP64 is cheap on the
-A100, so precision work leans on the 2070. Note this capture is the **untiled**
-build, so it is the baseline for the tiling A/B, not a measurement of it.
+**Current kernel mix.** The two cards disagree, and that has repeatedly decided
+what is worth doing — always check which one a claim came from:
+
+| kernel | RTX 2070 (tiled build) | A100 (untiled, `edad94b34`) |
+|---|---|---|
+| `gpu_fused_fringe(_tiled)` | **39.7%** (677 µs) | 24.1% (192 µs) |
+| `vector_fft` (cuFFT) | 25.1% | 12.3% |
+| `gpu_resultsrotatorMultiply` | 23.3% (397 µs) | **34.9%** (278 µs) |
+| `gpu_fuse_xmac_and_average` | 8.0% | 24.7% |
+| kernel busy, 5 s window | 1360 ms | 3924 ms |
+
+The A100 capture predates the tiling, which is worth 1.48x on `gpu_fused_fringe`
+there, so its share is now ~17-18% and the rotator is the largest kernel on both
+cards. **GPU busy-union on the A100 is 91.4%** with no idle gap over 500 µs and
+97% of the remaining idle in sub-20 µs gaps: the host/data-delivery stall that
+dominated the 2026-07 captures is gone, and what is left on the host side is
+launch overhead (CUDA graphs). FP64 is cheap on the A100, so precision work leans
+on the 2070.
 
 **What actually limits `gpu_resultsrotatorMultiply`** — measured, not assumed
-(`tests/frac-probes/RESULTS.md`, four env-gated timing probes on the A100):
-atomics **24%**, cross-pol traffic **25%**, band traffic + compute ~50%. Two
-results worth carrying forward: the answer does **not** transfer between cards
-(atomics are 24% on the A100 and 0% on the bandwidth-saturated 2070), and
-giving every (window, band, channel) its own thread is **2.3-2.4× SLOWER** on
-both cards — do not move bands out of the in-thread loop. `docs/gpu-autocorr-
-design.md` holds the resulting three-step plan; §15 was step one.
+(`tests/frac-probes/RESULTS.md`, four env-gated probes on the A100): atomics
+**24%**, cross-pol traffic **25%**, band traffic + compute ~50%. Two results to
+carry forward: the answer does **not** transfer between cards (atomics are 24% on
+the A100 and 0% on the 2070, where the kernel is FP64-pipe bound), and giving
+every (window, band, channel) its own thread is **2.3-2.4× slower** on both cards
+— do not move bands out of the in-thread loop.
 
-**Two benchmarking rules** (each cost a wrong conclusion once — §10, §14):
-- Benchmark with **single-thread VDIF**. The DataStream interlaced-VDIF
-  corner-turn is CPU-bound and starves the GPU, capping what any GPU benchmark
-  can show. The Longer-term item below tracks fixing it for production.
-- Give cluster runs **most of the node** for any number that reaches the
-  ledger: `sbatch --cpus-per-task=5 …` (60 of gina's 64 cores). tooarrana
-  rejects `--exclusive`, and widening `--cpus-per-task` does *not* start extra
-  mpifxcorr ranks — that is `--ntasks`. Keep `--nodes=1`, or SLURM splits the
-  ranks over two nodes and the data path changes under you. A co-tenant job
-  stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
-  `node ownership:` verdict.
+**Two benchmarking rules**, each of which cost a wrong conclusion once (§10, §14):
+- Benchmark with **single-thread VDIF**; the interlaced corner-turn is CPU-bound
+  and starves the GPU (Longer-term tracks fixing it for production).
+- Give cluster runs **most of the node** for any *absolute* number:
+  `sbatch --cpus-per-task=5` (60 of gina's 64 cores; tooarrana rejects
+  `--exclusive`), and keep `--nodes=1`. Each run prints a `node ownership:`
+  verdict.
 
-**PENDING (narrowed 2026-08-28):** the queued A100 profile of `edad94b34`
-landed and is written up in `BENCHMARKS.md` - it confirms §15 is worth −30% on
-`gpu_resultsrotatorMultiply` there. What it does *not* give is a wall time: it is
-a 5 s nsys profile, so the `gina4 (A100) 24.5 s` figure behind `gpu-payback.pdf`
-and its artifact is still pre-§15 and still conservative. Refreshing that needs
-one `sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch` at the current
-commit, and the tiling A/B (`benchprof-fringetile-ab.sbatch`) is still to run.
+And one added 2026-08-28: **if the effect is a few percent of one kernel, measure
+the kernel, not a correlation.** A shared-node wall-clock A/B of the tiling
+returned the wrong sign; the 2-minute kernel sweep settled it. See
+`gpu-profiling.md`, "Measurement pitfall".
+
+**PENDING:** a 20 s wall run at the current commit
+(`sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch`, queued
+2026-08-28) — the `gina4 (A100) 24.5 s` figure behind `gpu-payback.pdf` and its
+artifact is still pre-§15 and conservative. That is the only open measurement.
 
 **Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
@@ -59,35 +64,30 @@ commit, and the tiling A/B (`benchprof-fringetile-ab.sbatch`) is still to run.
    reducing them, takes the cross-pol traffic with them, and deletes a whole
    host-tail data path (device→host copy, `vectorCopy_cf32` mirror,
    `averageFrequency`, the `vectorAdd_cf32_I` loop and `autocorrcopylock`).
-   ~17% of A100 kernel busy plus the tail. Invasive: `Mode`, `Core`,
-   `Configuration`, the results-buffer layout, and it must keep the CPU path's
-   Mode-based autocorrelations working alongside — the CPU/GPU divergence class
-   that has caused the most bugs here.
+   Invasive: `Mode`, `Core`, `Configuration`, the results-buffer layout, and it
+   must keep the CPU path's Mode-based autocorrelations working alongside — the
+   CPU/GPU divergence class that has caused the most bugs here.
 2. **FP16 spectra**, in three stages, because stage (c) cannot be skipped:
    (a) the standalone `fftbench` accuracy/speed probe — no correlator changes;
    (b) the implementation, opt-in and gated;
    (c) **the science-level accuracy gate — a PREREQUISITE, not a follow-up.**
-   FP16 changes results well beyond FP rounding, so `diffDiFX` cannot validate
-   it at any threshold. Adam asked for fringe-fitting S/N and image S/N tests
-   (2026-08-26); until they exist FP16 can be built and measured but not
-   landed. Worth starting (c) in parallel with (a).
+   FP16 changes results well beyond FP rounding, so `diffDiFX` cannot validate it
+   at any threshold. Adam asked for fringe-fitting S/N and image S/N tests
+   (2026-08-26); until they exist FP16 can be built and measured but not landed.
+   Worth starting (c) alongside (a).
 
 **Superseded:** the window-group reduction was built, measured as a net loss on
-the 2070, and its branch **deleted** (2026-08-27) once item 1 was agreed, since
-item 1 removes the atomics entirely rather than reducing them. The approach and
-every measurement are written up in `gpu-autocorr-design.md` — enough to rebuild
-it from the note if an A100 result ever justifies revisiting. Do not re-plan it
-from scratch.
+the 2070, and its branch deleted (2026-08-27), since item 1 removes the atomics
+outright. Approach and measurements are preserved in `gpu-autocorr-design.md` —
+do not re-plan it from scratch.
 
-**Still the real production bottleneck: the DataStream corner-turn.** The
-2026-08-27 costing exercise made this concrete rather than theoretical: at the
+**Still the real production bottleneck: the DataStream corner-turn.** At the
 measured ~1.7 Gbps per core, a VGOS-rate 4 × 16 Gbps observation needs ~38 cores
 doing nothing but demultiplexing interlaced VDIF — more silicon than the
-correlation itself. Every GPU benchmark in this project deliberately bypasses it
-with single-thread VDIF, which is correct for measuring the correlator and
-misleading for specifying hardware. The frame-reorder + GPU de-interleave design
-is in Longer-term; on current evidence it gates real-world usefulness more than
-any remaining GPU-side optimisation.
+correlation itself. Every benchmark here bypasses it with single-thread VDIF,
+which is right for measuring the correlator and misleading for specifying
+hardware. Design in Longer-term; on current evidence it gates real-world
+usefulness more than any remaining GPU-side optimisation.
 
 ## Work queue (underway + future)
 
@@ -127,42 +127,27 @@ any remaining GPU-side optimisation.
    `datalengthbytes <= getMaxDataBytes` clamp in `process_gpu` first:
    non-VDIF datastreams keep the base class's guard-scaled sendbytes,
    which can exceed the packed-data buffer (latent, unreachable today).
-6. **Kernel launch-configuration / occupancy audit.** Verify every GPU
-   kernel launches an appropriate grid/block size - enough threads to
-   fill the device, a block shape with good occupancy, and no accidental
-   under- or over-subscription. Several kernels were written with ad-hoc
-   launch dims (one thread per (window, band, channel) in the fused
-   decode+fringe kernel; one thread per accumulator in the weight
-   reductions); check each with nsys/`ncu` and fix any that are
-   badly sized. Cheap, and a natural companion to the fused-decode and
-   precision work (items 1-2). (The old unpack-layout question is moot -
-   `gpu_unpack` was deleted in the fusion.) **DONE 2026-08-27:** `ncu` (now
-   usable on ar313) found `gpu_fused_fringe` - 46.5% of 2070 kernel time, and
-   never examined because it is only 21% on the A100 - latency-bound on an
-   uncoalesced band-major write, with a 1024-thread block that left one
-   resident block per SM. Fixed with a shared-memory transpose and a
-   256-thread block: 1.35x on the kernel, 7.3% on T5-T1, 1.30-1.54x across 13
-   (bands, channels) shapes, gated by `DIFX_GPU_FRINGE_TILE`. See
-   gpu-changes.md §16 and gpu-fringetile-design.md. **A100 confirmed
-   2026-08-28** by the kernel-level sweep: 1.48x at the benchmark shape and
-   2.1-2.2x at 32-128 bands - a bigger win there than on the 2070 - so the gate
-   stays on by default everywhere. **DONE so far (2026-07-23):**
-   the `<<<1,1>>>` `gpu_sum_weights` single-thread reduction (7.7% of A100
-   GPU busy) was eliminated by folding its sum into `gpu_set_weights`
-   (per-window atomicAdd) - see gpu-changes.md §13.
-7. **GPU pcal regression coverage** — the GPU phase-cal path is untested by
-   diffDiFX (phaseCalInt=0 in every synthetic/FakeData scenario), and the
-   pcal-fused `DOPCAL` path added in the unpack+fringe fusion is validated by
-   construction/review only. Add a phaseCalInt>0 synthetic scenario to
-   run-local.sh so CPU-vs-GPU covers pcal extraction.
-8. **NUMA/affinity audit — CLOSED 2026-08-26** (gpu-changes.md §14). The 2×
-   run-to-run swing in input-transfer speed turned out to be **node
-   contention, not placement**: every measured placement, GPU-local through
-   cross-socket, reached the same 26 GB/s per-copy peak. Fixed by giving
-   ledger benchmarks most of the node (`--cpus-per-task=5`; tooarrana rejects
-   `--exclusive`); `GPUCore` now logs its CPU/NUMA placement in every difxlog
-   so transfer numbers can be attributed after the fact. Reopen only if a
-   profile shows a placement effect that survives an isolated node.
+6. **Kernel launch-configuration / occupancy audit — DONE** (2026-07-23 and
+   2026-08-27). The `<<<1,1>>>` `gpu_sum_weights` reduction was folded away
+   (gpu-changes.md §13), and `ncu` then found `gpu_fused_fringe` latency-bound on
+   an uncoalesced write with one resident block per SM — fixed by the tiled
+   kernel: 1.35x on the 2070, 1.48x-2.2x on the A100, 7.3% of T5−T1
+   (§16, `gpu-fringetile-design.md`). Remaining kernels look sanely shaped; ncu
+   is now the cheap way to check any new one (`tests/FakeData/ncu-frac.sh`).
+
+7. **GPU pcal regression coverage** — still no CPU-vs-GPU test: `phaseCalInt=0`
+   in every synthetic/FakeData scenario, so `diffDiFX` never sees the phase-cal
+   path. Partially mitigated 2026-08-28: `fringetile-sweep.sh SWEEP_PCAL=1`
+   exercises the `DOPCAL` kernels and compares their bins across the tiled and
+   untiled paths (agreement 3e-07), which catches indexing errors but says
+   nothing about agreement with the CPU. The real fix is still a `phaseCalInt>0`
+   synthetic scenario in `run-local.sh`.
+
+8. **NUMA/affinity audit — CLOSED** 2026-08-26: the 2× swing in input-transfer
+   speed was node contention, not placement (every placement reached the same
+   26 GB/s). Fixed by giving ledger runs most of the node; `GPUCore` now logs its
+   CPU/NUMA placement. Full analysis: gpu-changes.md §14. Reopen only if a
+   profile shows a placement effect on an isolated node.
 
 ## Standing process (adopted 2026-07-18)
 
