@@ -411,6 +411,77 @@ with the cross-baseline plan filling the array as today. No behavioural change;
 lands on its own so the invasive step starts from a green base. Verify: Synthetic
 PASS both pipeline modes, bench flat.
 
+### What is asserted, and what it costs (2026-08-28)
+
+The ordering claim, stated exactly. The mapping is not "it happens to work out";
+it rests on **two preconditions, which increment 1 checks at plan-construction
+time and refuses on rather than trusting**:
+
+1. the two polarisations of a recorded frequency are **adjacent bands**
+   (`kL == kR + 1`) - true of vex2difx's ordering, verified in `test-dualpol` and
+   in the 10-station VLBA `benchprof` job (`REC BAND` runs freq0 R, freq0 L,
+   freq1 R, freq1 L, ...);
+2. both polarisations of a frequency share a post-averaging channel count - true
+   by construction, since it is one frequency.
+
+Given those, every case falls out, and there are only three:
+
+| pol products | `bandsperautocorr` | autocorrelation slots for one (datastream, freq) |
+|---|---|---|
+| 1 (single pol recorded) | 1 | one parallel slot; one synthetic baseline, one live pol slot |
+| 2 (dual pol, `doPolar = False`) | 1 | two parallel slots, contiguous → `base + pol * nchan` |
+| 4 (dual pol, `doPolar = True`) | 2 | two parallel (contiguous) **and** two cross-pol (contiguous, at `base + parallelLen`) → two synthetic baselines |
+
+The cross-polarisation *pairing* matches too, which is the part worth checking
+rather than assuming: `CPUMode` sets
+`autocorrelations[1][indices[0]] = fft[i0] * conj(fft[i1])`, so band `kR`'s
+cross-pol slot holds R x conj(L) - exactly what a synthetic baseline with
+`(b1 = kR, b2 = kL)` computes.
+
+Also asserted at plan time: **no zoom bands** (the autocorrelation region sizes
+them in after the recorded bands, and the GPU path does not do zoom bands), and
+the same `isFrequencyUsed` / `isEquivalentFrequencyUsed` band filter that
+`Core::processdata` uses - the prefix offsets are built with that predicate, so a
+mismatch would shift every subsequent band.
+
+### What actually gets deleted, and the one casualty
+
+`Mode::autocorrelations` has exactly three consumers, all in `core.cpp`:
+
+| line | what | under this change |
+|---|---|---|
+| 1289 | parallel autocorrs → results (`vectorAdd_cf32_I`) | **deleted** on the GPU path - the XMAC writes them |
+| 1302 | cross-pol autocorrs → results | **deleted** on the GPU path |
+| 1250 | the **STA dump** - `DifxMessageSTARecord` binary multicast | **the casualty** (below) |
+
+With 1289/1302 gone, the GPU path also stops needing `Mode::averageFrequency()`
+(it averages nothing else) and the `autocorrcopylock` around them. What must keep
+running is the **autocorrelation weights** block that follows: it reads
+`modes[j]->getWeight(false, k)`, the data weights, not the autocorrelation
+values, so it is unaffected.
+
+**The Short Term Accumulate dump does not survive on the GPU path.** It is the
+fast-transient / monitoring feature: on a `dumpsta` request, `Core` averages the
+Mode autocorrelations (optionally at full spectral resolution) and multicasts
+them as `BINARY_STA` messages. With the autocorrelations accumulated on the
+device straight into the results buffer, there is nothing for it to read. Options
+considered:
+
+- **Refuse, explicitly** - when a dump is requested while device autocorrelations
+  are active, log once and decline. Chosen: it is honest, and the alternative
+  silently sends stale or zeroed spectra to a monitoring tool, which is worse
+  than sending nothing.
+- Keep the Mode path alive whenever `dumpsta` is set - rejected: `dumpsta`
+  toggles at runtime, so this means carrying both accumulation paths and a
+  rarely-exercised switch between them.
+- Reimplement STA from the device buffers - possible later, and the natural place
+  is a small device kernel reading the results region; not now.
+
+The escape hatch is the gate: **`DIFX_GPU_XMAC_AUTOCORR=0` restores the Mode-based
+path and with it the STA dump**, so a site that needs transient monitoring on the
+GPU can have it at the cost of this optimisation. That is worth stating in the
+release notes for this branch, not just in a comment.
+
 **Increment 2 - self-baselines in the per-frequency plan**, gated by
 `DIFX_GPU_XMAC_AUTOCORR` (default off while it is being built). For each
 frequency `f` and each datastream `j` using it, append a baseline with both

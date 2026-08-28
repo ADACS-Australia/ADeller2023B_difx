@@ -139,7 +139,15 @@ usefulness more than any remaining GPU-side optimisation.
    (§16, `gpu-fringetile-design.md`). Remaining kernels look sanely shaped; ncu
    is now the cheap way to check any new one (`tests/FakeData/ncu-frac.sh`).
 
-7. **GPU pcal regression coverage** — still no CPU-vs-GPU test: `phaseCalInt=0`
+7. **STA (Short Term Accumulate) dumps on the GPU path** — the fast-transient /
+   monitoring multicast reads `Mode::autocorrelations`, which the
+   autocorrelation-into-XMAC work removes on the GPU path. Decision (2026-08-28):
+   refuse the dump explicitly rather than send stale spectra;
+   `DIFX_GPU_XMAC_AUTOCORR=0` restores both the Mode path and STA. Reimplementing
+   it from the device results region is possible and not planned. See
+   `gpu-autocorr-design.md`.
+
+8. **GPU pcal regression coverage** — still no CPU-vs-GPU test: `phaseCalInt=0`
    in every synthetic/FakeData scenario, so `diffDiFX` never sees the phase-cal
    path. Partially mitigated 2026-08-28: `fringetile-sweep.sh SWEEP_PCAL=1`
    exercises the `DOPCAL` kernels and compares their bins across the tiled and
@@ -147,7 +155,7 @@ usefulness more than any remaining GPU-side optimisation.
    nothing about agreement with the CPU. The real fix is still a `phaseCalInt>0`
    synthetic scenario in `run-local.sh`.
 
-8. **NUMA/affinity audit — CLOSED** 2026-08-26: the 2× swing in input-transfer
+9. **NUMA/affinity audit — CLOSED** 2026-08-26: the 2× swing in input-transfer
    speed was node contention, not placement (every placement reached the same
    26 GB/s). Fixed by giving ledger runs most of the node; `GPUCore` now logs its
    CPU/NUMA placement. Full analysis: gpu-changes.md §14. Reopen only if a
