@@ -62,8 +62,10 @@ artifact is still pre-§15 and conservative. That is the only open measurement.
 
 1. **Autocorrelations into Core/XMAC.** Implementation plan and increments are in
    `gpu-autocorr-design.md`; **increment 0 (a dual-pol synthetic scenario, so the
-   cross-pol autocorrelations are tested at all) landed 2026-08-28**, and
-   increment 1 (per-(baseline, pol) output offsets) is next.
+   cross-pol autocorrelations are tested at all) landed 2026-08-28**. The output
+   mapping is settled: one synthetic baseline per autocorrelation output run,
+   pol slot 0 only, which needs no kernel change and assumes nothing about band
+   ordering. Next is increment 2, the plan construction itself.
    Removes the atomics entirely rather than
    reducing them, takes the cross-pol traffic with them, and deletes a whole
    host-tail data path (device→host copy, `vectorCopy_cf32` mirror,

@@ -354,20 +354,48 @@ consequences:
   freq1 L, ...)` - verified in both `test-dualpol` and the 10-station VLBA
   `benchprof` job.
 
-**So the existing `base + pol * num_averaged_channels` indexing already fits.**
-For datastream `j` at frequency `f` with adjacent bands `kR, kL`, emit *two*
-synthetic baselines rather than one:
+**Correction (2026-08-28, Adam):** an earlier version of this section proposed
+packing a frequency's two polarisations into one synthetic baseline's pol slots,
+which requires their bands to be adjacent (`kL == kR + 1`). That ordering is
+usual but **not guaranteed** - a datastream may perfectly well be ordered
+`F0 R, F1 R, F0 L, F1 L`, in which case a frequency's two parallel
+autocorrelations sit two channel-strides apart and `base + pol * nchan` puts one
+of them in the wrong slot. The band indices handed to the kernel are per
+`(baseline, pol)` and already arbitrary, so nothing on the *input* side ever
+needed adjacency: **the constraint was entirely an artifact of reusing
+`base + pol * num_averaged_channels` for the output.** The claim that the layout
+"is already regular" was true only under that ordering convention. It is
+withdrawn.
 
-| synthetic baseline | pol slot 0 | pol slot 1 | output base |
+**The fix keeps the kernel unchanged without assuming anything about ordering:
+give every autocorrelation output run its own synthetic baseline, using pol slot
+0 only.** A baseline's *base* offset is already an arbitrary per-baseline int
+(`h_coreResultBaselineOffsets[j]`, filled from
+`getCoreResultBaselineOffset`), so an output run can be placed anywhere; it is
+only the *pol* dimension that carries the rigid `pol * nchan` stride. Using one
+run per baseline therefore sidesteps the stride entirely:
+
+| synthetic baseline | pol slot 0 | remaining slots | base offset |
 |---|---|---|---|
-| parallel | (kR, kR) → RR | (kL, kL) → LL | `acOffset(j) + prefix(kR)` |
-| cross-pol | (kR, kL) → RL | (kL, kR) → LR | `acOffset(j) + parallelLen(j) + prefix(kR)` |
+| (datastream j, band k), parallel | `(k, k)` | `-1` | `acOffset(j) + prefix(k)` |
+| (datastream j, band k), cross-pol | `(k, partner(k))` | `-1` | `acOffset(j) + parallelLen(j) + prefix(k)` |
 
-where `prefix(k)` is the summed channel count of the used bands before `k` - so
-no assumption of uniform channel counts across bands is needed, only that a
-frequency's two polarisations share a channel count, which they do by
-construction. Single-pol datastreams use one baseline with one live pol slot;
-the rest are `-1`, which the kernel already skips. **No kernel change at all.**
+`prefix(k)` is the summed channel count of the *used* bands before `k` and
+`partner(k)` is the other polarisation of `k`'s frequency, wherever it happens to
+sit in the band table. Both come from the same tables `Core::processdata` walks,
+so any band ordering works, including interleaved and non-adjacent ones. For
+benchprof this is 10 datastreams x 16 bands x 2 = 320 synthetic baselines.
+
+The cost is that a self-baseline still occupies `numPolarisationProducts` slots
+in the index arrays and grid, of which one is live, so the launch carries some
+blocks that read `-1` and return immediately. They are cheap (a couple of loads
+and a return, thousands retiring concurrently), and `num_averaged_channels` is
+shared with the cross-baselines at that frequency, so the self-baselines ride
+along in the existing per-frequency launch with no extra launch and no grouping
+by channel count. **Measure it** rather than assume: if those empty blocks ever
+show up in a profile, the fallback is a second launch for the self-baselines with
+`numPolarisationProducts = 1`, which removes them entirely at the cost of one
+extra launch per frequency.
 
 **Performance does not tip the balance - it is too small to matter.** The three
 options cost, per subint on the A100:
@@ -400,11 +428,11 @@ confined to the kernel and its launcher. Note that such a kernel would more like
 force a change to the *input* spectra layout, which is independent of this
 decision.
 
-**Revised increment 1: none needed.** The kernel is left alone; the work moves
-into increment 2's plan construction. What increment 1 becomes is a plan-time
-*validation*: assert the polarisation-adjacency and equal-channel assumptions,
-and refuse (fall back to the host path) rather than silently writing to the wrong
-offsets if a configuration violates them.
+**Revised increment 1: none needed.** The kernel is left alone and the work moves
+into increment 2's plan construction. The plan-time checks that remain are the
+zoom-band guard and the band-filter agreement above - **not** an ordering
+assertion, since after the correction there is no ordering assumption left to
+violate.
 
 **Increment 1 - per-(baseline, pol) output offsets.** The kernel change above,
 with the cross-baseline plan filling the array as today. No behavioural change;
@@ -413,24 +441,24 @@ PASS both pipeline modes, bench flat.
 
 ### What is asserted, and what it costs (2026-08-28)
 
-The ordering claim, stated exactly. The mapping is not "it happens to work out";
-it rests on **two preconditions, which increment 1 checks at plan-construction
-time and refuses on rather than trusting**:
+The ordering claim, stated exactly - after the correction above, it no longer
+involves band adjacency at all. Each autocorrelation output run is placed by its
+own base offset, computed from the band tables, so **any** band ordering works:
+`F0 R, F0 L, F1 R, F1 L` and `F0 R, F1 R, F0 L, F1 L` are equally fine. The three
+cases collapse to one rule - one synthetic baseline per output run:
 
-1. the two polarisations of a recorded frequency are **adjacent bands**
-   (`kL == kR + 1`) - true of vex2difx's ordering, verified in `test-dualpol` and
-   in the 10-station VLBA `benchprof` job (`REC BAND` runs freq0 R, freq0 L,
-   freq1 R, freq1 L, ...);
-2. both polarisations of a frequency share a post-averaging channel count - true
-   by construction, since it is one frequency.
-
-Given those, every case falls out, and there are only three:
-
-| pol products | `bandsperautocorr` | autocorrelation slots for one (datastream, freq) |
+| pol products | `bandsperautocorr` | runs for one (datastream, freq) |
 |---|---|---|
-| 1 (single pol recorded) | 1 | one parallel slot; one synthetic baseline, one live pol slot |
-| 2 (dual pol, `doPolar = False`) | 1 | two parallel slots, contiguous → `base + pol * nchan` |
-| 4 (dual pol, `doPolar = True`) | 2 | two parallel (contiguous) **and** two cross-pol (contiguous, at `base + parallelLen`) → two synthetic baselines |
+| 1 (single pol recorded) | 1 | 1 parallel run |
+| 2 (dual pol, `doPolar = False`) | 1 | 2 parallel runs |
+| 4 (dual pol, `doPolar = True`) | 2 | 2 parallel + 2 cross-pol runs |
+
+What *is* still asserted at plan-construction time: **no zoom bands** (the
+autocorrelation region sizes them in after the recorded bands and the GPU path
+does not do them), and that the plan's band filter reproduces
+`Core::processdata`'s `isFrequencyUsed` / `isEquivalentFrequencyUsed` predicate
+exactly - the prefix offsets are built with it, so a mismatch shifts every
+subsequent band. Neither assertion is about ordering.
 
 The cross-polarisation *pairing* matches too, which is the part worth checking
 rather than assuming: `CPUMode` sets
