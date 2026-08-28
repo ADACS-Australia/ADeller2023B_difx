@@ -270,6 +270,104 @@ class that has produced the most bugs on this branch. Sequencing it second is a
 deliberate choice to take a cheap 10% now rather than block on a 17% refactor;
 if that trade looks wrong, do Part 3 directly and skip Part 2.
 
+## Part 3: implementation plan (2026-08-28)
+
+Code reading turned the shape of this work around. The design note above framed
+it as invasive - "it moves a data path across `Mode`, `Core`, `Configuration` and
+the results-buffer layout". Most of that is already built:
+`gpu_fuse_xmac_and_average` is launched **per frequency**, and every per-baseline
+thing it needs is already a host-built array - the two spectra pointers, the two
+validity arrays, the per-stream band indexes, the per-stream window/band strides,
+and the output offset. **An autocorrelation is a baseline whose two streams are
+the same datastream**, so most of this is plan construction on the host, not new
+device code.
+
+### The one kernel change
+
+Output indexing today is `coreResultBaselineOffsets[baseline] + pol *
+num_averaged_channels + avg_chan`, i.e. a baseline's pol products are contiguous.
+The autocorrelation region is not laid out that way: per datastream it is
+`[band][channels]` over the *used* bands (`Core::processdata`, the
+`getCoreResultAutocorrOffset` loop), and the cross-pol autocorrelations sit in a
+separate block after it. So generalise to a per-(baseline, pol) offset array:
+
+    coreResultOffsets[baseline * numPolarisationProducts + pol]
+
+Cross-baselines fill it with exactly `base + pol * num_averaged_channels`, so
+their behaviour is bit-identical. Everything else the kernel already does -
+skipping invalid windows, the `channelstoaverage` mean, the store-vs-atomic
+choice - is what the autocorrelations need too.
+
+Two facts checked rather than assumed, because both would have sunk the plan:
+
+- **`Mode::averageFrequency` is a mean** (`vectorMean_cf32` over
+  `channelstoaverage`), which is exactly the kernel's `1/channelstoaverage`
+  scaling. No scaling mismatch.
+- **The AC weights do not come from the autocorrelation values.** They are
+  `modes[j]->getWeight(false, k)`, the data weights (`core.cpp`, the
+  `getCoreResultACWeightOffset` loop). So removing the device autocorrelation
+  buffer cannot disturb them - which the Part 1/2 verification notes worried
+  about.
+
+### Increments
+
+**Increment 0 - a dual-polarisation synthetic scenario. Do this first.**
+Every scenario in `tests/Synthetic` is single-pol (all Rcp), so
+`writecrossautocorrs && maxproducts > 2` is never true and **the cross-pol
+autocorrelation path has no test coverage at all** - not on the GPU, not on the
+CPU. That is the part of this work with the highest divergence risk, and moving
+it while untested would be moving code we cannot validate. A 2-pol scenario also
+retro-covers the existing kernel's `calccrosspolautocorrs` block, which is
+review-validated only today.
+
+**Increment 1 - per-(baseline, pol) output offsets.** The kernel change above,
+with the cross-baseline plan filling the array as today. No behavioural change;
+lands on its own so the invasive step starts from a green base. Verify: Synthetic
+PASS both pipeline modes, bench flat.
+
+**Increment 2 - self-baselines in the per-frequency plan**, gated by
+`DIFX_GPU_XMAC_AUTOCORR` (default off while it is being built). For each
+frequency `f` and each datastream `j` using it, append a baseline with both
+stream pointers, validity arrays and strides set to `j`'s, and pol slots:
+`(band, band)` for each of `j`'s bands at `f` (the parallel autocorrelations),
+plus `(bandA, bandB)` and `(bandB, bandA)` when the cross-pol autocorrelations
+are wanted. Unused slots get `-1`, which the kernel already skips.
+`numPolarisationProducts` becomes a max over cross and self baselines rather than
+a reference baseline's value. The offsets come from
+`getCoreResultAutocorrOffset` and must replicate `Core::processdata`'s
+`isFrequencyUsed`/`isEquivalentFrequencyUsed` band filtering exactly, or every
+subsequent band's data lands in the wrong slot.
+
+**Increment 3 - delete the old path.** Only once increment 2 is PASSing: the
+per-band `atomicAdd` and the whole cross-pol block leave
+`gpu_resultsrotatorMultiply` (with `calccrosspolautocorrs`, `counts_gpu` and
+`indices`); `temp_autocorrelations_gpu`, its per-subint memset and D2H, and the
+two host mirror loops in `gpumode.cu` go; and `Core`'s autocorrelation
+accumulation is skipped on the GPU path (it must keep running for the CPU path -
+the divergence class that has caused the most bugs here).
+
+### Risks, in the order they are likely to bite
+
+| risk | handling |
+|---|---|
+| **Zoom bands.** The autocorrelation region covers `getDNumTotalBands`, which includes zoom bands; the GPU path handles recorded bands only. | Check at plan-construction time and `NOT_SUPPORTED` if zoom bands are present, rather than silently writing short. |
+| **Band filtering must match `Core::processdata` exactly** (`isFrequencyUsed` / `isEquivalentFrequencyUsed`). | Build the offsets with the same predicate, and assert the total consumed length equals the region size. |
+| **Cross-pol autocorrelation slots are untested today.** | Increment 0. |
+| Store-vs-atomic: a self-baseline slot is written once per subint, so the kernel's plain-store branch is correct - but only if nothing else writes there. | Assert disjointness of the autocorr offsets against the baseline offsets when building the plan. |
+| Pulsar binning / multiple phase centres change the results layout. | Already `NOT_SUPPORTED` on the GPU path; confirm the guard covers this path too. |
+
+### Expected gain
+
+`gpu_resultsrotatorMultiply` loses its atomics (24% on the A100) and its cross-pol
+phase (25%), leaving a pure elementwise rotate: **~-49% of a kernel that is 34.9%
+of A100 kernel busy**. The XMAC grows by the self-baselines (45 -> 55 for
+benchprof, and it re-reads spectra already in its L2 working set, so
+sub-proportional). Net **~12-15% of A100 kernel busy**, plus the host tail:
+`host_finalize` is 150 ms over 500 subints in the current A100 profile, and the
+per-subint autocorrelation D2H goes with it. On the 2070 the atomics are free and
+the rotator is only 23.3%, so expect ~6% there - this is a cluster optimisation,
+like the autocorrelation work always was.
+
 ## Verification (Part 1 - the conjugate removal)
 
 1. `tests/Synthetic/run-local.sh usb usb-complex complex-complex multi` - PASS
