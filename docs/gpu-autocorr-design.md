@@ -329,6 +329,83 @@ it while untested would be moving code we cannot validate. A 2-pol scenario also
 retro-covers the existing kernel's `calccrosspolautocorrs` block, which is
 review-validated only today.
 
+### Output layout: three options weighed (2026-08-28)
+
+Adam pushed back on the per-(baseline, pol) offset array: an indirection table is
+the kind of thing that gets in the way later (tensor cores would want a regular
+tiling), and either a dense intermediate array shuffled on the way out, or a
+straightening of the host-side results layout, might be the cleaner answer.
+Checking the code changed the recommendation - **the layout is already regular,
+so the simplest option is also the regular one**, and no per-(baseline, pol)
+array is needed after all.
+
+**What the results buffer actually looks like.** It is
+`[xcorrs + baseline weights][autocorrs][ac weights][pcals]`
+(`Configuration::populateResultLengths`), and the autocorrelation region, per
+datastream, is `[parallel bands][cross-pol bands][channels]` - dense. Two
+consequences:
+
+- The GPU currently D2Hs only `getCoreResultXcorrsLength`. Because the
+  autocorrelation region *immediately follows* the xcorrs, computing
+  autocorrelations on the device extends that **same contiguous transfer**
+  rather than adding one. An intermediate array with its own D2H and a host-side
+  merge would reintroduce exactly the host tail this work exists to delete.
+- The band table orders polarisations adjacently - `(freq0 R, freq0 L, freq1 R,
+  freq1 L, ...)` - verified in both `test-dualpol` and the 10-station VLBA
+  `benchprof` job.
+
+**So the existing `base + pol * num_averaged_channels` indexing already fits.**
+For datastream `j` at frequency `f` with adjacent bands `kR, kL`, emit *two*
+synthetic baselines rather than one:
+
+| synthetic baseline | pol slot 0 | pol slot 1 | output base |
+|---|---|---|---|
+| parallel | (kR, kR) → RR | (kL, kL) → LL | `acOffset(j) + prefix(kR)` |
+| cross-pol | (kR, kL) → RL | (kL, kR) → LR | `acOffset(j) + parallelLen(j) + prefix(kR)` |
+
+where `prefix(k)` is the summed channel count of the used bands before `k` - so
+no assumption of uniform channel counts across bands is needed, only that a
+frequency's two polarisations share a channel count, which they do by
+construction. Single-pol datastreams use one baseline with one live pol slot;
+the rest are `-1`, which the kernel already skips. **No kernel change at all.**
+
+**Performance does not tip the balance - it is too small to matter.** The three
+options cost, per subint on the A100:
+
+| | extra VRAM | extra work | transfer |
+|---|---|---|---|
+| Direct write (above) | none | none | one contiguous D2H, extended |
+| Dense intermediate + device scatter | ~164 KB (benchprof) | ~0.2 µs of bandwidth + ~3-5 µs launch | same |
+| Dense intermediate + own D2H + host merge | ~164 KB | host tail returns | second transfer |
+
+The scatter option costs ~0.03% of wall - genuinely negligible - so it cannot be
+argued against on cost. It is argued against on the fact that **today it would be
+an identity copy**: the dense layout it would produce is the layout the results
+region already has, so it would reorder nothing. The third option is rejected
+outright: it puts back the host work being removed.
+
+Coalescing is unaffected by any of this. Each block writes `num_averaged_channels`
+consecutive complex values; where that run starts changes nothing, and the starts
+are multiples of the channel count (64, 1024, ...), so they stay 128-byte aligned.
+
+**Restraightening the host-side layout (the third idea) is not worth it now.**
+The results buffer is internal - `Core` → `FxManager` → `Visibility` - so the
+on-disk format is not at stake, but the layout is shared with the CPU path, which
+makes it the CPU/GPU divergence class that has produced most of this branch's
+bugs. There is no measurable gain to buy that risk with today. If a future kernel
+genuinely wants a different output tiling - a batched-GEMM XMAC producing dense
+`[baseline][pol][channel]` tiles is the plausible case - then the intermediate +
+scatter becomes the right structure, and it is a contained change *at that point*,
+confined to the kernel and its launcher. Note that such a kernel would more likely
+force a change to the *input* spectra layout, which is independent of this
+decision.
+
+**Revised increment 1: none needed.** The kernel is left alone; the work moves
+into increment 2's plan construction. What increment 1 becomes is a plan-time
+*validation*: assert the polarisation-adjacency and equal-channel assumptions,
+and refuse (fall back to the host path) rather than silently writing to the wrong
+offsets if a configuration violates them.
+
 **Increment 1 - per-(baseline, pol) output offsets.** The kernel change above,
 with the cross-baseline plan filling the array as today. No behavioural change;
 lands on its own so the invasive step starts from a green base. Verify: Synthetic
