@@ -40,6 +40,11 @@ public:
      * DIFX_GPU_WEIGHTS_HOST=1 restores the host set_weights path (which also
      * carries the full-fidelity WDEBUG output).
      */
+    /** True when the XMAC computes autocorrelations as ordinary baselines
+     * (DIFX_GPU_XMAC_AUTOCORR), so Mode accumulates none: no atomics and no
+     * cross-pol pass in the rotation kernel, no device buffer, no D2H, no host
+     * mirror. See docs/gpu-autocorr-design.md. */
+    static bool deviceAutocorrs();
     static bool useGpuWeights();
 
     /**

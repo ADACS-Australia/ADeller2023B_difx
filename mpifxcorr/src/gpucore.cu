@@ -399,16 +399,10 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
 }
 
 bool GPUCore::xmacAutocorrEnabled() {
-    // Off by default while this is being built and validated; increment 3 of
-    // docs/gpu-autocorr-design.md deletes the Mode-side path and flips it on.
-    // Thread-safe initialisation by the standard, unlike a read-modify-written
-    // `static int`.
-    static const bool enabled = []() {
-        const char *e = getenv("DIFX_GPU_XMAC_AUTOCORR");
-        return (e != NULL) && (strcmp(e, "0") != 0) && (strcasecmp(e, "false") != 0) &&
-               (strcasecmp(e, "no") != 0) && (strcasecmp(e, "off") != 0);
-    }();
-    return enabled;
+    // One gate, read in one place: GPUMode owns it because the Mode-side path is
+    // what it switches off. Two separate getenv calls of the same variable would
+    // be a divergence waiting to happen.
+    return GPUMode::deviceAutocorrs();
 }
 
 int GPUCore::stagedResultsLength(int configindex) const {

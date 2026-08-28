@@ -28,6 +28,21 @@ bool GPUMode::inputBuffersPinned = false;
 
 static int weightDebugFrom();   // defined above set_weights
 
+bool GPUMode::deviceAutocorrs() {
+    // The XMAC computes autocorrelations straight into the results buffer
+    // (GPUCore builds them as real baselines), so Mode does not accumulate them
+    // at all: no atomics in the rotation kernel, no cross-pol phase, no device
+    // buffer, no D2H, no host mirror. DIFX_GPU_XMAC_AUTOCORR=0 restores the lot,
+    // which is also what keeps STA dumps available. See
+    // docs/gpu-autocorr-design.md.
+    static const bool enabled = []() {
+        const char *e = getenv("DIFX_GPU_XMAC_AUTOCORR");
+        return (e != NULL) && (strcmp(e, "0") != 0) && (strcasecmp(e, "false") != 0) &&
+               (strcasecmp(e, "no") != 0) && (strcasecmp(e, "off") != 0);
+    }();
+    return enabled;
+}
+
 bool GPUMode::useGpuWeights() {
     // Function-local static, so initialisation is thread-safe by the standard
     // (C++11 6.7/4): this is called per subint from every Core processing
@@ -60,14 +75,17 @@ void GPUMode::finishWeights(bool validsubint) {
         memcpy(dataweight, gDataWeights->ptr(), cfg_numBufferedFFTs * sizeof(f32));
 
     // Host mirror of the device autocorrelation accumulators (was section 8
-    // of process_gpu on the host-weights path).
-    for (int i = 0; i < autocorrwidth; i++) {
-        for (int j = 0; j < numrecordedbands; j++) {
-            vectorCopy_cf32(
-                    reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
-                    autocorrelations[i][j],
-                    recordedbandchannels
-            );
+    // of process_gpu on the host-weights path). Not needed when the XMAC owns
+    // the autocorrelations - nothing reads Mode::autocorrelations then.
+    if (!deviceAutocorrs()) {
+        for (int i = 0; i < autocorrwidth; i++) {
+            for (int j = 0; j < numrecordedbands; j++) {
+                vectorCopy_cf32(
+                        reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
+                        autocorrelations[i][j],
+                        recordedbandchannels
+                );
+            }
         }
     }
 
@@ -960,9 +978,11 @@ int GPUMode::process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblo
     int *counts = savedProcessCounts;
 
     // Reset the autocorrelations (device) immediately before fractionalRotation
-    // accumulates into them (moved here from process_gpu_tofft).
-    checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
-                              sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
+    // accumulates into them (moved here from process_gpu_tofft). Skipped when
+    // the XMAC owns them: nothing accumulates into this buffer then.
+    if (!deviceAutocorrs())
+        checkCuda(cudaMemsetAsync(temp_autocorrelations_gpu->gpuPtr(), 0,
+                                  sizeof(cf32) * numrecordedbands * recordedbandchannels * autocorrwidth, cuStream));
 
     if (useGpuWeights()) {
         // Bring back the single total-weight scalar (Increment 2b): the sum was
@@ -1089,16 +1109,19 @@ int GPUMode::process_gpu_afterfft(int fftloop, int numBufferedFFTs, int startblo
         // vectors. On the device-weights path both the drain and the copy move
         // to finishWeights(), after GPUCore's single end-of-subint drain.
         auto post_start = high_resolution_clock::now();
-        temp_autocorrelations_gpu->sync();
+        // Nothing to drain or copy when the XMAC owns the autocorrelations.
+        if (!deviceAutocorrs()) {
+            temp_autocorrelations_gpu->sync();
 
-        // Copy over the autocorrs
-        for (int i = 0; i < autocorrwidth; i++) {
-            for (int j = 0; j < numrecordedbands; j++) {
-                vectorCopy_cf32(
-                        reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
-                        autocorrelations[i][j],
-                        recordedbandchannels
-                );
+            // Copy over the autocorrs
+            for (int i = 0; i < autocorrwidth; i++) {
+                for (int j = 0; j < numrecordedbands; j++) {
+                    vectorCopy_cf32(
+                            reinterpret_cast<const cf32 *>(&temp_autocorrelations_gpu->ptr()[(i * numrecordedbands * recordedbandchannels) + (j * recordedbandchannels)]),
+                            autocorrelations[i][j],
+                            recordedbandchannels
+                    );
+                }
             }
         }
 
@@ -1440,6 +1463,14 @@ void GPUMode::fringeRotation(int fftloop, int numBufferedFFTs, int startblock, i
 
 
 
+/** The fractional-sample rotation. With DOAUTOCORR it also accumulates the
+ * per-band autocorrelations (an atomicAdd per element) and the cross-pol
+ * autocorrelations (a second pass over the bands, re-reading the rotated
+ * spectra); without it, it is a pure elementwise rotate and the XMAC computes
+ * the autocorrelations as ordinary baselines instead - see
+ * docs/gpu-autocorr-design.md. On the A100 those two phases were measured at
+ * 24% and 25% of this kernel. */
+template<bool DOAUTOCORR>
 __global__ void gpu_resultsrotatorMultiply(
         cuFloatComplex* const gpufftd_gpu,
         cuFloatComplex* const autocorrelations,
@@ -1532,29 +1563,33 @@ __global__ void gpu_resultsrotatorMultiply(
         // which is real by construction, so only the real component is
         // accumulated (the imaginary one is provably zero and used to cost a
         // second atomic on every element).
-        const size_t autocorrIndex = (bandindex * recordedbandchannels) + channelindex;
-        atomicAdd(&((float*)&autocorrelations[autocorrIndex])[0],
-                  v.x * v.x + v.y * v.y);
+        if (DOAUTOCORR) {
+            const size_t autocorrIndex = (bandindex * recordedbandchannels) + channelindex;
+            atomicAdd(&((float*)&autocorrelations[autocorrIndex])[0],
+                      v.x * v.x + v.y * v.y);
+        }
     }
 
-    // Cross-polarisation autocorrelations. Both operands now come from the
-    // rotated spectra and the second is conjugated in the multiply
-    // (cuCmulConjf below) - there is no materialised conjugate array any more.
-    // Each value read here was written by THIS thread earlier in the band loop
-    // (same window, same channel, a different band), so there is no race.
-    for (size_t recordedfreq = 0; recordedfreq < numrecordedfreqs; recordedfreq++) {
-        if (calccrosspolautocorrs && counts_gpu[recordedfreq] > 1) {
-            const size_t bandA = indices[(recordedfreq * MAX_INDICIES) + 0];
-            const size_t bandB = indices[(recordedfreq * MAX_INDICIES) + 1];
-            const size_t windowBase = (subloopindex * fftchannels * numrecordedbands) + channelindex;
-            const size_t idxA = windowBase + (bandA * fftchannels);
-            const size_t idxB = windowBase + (bandB * fftchannels);
-            const size_t crossBase = (numrecordedbands * recordedbandchannels) + channelindex;
+    if (DOAUTOCORR) {
+        // Cross-polarisation autocorrelations. Both operands now come from the
+        // rotated spectra and the second is conjugated in the multiply
+        // (cuCmulConjf below) - there is no materialised conjugate array any more.
+        // Each value read here was written by THIS thread earlier in the band loop
+        // (same window, same channel, a different band), so there is no race.
+        for (size_t recordedfreq = 0; recordedfreq < numrecordedfreqs; recordedfreq++) {
+            if (calccrosspolautocorrs && counts_gpu[recordedfreq] > 1) {
+                const size_t bandA = indices[(recordedfreq * MAX_INDICIES) + 0];
+                const size_t bandB = indices[(recordedfreq * MAX_INDICIES) + 1];
+                const size_t windowBase = (subloopindex * fftchannels * numrecordedbands) + channelindex;
+                const size_t idxA = windowBase + (bandA * fftchannels);
+                const size_t idxB = windowBase + (bandB * fftchannels);
+                const size_t crossBase = (numrecordedbands * recordedbandchannels) + channelindex;
 
-            atomicAddFloatComplex(&autocorrelations[crossBase + (bandA * recordedbandchannels)],
-                                  cuCmulConjf(gpufftd_gpu[idxA], gpufftd_gpu[idxB]));
-            atomicAddFloatComplex(&autocorrelations[crossBase + (bandB * recordedbandchannels)],
-                                  cuCmulConjf(gpufftd_gpu[idxB], gpufftd_gpu[idxA]));
+                atomicAddFloatComplex(&autocorrelations[crossBase + (bandA * recordedbandchannels)],
+                                      cuCmulConjf(gpufftd_gpu[idxA], gpufftd_gpu[idxB]));
+                atomicAddFloatComplex(&autocorrelations[crossBase + (bandB * recordedbandchannels)],
+                                      cuCmulConjf(gpufftd_gpu[idxB], gpufftd_gpu[idxA]));
+            }
         }
     }
 }
@@ -1578,33 +1613,40 @@ void GPUMode::fractionalRotation(int fftloop, int numBufferedFFTs, int startbloc
             fftchannels_grid++;
         }
     }
-    for (int ii=0; ii < numrecordedfreqs; ii++) {
-        counts_gpu->ptr()[ii] = counts[ii];
-        //printf("counts[%d] = %d\n",ii,counts[ii]);
-        //printf("counts_gpu[%d] = %d\n",ii,counts_gpu->ptr()[ii]);
-	}
-	counts_gpu->copyToDevice(); // Check what these are for and if they are necessary!
+    // The band-pair map and its per-frequency counts only exist for the
+    // cross-pol autocorrelation phase, which is gone when the XMAC owns the
+    // autocorrelations - so is this upload.
+    if (!deviceAutocorrs()) {
+        for (int ii=0; ii < numrecordedfreqs; ii++) {
+            counts_gpu->ptr()[ii] = counts[ii];
+        }
+        counts_gpu->copyToDevice();
+    }
 
-	gpu_resultsrotatorMultiply<<<dim3(numBufferedFFTs, fftchannels_grid), dim3(fftchannels_block), 0, cuStream>>>
-           (
-                    fftd_gpu->gpuPtr(),
-                    temp_autocorrelations_gpu->gpuPtr(),
-                    gFracSampleError->gpuPtr(),
-                    gValidSamples->gpuPtr(),
-                    indices->gpuPtr(),
-                    grecordedfreqclockoffsets->gpuPtr(),
-                    grecordedfreqclockoffsetsdelta->gpuPtr(),
-                    recordedbandwidth,
-                    fftloop,
-                    startblock,
-                    numblocks,
-                    fftchannels,
-                    recordedbandchannels,
-                    numrecordedbands,
-                    numrecordedfreqs,
-		    calccrosspolautocorrs,
-		    counts_gpu->gpuPtr()
-            );
+    const dim3 rotgrid(numBufferedFFTs, fftchannels_grid);
+    const dim3 rotblock(fftchannels_block);
+    if (deviceAutocorrs()) {
+        // Pure elementwise rotation: no atomics, no cross-pol pass.
+        gpu_resultsrotatorMultiply<false><<<rotgrid, rotblock, 0, cuStream>>>(
+                fftd_gpu->gpuPtr(), nullptr,
+                gFracSampleError->gpuPtr(), gValidSamples->gpuPtr(), nullptr,
+                grecordedfreqclockoffsets->gpuPtr(),
+                grecordedfreqclockoffsetsdelta->gpuPtr(),
+                recordedbandwidth, fftloop, startblock, numblocks,
+                fftchannels, recordedbandchannels, numrecordedbands,
+                numrecordedfreqs, false, nullptr);
+    } else {
+        gpu_resultsrotatorMultiply<true><<<rotgrid, rotblock, 0, cuStream>>>(
+                fftd_gpu->gpuPtr(), temp_autocorrelations_gpu->gpuPtr(),
+                gFracSampleError->gpuPtr(), gValidSamples->gpuPtr(),
+                indices->gpuPtr(),
+                grecordedfreqclockoffsets->gpuPtr(),
+                grecordedfreqclockoffsetsdelta->gpuPtr(),
+                recordedbandwidth, fftloop, startblock, numblocks,
+                fftchannels, recordedbandchannels, numrecordedbands,
+                numrecordedfreqs, calccrosspolautocorrs,
+                counts_gpu->gpuPtr());
+    }
 
     // We should zero the first channel (lowest frequency) of any LSB bands of fftd_gpu.
     // In future, would be more efficient to do this at visibility.cpp, just prior to writing to disk (if either band in the baseline is LSB)

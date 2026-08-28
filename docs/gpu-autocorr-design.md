@@ -579,6 +579,51 @@ free here) against the +60 ms this costs - roughly break-even on kernels, plus
 the host tail. On the A100 the rotator gives back 49% of 1370 ms = 671 ms against
 a ~22% growth of a 970 ms kernel, so a clear net win. Proceed to increment 3.
 
+### Increment 3 measured: the rotator gives back almost nothing (2026-08-28)
+
+The Mode-side path is gone when the gate is on - the rotation kernel is
+templated on `DOAUTOCORR`, so with device autocorrelations there are no atomics
+and no cross-pol pass, no `temp_autocorrelations_gpu` memset, no drain, no host
+mirror, and no band-pair count upload. All GPU-eligible Synthetic scenarios PASS
+CPU-vs-GPU in both pipeline modes, with the gate on and off, and under
+`DIFX_GPU_WEIGHTS_HOST=1`.
+
+10-station `benchsimreal` on the 2070, gate off -> on:
+
+| | off | on |
+|---|---|---|
+| `gpu_fuse_xmac_and_average` | 1826.9 us/call | 2334.8 us/call (**+27.8%**) |
+| `gpu_resultsrotatorMultiply` | 767.5 us/call | 755.7 us/call (**−1.5%**) |
+| kernel busy | 2261.8 ms | 2458.4 ms (**+8.7%**) |
+| D2H volume | 53.5 MB | 62.0 MB |
+| T5−T1 | 10.1 s | **10.8 s (+7%)** |
+
+**The rotator gives back 12 ms against the XMAC's 508.** That is the finding, and
+it invalidates the estimate this whole plan rested on. The estimate came from the
+2026-08-26 probes - atomics 24% of the rotator, cross-pol traffic 25% - but those
+were measured **before §15 deleted the materialised conjugate array**. §15 cut
+that kernel by 26-30%, and what it removed *was* the cross-pol phase's expensive
+part: the phase used to read an 82 MB/mode materialised array, and now re-reads
+`gpufftd`, which is in cache. So on the 2070 the autocorrelation work in the
+rotator is now nearly free, and moving it to the XMAC swaps something free for
+something that costs 27.8% of another kernel. **Pre-§15 probe numbers must not be
+used to size any further autocorrelation work.**
+
+What this implies for the A100, arithmetically: the atomics were 24% of a kernel
+that is 34.9% of its kernel busy (≈8.4%), against the XMAC at 24.7% growing
+~27.8% (≈+6.9%). So roughly break-even on kernels plus the host tail - not the
+12-15% the design projected. And the atomic share itself is a pre-§15 number, so
+it may be smaller now too. **The A100 measurement is now the deciding one**, and
+it is cheap: `benchprof-fringetile-ab.sbatch` re-pointed at this gate, or two
+`benchprof-profile-nsys-5s.sbatch` runs with `DIFX_GPU_XMAC_AUTOCORR=0/1`.
+
+**If the A100 says no, the cheap variant is still worth building** (option B
+above): fold the *parallel* autocorrelations into the existing cross-baseline
+blocks, where `v1` and `v2` are already in registers and they cost an FMA and no
+extra reads, rather than adding 40 fresh runs per frequency. That removes the
+atomics without paying for the XMAC growth, and leaves the cross-pol pass in the
+rotator where §15 already made it cheap.
+
 ### Risks, in the order they are likely to bite
 
 | risk | handling |
