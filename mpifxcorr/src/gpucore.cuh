@@ -146,7 +146,6 @@ private:
      * NOTE: when the per-slot GPU buffer pool ([DEPTH] double/triple buffering)
      * lands, these cached pointers will need to be rebuilt per slot.
      */
-    const cuFloatComplex** d_m1_ptrs;
 
     /**
      * @brief Device pointers to the rotated FFT output buffers for Datastream 2 (one per baseline).
@@ -157,7 +156,6 @@ private:
      * back a materialised conjugate; the GPU path deliberately does not keep
      * one. See d_m1_ptrs.
      */
-    const cuFloatComplex** d_m2_ptrs;
 
     /**
      * @brief Device pointers to the per-FFT validity flags of each baseline's
@@ -166,8 +164,6 @@ private:
      * fused XMAC kernel skips any FFT flagged invalid on either datastream
      * (the CPU path zeroes such spectra, making their contribution zero).
      */
-    const bool** d_v1_ptrs;
-    const bool** d_v2_ptrs;
 
     /**
      * @brief Per-configuration baseline-weight reduction plan (Increment 2).
@@ -210,19 +206,37 @@ private:
         int numPolarisationProducts;
         int num_averaged_channels;
         int channelstoaverage;
-        int* d_stream1BandIndexes;         ///< [numbaselines * numPolarisationProducts]
-        int* d_stream2BandIndexes;         ///< [numbaselines * numPolarisationProducts]
-        int* d_coreResultBaselineOffsets;  ///< [numbaselines]
+        /** Baselines in THIS frequency's launch: the cross baselines, followed by
+         * one autocorrelation baseline per datastream that records this
+         * frequency. An autocorrelation is a baseline whose two antennas are the
+         * same, so it carries the frequency's polarisation products exactly as a
+         * cross baseline does - 45 baselines becomes 55, not 365. Because the
+         * self-baselines differ per frequency, each plan owns its own pointer
+         * and index arrays rather than sharing one set. */
+        int numBaselines;
+        const cuFloatComplex** d_m1_ptrs;  ///< [numBaselines]
+        const cuFloatComplex** d_m2_ptrs;  ///< [numBaselines]
+        const bool** d_v1_ptrs;            ///< [numBaselines]
+        const bool** d_v2_ptrs;            ///< [numBaselines]
+        int* d_stream1BandIndexes;         ///< [numBaselines * numPolarisationProducts]
+        int* d_stream2BandIndexes;         ///< [numBaselines * numPolarisationProducts]
+        /** [numBaselines * numPolarisationProducts]: one results-buffer offset
+         * per polarisation product, -1 where the product does not exist. Per
+         * product rather than per baseline because an autocorrelation baseline's
+         * parallel and cross-pol products sit in different sub-blocks of the
+         * autocorrelation region; cross baselines still get
+         * base + pol * num_averaged_channels, unchanged. */
+        int* d_coreResultOffsets;
         /* Per-baseline, per-stream FFT buffer strides. A GPUMode's fftd buffer
          * is laid out [window][band][fftchannels], where fftchannels =
          * freqchannels * (1 for complex sampling, 2 for real) and the band
          * count are properties of THAT datastream - so on a mixed baseline
          * (e.g. real x complex) the two streams' strides differ and each side
          * must be indexed with its own. */
-        int* d_stream1BandStride;          ///< [numbaselines] = that stream's fftchannels
-        int* d_stream1WindowStride;        ///< [numbaselines] = fftchannels * numrecordedbands
-        int* d_stream2BandStride;          ///< [numbaselines]
-        int* d_stream2WindowStride;        ///< [numbaselines]
+        int* d_stream1BandStride;          ///< [numBaselines] = that stream's fftchannels
+        int* d_stream1WindowStride;        ///< [numBaselines] = fftchannels * numrecordedbands
+        int* d_stream2BandStride;          ///< [numBaselines]
+        int* d_stream2WindowStride;        ///< [numBaselines]
     };
     std::vector<XmacFreqPlan> xmacPlans;
 
@@ -241,16 +255,13 @@ private:
      * baseline places each output by its own arbitrary base offset and so
      * assumes nothing about band ordering. */
     struct SelfBaseline {
-        int datastream;    ///< the datastream this autocorrelation belongs to
-        int freq;          ///< freqtable index, so the per-frequency plans can skip it
-        int band1;         ///< recorded band index (the conjugated-into side)
-        int band2;         ///< same as band1 for a parallel autocorrelation; the
-                           ///< other polarisation's band for a cross-pol one
-        int resultOffset;  ///< absolute complex offset into the results buffer
+        int datastream;      ///< the antenna on both sides of this "baseline"
+        int nproducts;       ///< live polarisation products (1, 2 or 4)
+        int band1[4];        ///< per product: the un-conjugated side
+        int band2[4];        ///< per product: the conjugated side (== band1 for a
+                             ///< parallel hand)
+        int resultOffset[4]; ///< per product: absolute complex offset in results
     };
-    std::vector<SelfBaseline> selfBaselines;
-    /// numbaselines + selfBaselines.size() when device autocorrelations are on.
-    int numXmacBaselines = 0;
 
     /** Device autocorrelations (DIFX_GPU_XMAC_AUTOCORR, default off while this
      * is being built): compute autocorrelations in the XMAC, straight into the

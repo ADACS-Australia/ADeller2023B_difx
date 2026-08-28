@@ -59,7 +59,7 @@ __global__ void gpu_fuse_xmac_and_average(
         const bool* const * const gpuM2Valid,
         const int* const stream1BandIndexes,
         const int* const stream2BandIndexes,
-        const int* const coreResultBaselineOffsets,
+        const int* const coreResultOffsets,
         cuFloatComplex* const results_gpu,
         int numbaselines,
         int numPolarisationProducts,
@@ -149,10 +149,15 @@ __global__ void gpu_fuse_xmac_and_average(
 
     // 5. Direct Output Mapping
     // We completely bypass the CPU's intermediate `threadcrosscorrs` array.
-    // The layout of procslots[index].results is contiguous: [Baseline][Polarisation][Channel]
-    int base_offset = coreResultBaselineOffsets[baseline];
-    int pol_offset = pol * num_averaged_channels;
-    int final_index = base_offset + pol_offset + avg_chan;
+    // One offset per (baseline, polproduct): for a cross baseline these are the
+    // contiguous [Baseline][Polarisation][Channel] run the results buffer has
+    // always had, but an autocorrelation baseline's products live in two
+    // separate sub-blocks of the autocorrelation region (all parallel hands,
+    // then all cross-pol), so the placement has to be per product. -1 means the
+    // product does not exist for this baseline at this frequency.
+    int base_offset = coreResultOffsets[baseline * numPolarisationProducts + pol];
+    if (base_offset < 0) return;
+    int final_index = base_offset + avg_chan;
 
     if (fftsPerChunk >= numBufferedFFTs) {
         // Single FFT chunk: this (baseline, pol, avg_chan) triple is unique
@@ -389,10 +394,8 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     // entry per baseline). These are populated once per configuration by
     // buildXmacPlans(). The per-frequency band-index/offset arrays are allocated
     // lazily inside buildXmacPlans() and cached in xmacPlans.
-    checkCuda(cudaMalloc(&d_m1_ptrs, numbaselines * sizeof(cuFloatComplex*)));
-    checkCuda(cudaMalloc(&d_m2_ptrs, numbaselines * sizeof(cuFloatComplex*)));
-    checkCuda(cudaMalloc(&d_v1_ptrs, numbaselines * sizeof(bool*)));
-    checkCuda(cudaMalloc(&d_v2_ptrs, numbaselines * sizeof(bool*)));
+    // (the XMAC's per-baseline pointer arrays now live in each XmacFreqPlan,
+    // because the autocorrelation baselines differ from frequency to frequency)
 }
 
 bool GPUCore::xmacAutocorrEnabled() {
@@ -521,7 +524,11 @@ void GPUCore::freeXmacPlans() {
     for (auto &plan : xmacPlans) {
         checkCuda(cudaFree(plan.d_stream1BandIndexes));
         checkCuda(cudaFree(plan.d_stream2BandIndexes));
-        checkCuda(cudaFree(plan.d_coreResultBaselineOffsets));
+        checkCuda(cudaFree(plan.d_coreResultOffsets));
+        checkCuda(cudaFree(plan.d_m1_ptrs));
+        checkCuda(cudaFree(plan.d_m2_ptrs));
+        checkCuda(cudaFree(plan.d_v1_ptrs));
+        checkCuda(cudaFree(plan.d_v2_ptrs));
         checkCuda(cudaFree(plan.d_stream1BandStride));
         checkCuda(cudaFree(plan.d_stream1WindowStride));
         checkCuda(cudaFree(plan.d_stream2BandStride));
@@ -551,17 +558,16 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
     // The FFT buffer pointers depend only on the baseline's datastreams (not on
     // frequency) and the GPUMode buffers never move, so they are gathered and
     // uploaded once here and shared across all per-frequency launches.
-    // Enumerate the autocorrelation output runs as synthetic baselines, one per
-    // run, before the pointer arrays below are sized - they are shared by every
-    // frequency plan and so must cover the self-baselines too. Each run's
-    // destination is computed the way Core::processdata walks the region:
-    // [parallel bands][cross-pol bands] per datastream, in band order, over the
-    // bands that pass the isFrequencyUsed / isEquivalentFrequencyUsed filter.
-    // Nothing here assumes anything about the order of bands within a datastream.
-    selfBaselines.clear();
+    // Per-datastream autocorrelation region geometry, computed once: where each
+    // used band's channels sit inside that datastream's region, and how long the
+    // parallel-hand block is (the cross-pol block follows it). Built with the
+    // same used-band predicate Core::processdata walks, and making no assumption
+    // about the order of bands within a datastream.
+    std::vector<std::vector<int>> acBandPrefix(numdatastreams);
+    std::vector<int> acParallelLen(numdatastreams, 0);
+    const bool crossautocorrs = config->writeAutoCorrs(configindex) &&
+                                config->getMaxProducts() > 2;
     if (xmacAutocorrEnabled()) {
-        const bool crossautocorrs = config->writeAutoCorrs(configindex) &&
-                                    config->getMaxProducts() > 2;
         for (int ds = 0; ds < numdatastreams; ds++) {
             if (config->getDNumZoomBands(configindex, ds) > 0) {
                 cfatal << startl << "GPUCore: device autocorrelations do not support zoom bands "
@@ -570,94 +576,20 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
                        << "run with DIFX_GPU_XMAC_AUTOCORR=0" << endl;
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
-            const int acbase = config->getCoreResultAutocorrOffset(configindex, ds);
             const int nbands = config->getDNumRecordedBands(configindex, ds);
-            // First pass: the parallel-hand block, and the running channel offset
-            // it consumes (also the length of that block, needed by the cross one).
+            acBandPrefix[ds].assign(nbands, -1);
             int prefix = 0;
-            std::vector<int> bandPrefix(nbands, -1);
             for (int k = 0; k < nbands; k++) {
                 const int fq = config->getDRecordedFreqIndex(configindex, ds, k);
                 if (!(config->isFrequencyUsed(configindex, fq) ||
                       config->isEquivalentFrequencyUsed(configindex, fq)))
                     continue;
-                bandPrefix[k] = prefix;
-                selfBaselines.push_back({ds, fq, k, k, acbase + prefix});
+                acBandPrefix[ds][k] = prefix;
                 prefix += config->getFNumChannels(fq) / config->getFChannelsToAverage(fq);
             }
-            if (!crossautocorrs)
-                continue;
-            // Second pass: the cross-pol block, which follows the whole parallel
-            // block. A band whose frequency has no second polarisation gets no
-            // run at all: the CPU path leaves that slot zero and results_gpu is
-            // zeroed every subint, so the outcome matches.
-            const int parallelLen = prefix;
-            for (int k = 0; k < nbands; k++) {
-                if (bandPrefix[k] < 0)
-                    continue;
-                const int fq = config->getDRecordedFreqIndex(configindex, ds, k);
-                int partner = -1;
-                for (int l = 0; l < nbands; l++) {
-                    if (l != k && config->getDRecordedFreqIndex(configindex, ds, l) == fq) {
-                        partner = l;
-                        break;
-                    }
-                }
-                if (partner < 0)
-                    continue;
-                // CPUMode computes autocorrelations[1][k] = fft[k] * conj(fft[partner]),
-                // and the kernel's cuCmulConjf(v1, v2) is v1 * conj(v2), so band
-                // k is stream 1 and its partner is stream 2.
-                selfBaselines.push_back({ds, fq, k, partner,
-                                         acbase + parallelLen + bandPrefix[k]});
-            }
+            acParallelLen[ds] = prefix;
         }
     }
-    numXmacBaselines = numbaselines + (int)selfBaselines.size();
-    if (!selfBaselines.empty())
-        cinfo << startl << "GPUCore: computing " << selfBaselines.size()
-              << " autocorrelation runs in the XMAC (DIFX_GPU_XMAC_AUTOCORR)" << endl;
-
-    const cuFloatComplex* h_m1_ptrs[numXmacBaselines];
-    const cuFloatComplex* h_m2_ptrs[numXmacBaselines];
-    const bool* h_v1_ptrs[numXmacBaselines];
-    const bool* h_v2_ptrs[numXmacBaselines];
-    for (int j = 0; j < numbaselines; j++) {
-        int ds1index = config->getBOrderedDataStream1Index(configindex, j);
-        int ds2index = config->getBOrderedDataStream2Index(configindex, j);
-        h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
-        h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->fftd_gpu->gpuPtr();
-        h_v1_ptrs[j] = ((GPUMode*)modes[ds1index])->getGpuValidSamples();
-        h_v2_ptrs[j] = ((GPUMode*)modes[ds2index])->getGpuValidSamples();
-    }
-    // A self-baseline's two "streams" are the same datastream.
-    for (size_t sb = 0; sb < selfBaselines.size(); sb++) {
-        const int ds = selfBaselines[sb].datastream;
-        const int j = numbaselines + (int)sb;
-        h_m1_ptrs[j] = h_m2_ptrs[j] = ((GPUMode*)modes[ds])->fftd_gpu->gpuPtr();
-        h_v1_ptrs[j] = h_v2_ptrs[j] = ((GPUMode*)modes[ds])->getGpuValidSamples();
-    }
-    // These four were sized for the cross baselines alone in the constructor,
-    // before the self-baselines were known. Resize before uploading; a config
-    // change is the only time this runs, and the function synchronises at the end.
-    if (numXmacBaselines > numbaselines) {
-        checkCuda(cudaFree(d_m1_ptrs));
-        checkCuda(cudaFree(d_m2_ptrs));
-        checkCuda(cudaFree(d_v1_ptrs));
-        checkCuda(cudaFree(d_v2_ptrs));
-        checkCuda(cudaMalloc(&d_m1_ptrs, numXmacBaselines * sizeof(cuFloatComplex*)));
-        checkCuda(cudaMalloc(&d_m2_ptrs, numXmacBaselines * sizeof(cuFloatComplex*)));
-        checkCuda(cudaMalloc(&d_v1_ptrs, numXmacBaselines * sizeof(bool*)));
-        checkCuda(cudaMalloc(&d_v2_ptrs, numXmacBaselines * sizeof(bool*)));
-    }
-    checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numXmacBaselines * sizeof(cuFloatComplex*),
-                             cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numXmacBaselines * sizeof(cuFloatComplex*),
-                             cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_v1_ptrs, h_v1_ptrs, numXmacBaselines * sizeof(bool*),
-                             cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_v2_ptrs, h_v2_ptrs, numXmacBaselines * sizeof(bool*),
-                             cudaMemcpyHostToDevice, cuStream));
 
     for (int f = 0; f < config->getFreqTableLength(); f++) {
         if (!config->isFrequencyUsed(configindex, f)) continue;
@@ -697,18 +629,74 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         plan.num_averaged_channels = freqchannels / channelstoaverage;
         plan.channelstoaverage = channelstoaverage;
 
+        // The autocorrelation baselines for THIS frequency: one per datastream that
+        // records it, carrying this frequency's polarisation products. For a
+        // dual-pol frequency with bands (kA, kB) the products are
+        //   0: (kA, kA)  1: (kB, kB)      the parallel hands, and
+        //   2: (kA, kB)  3: (kB, kA)      the cross-pol pair,
+        // matching CPUMode's autocorrelations[1][kA] = fft[kA] * conj(fft[kB]).
+        // Each product's destination is looked up individually, so nothing here
+        // depends on the two polarisations being adjacent in the band table.
+        std::vector<SelfBaseline> planSelf;
+        if (xmacAutocorrEnabled()) {
+            for (int ds = 0; ds < numdatastreams; ds++) {
+                int bands[2] = {-1, -1};
+                int nfound = 0;
+                const int nbands = config->getDNumRecordedBands(configindex, ds);
+                for (int k = 0; k < nbands && nfound < 2; k++) {
+                    if (acBandPrefix[ds][k] < 0) continue;
+                    if (config->getDRecordedFreqIndex(configindex, ds, k) == f)
+                        bands[nfound++] = k;
+                }
+                if (nfound == 0) continue;   // this datastream does not record f
+                SelfBaseline self;
+                self.datastream = ds;
+                self.nproducts = 0;
+                const int acbase = config->getCoreResultAutocorrOffset(configindex, ds);
+                for (int i = 0; i < nfound; i++) {          // parallel hands
+                    self.band1[self.nproducts] = bands[i];
+                    self.band2[self.nproducts] = bands[i];
+                    self.resultOffset[self.nproducts] = acbase + acBandPrefix[ds][bands[i]];
+                    self.nproducts++;
+                }
+                if (crossautocorrs && nfound == 2) {        // cross-pol pair
+                    for (int i = 0; i < 2; i++) {
+                        self.band1[self.nproducts] = bands[i];
+                        self.band2[self.nproducts] = bands[1 - i];
+                        self.resultOffset[self.nproducts] =
+                            acbase + acParallelLen[ds] + acBandPrefix[ds][bands[i]];
+                        self.nproducts++;
+                    }
+                }
+                if (self.nproducts > numPolarisationProducts) {
+                    cfatal << startl << "GPUCore: datastream " << ds << " needs "
+                           << self.nproducts << " autocorrelation products at frequency " << f
+                           << " but the launch carries only " << numPolarisationProducts
+                           << "; run with DIFX_GPU_XMAC_AUTOCORR=0" << endl;
+                    MPI_Abort(MPI_COMM_WORLD, 1);
+                }
+                planSelf.push_back(self);
+            }
+        }
+        plan.numBaselines = numbaselines + (int)planSelf.size();
+        const int planbl = plan.numBaselines;
+
         // Gather the per-baseline band indexes and result offsets for this frequency.
-        int h_stream1BandIndexes[numXmacBaselines * numPolarisationProducts];
-        int h_stream2BandIndexes[numXmacBaselines * numPolarisationProducts];
-        int h_coreResultBaselineOffsets[numXmacBaselines];
+        int h_stream1BandIndexes[planbl * numPolarisationProducts];
+        int h_stream2BandIndexes[planbl * numPolarisationProducts];
+        int h_coreResultOffsets[planbl * numPolarisationProducts];
+        const cuFloatComplex* h_m1_ptrs[planbl];
+        const cuFloatComplex* h_m2_ptrs[planbl];
+        const bool* h_v1_ptrs[planbl];
+        const bool* h_v2_ptrs[planbl];
         // Per-baseline, per-stream buffer strides: each side's GPUMode fftd
         // buffer geometry follows THAT datastream's sampling type and band
         // count, so a mixed (e.g. real x complex) baseline has different
         // strides on its two sides.
-        int h_s1BandStride[numXmacBaselines];
-        int h_s1WindowStride[numXmacBaselines];
-        int h_s2BandStride[numXmacBaselines];
-        int h_s2WindowStride[numXmacBaselines];
+        int h_s1BandStride[planbl];
+        int h_s1WindowStride[planbl];
+        int h_s2BandStride[planbl];
+        int h_s2WindowStride[planbl];
         for (int j = 0; j < numbaselines; j++) {
             int ds1index = config->getBOrderedDataStream1Index(configindex, j);
             int ds2index = config->getBOrderedDataStream2Index(configindex, j);
@@ -718,11 +706,18 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
             h_s1WindowStride[j] = h_s1BandStride[j] * config->getDNumRecordedBands(configindex, ds1index);
             h_s2BandStride[j] = freqchannels * mult2;
             h_s2WindowStride[j] = h_s2BandStride[j] * config->getDNumRecordedBands(configindex, ds2index);
+            h_m1_ptrs[j] = ((GPUMode*)modes[ds1index])->fftd_gpu->gpuPtr();
+            h_m2_ptrs[j] = ((GPUMode*)modes[ds2index])->fftd_gpu->gpuPtr();
+            h_v1_ptrs[j] = ((GPUMode*)modes[ds1index])->getGpuValidSamples();
+            h_v2_ptrs[j] = ((GPUMode*)modes[ds2index])->getGpuValidSamples();
             int localfreqindex = config->getBLocalFreqIndex(configindex, j, f);
             if (localfreqindex >= 0) {
-                h_coreResultBaselineOffsets[j] =
-                    config->getCoreResultBaselineOffset(configindex, f, j);
+                // A cross baseline's products are the contiguous run they always
+                // were: base + pol * num_averaged_channels.
+                const int base = config->getCoreResultBaselineOffset(configindex, f, j);
                 for (int p = 0; p < numPolarisationProducts; p++) {
+                    h_coreResultOffsets[j * numPolarisationProducts + p] =
+                        base + p * plan.num_averaged_channels;
                     h_stream1BandIndexes[j * numPolarisationProducts + p] =
                         config->getBDataStream1BandIndex(configindex, j, localfreqindex, p);
                     h_stream2BandIndexes[j * numPolarisationProducts + p] =
@@ -731,61 +726,74 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
             } else {
                 // Baseline doesn't participate in this frequency; flag with -1 so
                 // the kernel early-returns for it.
-                h_coreResultBaselineOffsets[j] = -1;
                 for (int p = 0; p < numPolarisationProducts; p++) {
+                    h_coreResultOffsets[j * numPolarisationProducts + p] = -1;
                     h_stream1BandIndexes[j * numPolarisationProducts + p] = -1;
                     h_stream2BandIndexes[j * numPolarisationProducts + p] = -1;
                 }
             }
         }
 
-        // The self-baselines: one output run each, in pol slot 0. A run belonging
-        // to another frequency is flagged -1 and the kernel early-returns for it,
-        // exactly as a cross baseline that does not carry this frequency is.
-        for (size_t sb = 0; sb < selfBaselines.size(); sb++) {
-            const SelfBaseline &self = selfBaselines[sb];
+        // The autocorrelation baselines: both sides are the same datastream, and
+        // each live product gets its own destination.
+        for (size_t sb = 0; sb < planSelf.size(); sb++) {
+            const SelfBaseline &self = planSelf[sb];
             const int j = numbaselines + (int)sb;
-            const int mult = (config->getDSampling(configindex, self.datastream) ==
+            const int ds = self.datastream;
+            h_m1_ptrs[j] = h_m2_ptrs[j] = ((GPUMode*)modes[ds])->fftd_gpu->gpuPtr();
+            h_v1_ptrs[j] = h_v2_ptrs[j] = ((GPUMode*)modes[ds])->getGpuValidSamples();
+            const int mult = (config->getDSampling(configindex, ds) ==
                               Configuration::COMPLEX) ? 1 : 2;
             h_s1BandStride[j] = h_s2BandStride[j] = freqchannels * mult;
             h_s1WindowStride[j] = h_s2WindowStride[j] =
-                h_s1BandStride[j] * config->getDNumRecordedBands(configindex, self.datastream);
-            const bool thisfreq = (self.freq == f);
-            h_coreResultBaselineOffsets[j] = thisfreq ? self.resultOffset : -1;
+                h_s1BandStride[j] * config->getDNumRecordedBands(configindex, ds);
             for (int p = 0; p < numPolarisationProducts; p++) {
-                const bool live = thisfreq && (p == 0);
-                h_stream1BandIndexes[j * numPolarisationProducts + p] = live ? self.band1 : -1;
-                h_stream2BandIndexes[j * numPolarisationProducts + p] = live ? self.band2 : -1;
+                const bool live = (p < self.nproducts);
+                h_stream1BandIndexes[j * numPolarisationProducts + p] = live ? self.band1[p] : -1;
+                h_stream2BandIndexes[j * numPolarisationProducts + p] = live ? self.band2[p] : -1;
+                h_coreResultOffsets[j * numPolarisationProducts + p] = live ? self.resultOffset[p] : -1;
             }
         }
 
         // Allocate persistent device arrays and upload the gathered metadata.
-        checkCuda(cudaMalloc(&plan.d_stream1BandIndexes,
-                             numXmacBaselines * numPolarisationProducts * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream2BandIndexes,
-                             numXmacBaselines * numPolarisationProducts * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_coreResultBaselineOffsets, numXmacBaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream1BandStride, numXmacBaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream1WindowStride, numXmacBaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream2BandStride, numXmacBaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream2WindowStride, numXmacBaselines * sizeof(int)));
+        const size_t nprod = (size_t)planbl * numPolarisationProducts;
+        checkCuda(cudaMalloc(&plan.d_stream1BandIndexes, nprod * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2BandIndexes, nprod * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_coreResultOffsets, nprod * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1BandStride, planbl * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1WindowStride, planbl * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2BandStride, planbl * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2WindowStride, planbl * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_m1_ptrs, planbl * sizeof(cuFloatComplex*)));
+        checkCuda(cudaMalloc(&plan.d_m2_ptrs, planbl * sizeof(cuFloatComplex*)));
+        checkCuda(cudaMalloc(&plan.d_v1_ptrs, planbl * sizeof(bool*)));
+        checkCuda(cudaMalloc(&plan.d_v2_ptrs, planbl * sizeof(bool*)));
         checkCuda(cudaMemcpyAsync(plan.d_stream1BandIndexes, h_stream1BandIndexes,
-                                 numXmacBaselines * numPolarisationProducts * sizeof(int),
-                                 cudaMemcpyHostToDevice, cuStream));
+                                 nprod * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2BandIndexes, h_stream2BandIndexes,
-                                 numXmacBaselines * numPolarisationProducts * sizeof(int),
-                                 cudaMemcpyHostToDevice, cuStream));
-        checkCuda(cudaMemcpyAsync(plan.d_coreResultBaselineOffsets, h_coreResultBaselineOffsets,
-                                 numXmacBaselines * sizeof(int),
-                                 cudaMemcpyHostToDevice, cuStream));
+                                 nprod * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_coreResultOffsets, h_coreResultOffsets,
+                                 nprod * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream1BandStride, h_s1BandStride,
-                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 planbl * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream1WindowStride, h_s1WindowStride,
-                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 planbl * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2BandStride, h_s2BandStride,
-                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 planbl * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2WindowStride, h_s2WindowStride,
-                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 planbl * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_m1_ptrs, h_m1_ptrs,
+                                 planbl * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_m2_ptrs, h_m2_ptrs,
+                                 planbl * sizeof(cuFloatComplex*), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_v1_ptrs, h_v1_ptrs,
+                                 planbl * sizeof(bool*), cudaMemcpyHostToDevice, cuStream));
+        checkCuda(cudaMemcpyAsync(plan.d_v2_ptrs, h_v2_ptrs,
+                                 planbl * sizeof(bool*), cudaMemcpyHostToDevice, cuStream));
+        if (!planSelf.empty() && f == 0)
+            cinfo << startl << "GPUCore: XMAC carries " << numbaselines << " cross + "
+                  << planSelf.size() << " autocorrelation baselines per frequency "
+                  << "(DIFX_GPU_XMAC_AUTOCORR)" << endl;
 
         xmacPlans.push_back(plan);
     }
@@ -1301,16 +1309,16 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
                 numFftChunks = 1;
 
             dim3 threads(threadsPerBlock);
-            dim3 blocks(numXmacBaselines, plan.numPolarisationProducts,
+            dim3 blocks(plan.numBaselines, plan.numPolarisationProducts,
                         numChanBlocks * numFftChunks);
 
             gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
-                d_m1_ptrs, d_m2_ptrs,
-                d_v1_ptrs, d_v2_ptrs,
+                plan.d_m1_ptrs, plan.d_m2_ptrs,
+                plan.d_v1_ptrs, plan.d_v2_ptrs,
                 plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
-                plan.d_coreResultBaselineOffsets,
+                plan.d_coreResultOffsets,
                 gpuprocslots[index].results_gpu,
-                numXmacBaselines, plan.numPolarisationProducts, numBufferedFFTs,
+                plan.numBaselines, plan.numPolarisationProducts, numBufferedFFTs,
                 fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
                 plan.d_stream1BandStride, plan.d_stream1WindowStride,

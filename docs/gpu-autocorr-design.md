@@ -531,69 +531,53 @@ two host mirror loops in `gpumode.cu` go; and `Core`'s autocorrelation
 accumulation is skipped on the GPU path (it must keep running for the CPU path -
 the divergence class that has caused the most bugs here).
 
-### Increment 2 measured: the shape is wrong, and here is the number
+### Increment 2 measured, twice - the first plan was wrong, not the design
 
-Increment 2 is built, correct and gated off (all GPU-eligible Synthetic
-scenarios PASS CPU-vs-GPU in both pipeline modes, with the gate on and off, and
-under `DIFX_GPU_WEIGHTS_HOST=1`). It is also, as specified, **a net loss**:
+**Corrected 2026-08-28 (Adam).** An autocorrelation is a baseline whose two
+antennas are the same, so 45 baselines becomes **55**, and each autocorrelation
+baseline carries the frequency's polarisation products exactly as a cross
+baseline does. The first implementation instead emitted one baseline *per output
+run* (per datastream, band and acwidth) and put every one of them in **every**
+frequency's plan, so a 10-station launch carried 365 baselines x 4 products with
+85% of the block-columns idle. Two errors compounded:
 
-| RTX 2070, benchprof2 | gate off | gate on |
+- **The extrapolation was arithmetic nonsense.** It compared 320 self runs *in
+  total* against 180 cross runs *per frequency*. Like for like: per frequency,
+  45 x 4 = 180 cross against 10 x 4 = 40 self, i.e. **+22%** - and over all
+  frequencies 1440 against 320, the same +22%. The design note's "45 -> 55" was
+  right all along.
+- **The 3.07x measured on benchprof2 was a 2-station artifact.** With two
+  antennas there is one cross baseline and two autocorrelation baselines, so
+  autocorrelations are two thirds of all products. benchprof2 is the *worst*
+  case for this change, not a representative one.
+
+Measured on benchprof2, all three states:
+
+| RTX 2070, benchprof2 | `gpu_fuse_xmac_and_average` | kernel busy |
 |---|---|---|
-| `gpu_fuse_xmac_and_average` | 34.0 us/call (108.8 ms) | **104.5 us/call (334.5 ms)** |
-| total kernel busy | 1360 ms | 1584 ms (**+16.5%**) |
-| T5-T1 | 10.1 s | **11.1 s (10% slower)** |
+| gate off (no device autocorrelations) | 34.0 us/call | 1360 ms |
+| first plan (365 baselines, 85% idle) | 104.5 us/call | 1584 ms (+16.5%) |
+| **corrected plan (per-frequency, 45 -> 55)** | **52.9 us/call** | **1420 ms (+4.4%)** |
 
-**Why: one synthetic baseline per output run re-reads the spectra from global
-memory, and that costs more than the atomics it removes.** For benchprof2 (2
-datastreams x 16 bands, cross-pol autocorrelations on) the runs go 4 -> 68 and
-the *band-reads* go 8 -> 96: a parallel run reads its band, a cross-pol run reads
-two. Time went up 3.07x - sub-proportional, because the re-reads hit cache, but
-nowhere near free. The design note's estimate ("45 -> 55 baselines, ~22%") was
-simply wrong: it counted one self-baseline per datastream, when there is one per
-(datastream, band, acwidth) - 320 of them for the 10-station benchprof, against
-45 cross baselines.
+10-station T5-T1: 10.1 s gate off, 11.1 s with the first plan, **10.8 s** with
+the corrected one - and that is still *before* increment 3, which removes the
+duplicated work the rotator is currently doing as well.
 
-What increment 3 would give back does not cover it. On the 2070 the rotator's
-cross-pol phase is 27% of 316 ms = 85 ms and its atomics are free, against
-+226 ms here. Projecting the same shape to the A100: self runs 320 vs cross runs
-180, so the XMAC grows by more than the 671 ms (49% of 1370 ms) that leaves the
-rotator. **The move is right; reusing the XMAC unchanged is the wrong vehicle**,
-because the rotator gets autocorrelations nearly free from values already in
-registers, and this hands that advantage back.
+Getting there needed the **per-(baseline, polproduct) output offsets** after all:
+an autocorrelation baseline's four products are two parallel hands (in the
+parallel sub-block) and two cross-pol (in the cross-pol sub-block), which
+`base + pol * num_averaged_channels` cannot express. Cross baselines fill the
+array with exactly `base + pol * num_averaged_channels`, so their behaviour is
+unchanged, and this is a far smaller change than restraightening the results
+layout - the alternative Adam offered. Each plan also owns its own pointer and
+index arrays now, because which autocorrelation baselines exist depends on the
+frequency.
 
-### Three ways forward (2026-08-28)
-
-**(A) A fused autocorrelation kernel.** One block per (datastream, band pair),
-reading each band's spectra once and emitting both the parallel and the cross-pol
-output. Band-reads for benchprof2 drop 96 -> 32. Still adds a full read of the
-spectra per datastream that the register-resident rotator never needed: a wash on
-the 2070, a modest win on the A100.
-
-**(B) Split it where each side is already cheap - the recommended option.**
-- **Parallel autocorrelations move into the *existing* cross-baseline blocks,
-  free.** A block computing pol product (b1, b2) already holds `v1` and `v2` in
-  registers, so `|v1|^2` and `|v2|^2` are an FMA each and **no extra reads**. The
-  RR and LL pol products between them supply both stations' parallel
-  autocorrelations; designate one baseline per (datastream, frequency) to own
-  them so they are accumulated once.
-- **Cross-pol autocorrelations stay in the rotator**, where the in-thread band
-  loop already holds both polarisations - which is exactly why they are cheap
-  there and expensive anywhere else.
-- To still delete the host tail, the rotator writes its cross-pol accumulation to
-  a device buffer as today and a small kernel averages it into the results
-  region (it is `freqchannels/chanstoaverage` values per band - microseconds).
-
-  Estimated: A100 loses the rotator's parallel-autocorrelation atomics (24% of
-  34.9% = ~8% of kernel busy) at ~zero XMAC cost; the 2070 is roughly neutral on
-  kernels (its atomics are free) and gains the host tail. Both to be measured,
-  not believed.
-
-**(C) Abandon the move** and leave autocorrelations in `Mode`. The host tail
-stays, and the A100 keeps paying 24% of its largest kernel for atomics.
-
-Increment 2's code is kept, gated off: it is the scaffolding all of (A) and (B)
-need - the self-baseline enumeration, the results-region offsets, the staged-copy
-split and the STA handling are common to both.
+**Where that leaves the arithmetic.** On the 2070 increment 3 should return
+~85 ms (the rotator's cross-pol phase, 27% of 316 ms; its atomics are already
+free here) against the +60 ms this costs - roughly break-even on kernels, plus
+the host tail. On the A100 the rotator gives back 49% of 1370 ms = 671 ms against
+a ~22% growth of a 970 ms kernel, so a clear net win. Proceed to increment 3.
 
 ### Risks, in the order they are likely to bite
 
