@@ -204,6 +204,13 @@ protected:
   */
   void averageAndSendAutocorrs(int index, int threadid, double nsoffset, double nswidth, Mode ** modes, threadscratchspace * scratchspace);
 
+  /** Set by GPUCore when the device accumulates autocorrelations straight into
+   * the results buffer (DIFX_GPU_XMAC_AUTOCORR). It suppresses the host-side
+   * fold of Mode::autocorrelations in averageAndSendAutocorrs - and, with it,
+   * STA dumps, which have nothing left to read. See
+   * docs/gpu-autocorr-design.md. Always false on the CPU path. */
+  bool deviceautocorrs = false;
+
  /**
   * Averages the kurtosis down and sends off as a series of STA dumps down a socket
   * @param index The index in the circular send/receive buffer to be processed

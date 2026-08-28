@@ -1184,6 +1184,24 @@ void Core::averageAndSendAutocorrs(int index, int threadid, double nsoffset, dou
   writecrossautocorrs = modes[0]->writeCrossAutoCorrs();
   maxproducts = config->getMaxProducts();
 
+  //Short Term Accumulate dumps read Mode::autocorrelations, which do not exist
+  //when the device accumulated the autocorrelations straight into the results
+  //buffer. Decline the dump and say so once, rather than multicasting stale or
+  //zeroed spectra to a monitoring tool. DIFX_GPU_XMAC_AUTOCORR=0 restores both
+  //the Mode-side path and STA. See docs/gpu-autocorr-design.md.
+  if(deviceautocorrs && scratchspace->dumpsta)
+  {
+    static bool warnedaboutsta = false;
+    if(!warnedaboutsta)
+    {
+      cwarn << startl << "STA (Short Term Accumulate) dumps are not available while the GPU "
+            << "computes autocorrelations on the device; no STA data will be sent. Run with "
+            << "DIFX_GPU_XMAC_AUTOCORR=0 if STA is needed." << endl;
+      warnedaboutsta = true;
+    }
+    scratchspace->dumpsta = false;
+  }
+
   //if STA send needed but we can average datastream results in freq first, do so
   if(scratchspace->dumpsta && config->getMinPostAvFreqChannels(procslots[index].configindex) >= config->getSTADumpChannels())
   {
@@ -1264,13 +1282,21 @@ void Core::averageAndSendAutocorrs(int index, int threadid, double nsoffset, dou
     //cout << "Finished doing some STA stuff" << endl;
   }
 
-  //if required, average the datastreams down in frequency
-  if(!datastreamsaveraged) {
+  //if required, average the datastreams down in frequency. averageFrequency()
+  //averages the Mode autocorrelations and nothing else, so with device
+  //autocorrelations there is nothing here to average.
+  if(!datastreamsaveraged && !deviceautocorrs) {
     for(int i=0;i<numdatastreams;i++) {
       modes[i]->averageFrequency();
     }
   }
 
+  //Fold the Mode autocorrelations into the results buffer - unless the device
+  //already wrote them there, in which case there is nothing to copy and no lock
+  //to take (this whole block, and the D2H that feeds it, is what the
+  //autocorrelations-in-XMAC change removes; see docs/gpu-autocorr-design.md).
+  if(!deviceautocorrs)
+  {
   //lock the autocorr copylock, so we're the only one adding to the result array (datastream section)
   perr = pthread_mutex_lock(&(procslots[index].autocorrcopylock));
   if(perr != 0)
@@ -1313,6 +1339,7 @@ void Core::averageAndSendAutocorrs(int index, int threadid, double nsoffset, dou
   if(perr != 0)
     csevere << startl << "PROCESSTHREAD " << mpiid << "/" << threadid << " error trying unlock autocorr copy mutex!!!" << endl;
 
+  } //end of the !deviceautocorrs autocorrelation fold
   //lock the acweight copylock, so we're the only one adding to the result array (autocorr weight section)
   perr = pthread_mutex_lock(&(procslots[index].acweightcopylock));
   if(perr != 0)

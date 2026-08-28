@@ -255,6 +255,10 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
 
     cudaMaxThreadsPerBlock = prop.maxThreadsPerBlock;
     cudaMultiProcessorCount = prop.multiProcessorCount;
+
+    // Tell the base class the device is accumulating autocorrelations into the
+    // results buffer, so it skips the host-side fold (and STA dumps).
+    deviceautocorrs = xmacAutocorrEnabled();
     if(numprocessthreads > 1) {
       cerr << "GPU DiFX must have 1 thread per Core process - had " << numprocessthreads << endl;
       exit(1);
@@ -391,6 +395,51 @@ GPUCore::GPUCore(const int id, Configuration *const conf, int *const dids, MPI_C
     checkCuda(cudaMalloc(&d_v2_ptrs, numbaselines * sizeof(bool*)));
 }
 
+bool GPUCore::xmacAutocorrEnabled() {
+    // Off by default while this is being built and validated; increment 3 of
+    // docs/gpu-autocorr-design.md deletes the Mode-side path and flips it on.
+    // Thread-safe initialisation by the standard, unlike a read-modify-written
+    // `static int`.
+    static const bool enabled = []() {
+        const char *e = getenv("DIFX_GPU_XMAC_AUTOCORR");
+        return (e != NULL) && (strcmp(e, "0") != 0) && (strcasecmp(e, "false") != 0) &&
+               (strcasecmp(e, "no") != 0) && (strcasecmp(e, "off") != 0);
+    }();
+    return enabled;
+}
+
+int GPUCore::stagedResultsLength(int configindex) const {
+    int len = config->getCoreResultXcorrsLength(configindex);
+    if (xmacAutocorrEnabled()) {
+        // Reach the end of the autocorrelation region, which is where the first
+        // datastream's AC weights begin. One transfer covers it, at the cost of
+        // carrying the host-owned baseline-weight and shift-decorrelation regions
+        // in between - see copyStagedResults, which does not copy those on.
+        const int acend = config->getCoreResultACWeightOffset(configindex, 0);
+        if (acend > len)
+            len = acend;
+    }
+    return len;
+}
+
+void GPUCore::copyStagedResults(int index) {
+    const int configindex = procslots[index].configindex;
+    const cf32 *const staged = (const cf32*)gpuprocslots[index].results_host;
+    // The visibilities always.
+    const int xcorrslength = config->getCoreResultXcorrsLength(configindex);
+    memcpy(procslots[index].results, staged, xcorrslength * sizeof(cf32));
+    if (!xmacAutocorrEnabled())
+        return;
+    // And the autocorrelations, as a SECOND range: between the two lie the
+    // baseline weights and shift-decorrelation factors, which the host folds in
+    // itself and which the device buffer holds only zeros for.
+    const int acstart = config->getCoreResultAutocorrOffset(configindex, 0);
+    const int acend = config->getCoreResultACWeightOffset(configindex, 0);
+    if (acend > acstart)
+        memcpy(procslots[index].results + acstart, staged + acstart,
+               (acend - acstart) * sizeof(cf32));
+}
+
 void GPUCore::checkDeviceMemory() {
     // Peak device usage is dominated by the per-datastream GPUMode buffers.
     // These are allocated for whichever config a scan uses, and a Core holds
@@ -502,10 +551,77 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
     // The FFT buffer pointers depend only on the baseline's datastreams (not on
     // frequency) and the GPUMode buffers never move, so they are gathered and
     // uploaded once here and shared across all per-frequency launches.
-    const cuFloatComplex* h_m1_ptrs[numbaselines];
-    const cuFloatComplex* h_m2_ptrs[numbaselines];
-    const bool* h_v1_ptrs[numbaselines];
-    const bool* h_v2_ptrs[numbaselines];
+    // Enumerate the autocorrelation output runs as synthetic baselines, one per
+    // run, before the pointer arrays below are sized - they are shared by every
+    // frequency plan and so must cover the self-baselines too. Each run's
+    // destination is computed the way Core::processdata walks the region:
+    // [parallel bands][cross-pol bands] per datastream, in band order, over the
+    // bands that pass the isFrequencyUsed / isEquivalentFrequencyUsed filter.
+    // Nothing here assumes anything about the order of bands within a datastream.
+    selfBaselines.clear();
+    if (xmacAutocorrEnabled()) {
+        const bool crossautocorrs = config->writeAutoCorrs(configindex) &&
+                                    config->getMaxProducts() > 2;
+        for (int ds = 0; ds < numdatastreams; ds++) {
+            if (config->getDNumZoomBands(configindex, ds) > 0) {
+                cfatal << startl << "GPUCore: device autocorrelations do not support zoom bands "
+                       << "(datastream " << ds << " has "
+                       << config->getDNumZoomBands(configindex, ds) << "); "
+                       << "run with DIFX_GPU_XMAC_AUTOCORR=0" << endl;
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            const int acbase = config->getCoreResultAutocorrOffset(configindex, ds);
+            const int nbands = config->getDNumRecordedBands(configindex, ds);
+            // First pass: the parallel-hand block, and the running channel offset
+            // it consumes (also the length of that block, needed by the cross one).
+            int prefix = 0;
+            std::vector<int> bandPrefix(nbands, -1);
+            for (int k = 0; k < nbands; k++) {
+                const int fq = config->getDRecordedFreqIndex(configindex, ds, k);
+                if (!(config->isFrequencyUsed(configindex, fq) ||
+                      config->isEquivalentFrequencyUsed(configindex, fq)))
+                    continue;
+                bandPrefix[k] = prefix;
+                selfBaselines.push_back({ds, fq, k, k, acbase + prefix});
+                prefix += config->getFNumChannels(fq) / config->getFChannelsToAverage(fq);
+            }
+            if (!crossautocorrs)
+                continue;
+            // Second pass: the cross-pol block, which follows the whole parallel
+            // block. A band whose frequency has no second polarisation gets no
+            // run at all: the CPU path leaves that slot zero and results_gpu is
+            // zeroed every subint, so the outcome matches.
+            const int parallelLen = prefix;
+            for (int k = 0; k < nbands; k++) {
+                if (bandPrefix[k] < 0)
+                    continue;
+                const int fq = config->getDRecordedFreqIndex(configindex, ds, k);
+                int partner = -1;
+                for (int l = 0; l < nbands; l++) {
+                    if (l != k && config->getDRecordedFreqIndex(configindex, ds, l) == fq) {
+                        partner = l;
+                        break;
+                    }
+                }
+                if (partner < 0)
+                    continue;
+                // CPUMode computes autocorrelations[1][k] = fft[k] * conj(fft[partner]),
+                // and the kernel's cuCmulConjf(v1, v2) is v1 * conj(v2), so band
+                // k is stream 1 and its partner is stream 2.
+                selfBaselines.push_back({ds, fq, k, partner,
+                                         acbase + parallelLen + bandPrefix[k]});
+            }
+        }
+    }
+    numXmacBaselines = numbaselines + (int)selfBaselines.size();
+    if (!selfBaselines.empty())
+        cinfo << startl << "GPUCore: computing " << selfBaselines.size()
+              << " autocorrelation runs in the XMAC (DIFX_GPU_XMAC_AUTOCORR)" << endl;
+
+    const cuFloatComplex* h_m1_ptrs[numXmacBaselines];
+    const cuFloatComplex* h_m2_ptrs[numXmacBaselines];
+    const bool* h_v1_ptrs[numXmacBaselines];
+    const bool* h_v2_ptrs[numXmacBaselines];
     for (int j = 0; j < numbaselines; j++) {
         int ds1index = config->getBOrderedDataStream1Index(configindex, j);
         int ds2index = config->getBOrderedDataStream2Index(configindex, j);
@@ -514,13 +630,33 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         h_v1_ptrs[j] = ((GPUMode*)modes[ds1index])->getGpuValidSamples();
         h_v2_ptrs[j] = ((GPUMode*)modes[ds2index])->getGpuValidSamples();
     }
-    checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numbaselines * sizeof(cuFloatComplex*),
+    // A self-baseline's two "streams" are the same datastream.
+    for (size_t sb = 0; sb < selfBaselines.size(); sb++) {
+        const int ds = selfBaselines[sb].datastream;
+        const int j = numbaselines + (int)sb;
+        h_m1_ptrs[j] = h_m2_ptrs[j] = ((GPUMode*)modes[ds])->fftd_gpu->gpuPtr();
+        h_v1_ptrs[j] = h_v2_ptrs[j] = ((GPUMode*)modes[ds])->getGpuValidSamples();
+    }
+    // These four were sized for the cross baselines alone in the constructor,
+    // before the self-baselines were known. Resize before uploading; a config
+    // change is the only time this runs, and the function synchronises at the end.
+    if (numXmacBaselines > numbaselines) {
+        checkCuda(cudaFree(d_m1_ptrs));
+        checkCuda(cudaFree(d_m2_ptrs));
+        checkCuda(cudaFree(d_v1_ptrs));
+        checkCuda(cudaFree(d_v2_ptrs));
+        checkCuda(cudaMalloc(&d_m1_ptrs, numXmacBaselines * sizeof(cuFloatComplex*)));
+        checkCuda(cudaMalloc(&d_m2_ptrs, numXmacBaselines * sizeof(cuFloatComplex*)));
+        checkCuda(cudaMalloc(&d_v1_ptrs, numXmacBaselines * sizeof(bool*)));
+        checkCuda(cudaMalloc(&d_v2_ptrs, numXmacBaselines * sizeof(bool*)));
+    }
+    checkCuda(cudaMemcpyAsync(d_m1_ptrs, h_m1_ptrs, numXmacBaselines * sizeof(cuFloatComplex*),
                              cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numbaselines * sizeof(cuFloatComplex*),
+    checkCuda(cudaMemcpyAsync(d_m2_ptrs, h_m2_ptrs, numXmacBaselines * sizeof(cuFloatComplex*),
                              cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_v1_ptrs, h_v1_ptrs, numbaselines * sizeof(bool*),
+    checkCuda(cudaMemcpyAsync(d_v1_ptrs, h_v1_ptrs, numXmacBaselines * sizeof(bool*),
                              cudaMemcpyHostToDevice, cuStream));
-    checkCuda(cudaMemcpyAsync(d_v2_ptrs, h_v2_ptrs, numbaselines * sizeof(bool*),
+    checkCuda(cudaMemcpyAsync(d_v2_ptrs, h_v2_ptrs, numXmacBaselines * sizeof(bool*),
                              cudaMemcpyHostToDevice, cuStream));
 
     for (int f = 0; f < config->getFreqTableLength(); f++) {
@@ -562,17 +698,17 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
         plan.channelstoaverage = channelstoaverage;
 
         // Gather the per-baseline band indexes and result offsets for this frequency.
-        int h_stream1BandIndexes[numbaselines * numPolarisationProducts];
-        int h_stream2BandIndexes[numbaselines * numPolarisationProducts];
-        int h_coreResultBaselineOffsets[numbaselines];
+        int h_stream1BandIndexes[numXmacBaselines * numPolarisationProducts];
+        int h_stream2BandIndexes[numXmacBaselines * numPolarisationProducts];
+        int h_coreResultBaselineOffsets[numXmacBaselines];
         // Per-baseline, per-stream buffer strides: each side's GPUMode fftd
         // buffer geometry follows THAT datastream's sampling type and band
         // count, so a mixed (e.g. real x complex) baseline has different
         // strides on its two sides.
-        int h_s1BandStride[numbaselines];
-        int h_s1WindowStride[numbaselines];
-        int h_s2BandStride[numbaselines];
-        int h_s2WindowStride[numbaselines];
+        int h_s1BandStride[numXmacBaselines];
+        int h_s1WindowStride[numXmacBaselines];
+        int h_s2BandStride[numXmacBaselines];
+        int h_s2WindowStride[numXmacBaselines];
         for (int j = 0; j < numbaselines; j++) {
             int ds1index = config->getBOrderedDataStream1Index(configindex, j);
             int ds2index = config->getBOrderedDataStream2Index(configindex, j);
@@ -603,33 +739,53 @@ void GPUCore::buildXmacPlans(int configindex, Mode **modes) {
             }
         }
 
+        // The self-baselines: one output run each, in pol slot 0. A run belonging
+        // to another frequency is flagged -1 and the kernel early-returns for it,
+        // exactly as a cross baseline that does not carry this frequency is.
+        for (size_t sb = 0; sb < selfBaselines.size(); sb++) {
+            const SelfBaseline &self = selfBaselines[sb];
+            const int j = numbaselines + (int)sb;
+            const int mult = (config->getDSampling(configindex, self.datastream) ==
+                              Configuration::COMPLEX) ? 1 : 2;
+            h_s1BandStride[j] = h_s2BandStride[j] = freqchannels * mult;
+            h_s1WindowStride[j] = h_s2WindowStride[j] =
+                h_s1BandStride[j] * config->getDNumRecordedBands(configindex, self.datastream);
+            const bool thisfreq = (self.freq == f);
+            h_coreResultBaselineOffsets[j] = thisfreq ? self.resultOffset : -1;
+            for (int p = 0; p < numPolarisationProducts; p++) {
+                const bool live = thisfreq && (p == 0);
+                h_stream1BandIndexes[j * numPolarisationProducts + p] = live ? self.band1 : -1;
+                h_stream2BandIndexes[j * numPolarisationProducts + p] = live ? self.band2 : -1;
+            }
+        }
+
         // Allocate persistent device arrays and upload the gathered metadata.
         checkCuda(cudaMalloc(&plan.d_stream1BandIndexes,
-                             numbaselines * numPolarisationProducts * sizeof(int)));
+                             numXmacBaselines * numPolarisationProducts * sizeof(int)));
         checkCuda(cudaMalloc(&plan.d_stream2BandIndexes,
-                             numbaselines * numPolarisationProducts * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_coreResultBaselineOffsets, numbaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream1BandStride, numbaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream1WindowStride, numbaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream2BandStride, numbaselines * sizeof(int)));
-        checkCuda(cudaMalloc(&plan.d_stream2WindowStride, numbaselines * sizeof(int)));
+                             numXmacBaselines * numPolarisationProducts * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_coreResultBaselineOffsets, numXmacBaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1BandStride, numXmacBaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream1WindowStride, numXmacBaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2BandStride, numXmacBaselines * sizeof(int)));
+        checkCuda(cudaMalloc(&plan.d_stream2WindowStride, numXmacBaselines * sizeof(int)));
         checkCuda(cudaMemcpyAsync(plan.d_stream1BandIndexes, h_stream1BandIndexes,
-                                 numbaselines * numPolarisationProducts * sizeof(int),
+                                 numXmacBaselines * numPolarisationProducts * sizeof(int),
                                  cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2BandIndexes, h_stream2BandIndexes,
-                                 numbaselines * numPolarisationProducts * sizeof(int),
+                                 numXmacBaselines * numPolarisationProducts * sizeof(int),
                                  cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_coreResultBaselineOffsets, h_coreResultBaselineOffsets,
-                                 numbaselines * sizeof(int),
+                                 numXmacBaselines * sizeof(int),
                                  cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream1BandStride, h_s1BandStride,
-                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream1WindowStride, h_s1WindowStride,
-                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2BandStride, h_s2BandStride,
-                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
         checkCuda(cudaMemcpyAsync(plan.d_stream2WindowStride, h_s2WindowStride,
-                                 numbaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
+                                 numXmacBaselines * sizeof(int), cudaMemcpyHostToDevice, cuStream));
 
         xmacPlans.push_back(plan);
     }
@@ -1145,7 +1301,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
                 numFftChunks = 1;
 
             dim3 threads(threadsPerBlock);
-            dim3 blocks(numbaselines, plan.numPolarisationProducts,
+            dim3 blocks(numXmacBaselines, plan.numPolarisationProducts,
                         numChanBlocks * numFftChunks);
 
             gpu_fuse_xmac_and_average<<<blocks, threads, 0, cuStream>>>(
@@ -1154,7 +1310,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
                 plan.d_stream1BandIndexes, plan.d_stream2BandIndexes,
                 plan.d_coreResultBaselineOffsets,
                 gpuprocslots[index].results_gpu,
-                numbaselines, plan.numPolarisationProducts, numBufferedFFTs,
+                numXmacBaselines, plan.numPolarisationProducts, numBufferedFFTs,
                 fftsPerChunk,
                 plan.num_averaged_channels, plan.channelstoaverage,
                 plan.d_stream1BandStride, plan.d_stream1WindowStride,
@@ -1201,7 +1357,7 @@ GPUCore::issue_afterfft_xmac_drain(int index, int threadid, int startblock, int 
         // D2Hs too (autocorr / gTotalWeight / pcal / baseline-weights). The whole
         // host tail (finishWeights, autocorr + baseline-weight fold, pcal, and
         // the visibility memcpy) moves to completegpudata.
-        int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
+        int xcorrslength = stagedResultsLength(procslots[index].configindex);
         checkCuda(cudaStreamWaitEvent(d2hStream, gpuprocslots[index].evComputeDone, 0));
         checkCuda(cudaMemcpyAsync(gpuprocslots[index].results_host, gpuprocslots[index].results_gpu,
                                   xcorrslength * sizeof(cuFloatComplex),
@@ -1422,10 +1578,12 @@ void GPUCore::completegpudata(int index, int threadid, int startblock, int numbl
     DIFX_NVTX_POP(); // host_finalize
 #endif
 
-    // Copy the staged visibilities across into procslots (the visibility prefix,
-    // disjoint from the autocorr/weight/pcal trailing regions folded above,
-    // which the main thread pre-zeroed before handing us this slot).
-    int xcorrslength = config->getCoreResultXcorrsLength(procslots[index].configindex);
-    memcpy(procslots[index].results, gpuprocslots[index].results_host, xcorrslength * sizeof(cuFloatComplex));
+    // Copy the staged results across into procslots: the visibilities, plus the
+    // autocorrelation region when the device computed it (in which case the host
+    // fold in averageAndSendAutocorrs is skipped, so nothing else writes there).
+    // The regions in between and after - baseline weights, shift decorrelation,
+    // ac weights, pcal - are folded above into a slot the main thread pre-zeroed,
+    // and must not be overwritten from the device buffer.
+    copyStagedResults(index);
 }
 // vim: shiftwidth=2:softtabstop=2:expandtab

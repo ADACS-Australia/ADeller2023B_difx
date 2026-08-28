@@ -226,6 +226,55 @@ private:
     };
     std::vector<XmacFreqPlan> xmacPlans;
 
+    /** One autocorrelation output run, expressed as a synthetic baseline for the
+     * XMAC. An autocorrelation is just a baseline whose two streams are the same
+     * datastream, so the existing kernel computes it unchanged - see
+     * docs/gpu-autocorr-design.md.
+     *
+     * There is one of these per output run rather than one per (datastream,
+     * frequency), and each uses only pol slot 0. That is deliberate: a
+     * baseline's pol products land at `base + pol * num_averaged_channels`, a
+     * fixed stride, whereas the results buffer orders autocorrelations by band
+     * index. Packing two polarisations into one synthetic baseline would
+     * therefore only work if a frequency's two bands were adjacent, which is
+     * usual but NOT guaranteed (F0R, F1R, F0L, F1L is legal). One run per
+     * baseline places each output by its own arbitrary base offset and so
+     * assumes nothing about band ordering. */
+    struct SelfBaseline {
+        int datastream;    ///< the datastream this autocorrelation belongs to
+        int freq;          ///< freqtable index, so the per-frequency plans can skip it
+        int band1;         ///< recorded band index (the conjugated-into side)
+        int band2;         ///< same as band1 for a parallel autocorrelation; the
+                           ///< other polarisation's band for a cross-pol one
+        int resultOffset;  ///< absolute complex offset into the results buffer
+    };
+    std::vector<SelfBaseline> selfBaselines;
+    /// numbaselines + selfBaselines.size() when device autocorrelations are on.
+    int numXmacBaselines = 0;
+
+    /** Device autocorrelations (DIFX_GPU_XMAC_AUTOCORR, default off while this
+     * is being built): compute autocorrelations in the XMAC, straight into the
+     * results buffer, instead of accumulating them in Mode and folding them in
+     * on the host. Read once. */
+    static bool xmacAutocorrEnabled();
+
+    /** Length, in complex values, to stage back from the device: the
+     * cross-correlations, or - with device autocorrelations - everything up to
+     * the end of the autocorrelation region.
+     *
+     * NOTE the results buffer is NOT [xcorrs][autocorrs]: populateResultLengths
+     * lays it out [visibilities][baseline weights][shift decorr][autocorrs]
+     * [ac weights][pcals], and `coreresultxcorrslength` covers the visibilities
+     * only. The middle regions are folded in by the host, so this one transfer
+     * carries them across as filler and `copyStagedResults` must skip them -
+     * copying straight through zeroed the baseline weights and made Visibility
+     * drop every cross-correlation record. */
+    int stagedResultsLength(int configindex) const;
+
+    /// Copy the staged device results into a procslot, skipping the host-owned
+    /// regions in the middle. See stagedResultsLength.
+    void copyStagedResults(int index);
+
     /// The configindex the cached xmacPlans were built for (-1 = none yet).
     int xmacPlanConfigIndex = -1;
 
