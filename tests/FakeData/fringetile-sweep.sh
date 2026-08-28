@@ -111,12 +111,15 @@ echo "[fringetile-sweep] results in $OUTDIR"
 # reported as a pass) by a run that never touched the pcal path.
 rm -f pcal-*.f32
 
+# Tag every output with the sampling mode, so a complex run cannot overwrite a
+# real one's raw tables (the joined .log was already distinct; these were not).
+TAG="${SWEEP_COMPLEX:+-complex}"
 echo "[fringetile-sweep] running untiled ..."
-DIFX_GPU_FRINGE_TILE=0 "$BIN" "$NBUF" "$NREPS" > fringetile-sweep-untiled.txt || exit 1
+DIFX_GPU_FRINGE_TILE=0 "$BIN" "$NBUF" "$NREPS" > "fringetile-sweep$TAG-untiled.txt" || exit 1
 echo "[fringetile-sweep] running tiled ..."
-DIFX_GPU_FRINGE_TILE=1 "$BIN" "$NBUF" "$NREPS" > fringetile-sweep-tiled.txt || exit 1
+DIFX_GPU_FRINGE_TILE=1 "$BIN" "$NBUF" "$NREPS" > "fringetile-sweep$TAG-tiled.txt" || exit 1
 
-python3 - fringetile-sweep-untiled.txt fringetile-sweep-tiled.txt <<'PY' | tee "fringetile-sweep${SWEEP_COMPLEX:+-complex}.log"
+python3 - "fringetile-sweep$TAG-untiled.txt" "fringetile-sweep$TAG-tiled.txt" <<'PY' | tee "fringetile-sweep$TAG.log"
 import sys
 def rows(fn):
     out = []
