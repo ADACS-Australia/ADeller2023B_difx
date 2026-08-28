@@ -5,8 +5,10 @@ coalesced without un-coalescing its decode read. Companion to
 `gpu-fringerotation-design.md` (which covers the FP64 precompute already landed)
 and `gpu-profiling.md` (the ncu measurements that motivate this).
 
-Status: **implemented and verified on the 2070, 2026-08-27** (`DIFX_GPU_FRINGE_TILE`,
-default on). Results at the end; the A100 A/B is still to run.
+Status: **landed and verified on both architectures, 2026-08-28**
+(`DIFX_GPU_FRINGE_TILE`, default on). RTX 2070: ~1.2-1.5x per shape, T5-T1
+7.3%. A100: **1.0-2.2x per shape**, no shape slower, output bit-identical on
+both. Results at the end.
 
 ## The measurement
 
@@ -129,12 +131,15 @@ one shared store, one shared load and one `__syncthreads()` per tile — visible
 only if a card is instruction-issue-bound on this kernel, which nothing measured
 so far is.
 
-That argument is not a measurement, so:
+That argument is not a measurement, so the tiled path is gated by
+**`DIFX_GPU_FRINGE_TILE`** (default on, `=0` selects the untiled kernels
+unchanged), so any site can A/B it and revert without a rebuild.
 
-- the tiled path is gated by **`DIFX_GPU_FRINGE_TILE`** (default on, `=0`
-  selects today's kernel unchanged), so any site can A/B it and revert without a
-  rebuild, and
-- it is not claimed as a general win until the A100 leg below runs.
+**Measured on the A100, 2026-08-28: the argument held, and then some.** The gain
+is 1.07-1.20x at 1-8 bands, 1.48x at the benchmark's 16, and 2.1-2.2x at 32-128
+bands - *larger* than the 2070's, because the untiled write scatters further the
+more bands there are and the A100 executes everything else fast enough for the
+wasted sectors to dominate. Full table in `BENCHMARKS.md`.
 
 ## Test plan
 
@@ -166,9 +171,8 @@ achieved occupancy, shared bank conflicts.
 **Ledger**: `tests/FakeData/run-bench.sh` T5-T1, best of 3, into
 `BENCHMARKS.md` as usual.
 
-**A100 leg** (the second acceptance condition): the same tiled/legacy A/B as a
-cluster sbatch on tooarrana, `--cpus-per-task=5 --nodes=1` per the standing
-rules. Until it reports, the change is 2070-verified only.
+**A100 leg** (the second acceptance condition) - **MET 2026-08-28** by the
+kernel-level sweep (jobs 16004857/16004871), not by the wall-clock A/B.
 
 **Attempt 1 (2026-08-28, job 16004634) was inconclusive** - written up in
 `BENCHMARKS.md`. On a shared node the per-leg srun launch and teardown cost
@@ -204,6 +208,16 @@ nor launch overhead can reach it.
 | excessive sectors | 29% | none reported |
 | shared bank conflicts | n/a | 0 (640k with the `CT+1` pad) |
 | T5-T1, same binary and session | 10.9 s | **10.1 s** (7.3%) |
+
+### A100-SXM4-80GB (sm_80), 2026-08-28
+
+**1.0x - 2.19x real, 1.0x - 1.95x complex, no shape slower, output
+bit-identical at all 15 shapes in both modes.** Best at wide band counts
+(2.1-2.2x at 32-128 bands); 1.48x at the benchmark's 16 x 256, which predicts
+~5-6% of span and matches what the steady-state visibility dumps showed in the
+wall A/B. Full table: `BENCHMARKS.md`.
+
+### RTX 2070 SUPER (sm_75), 2026-08-27
 
 Shape sweep (`tests/FakeData/fringetile-sweep.sh 2500 30`, 15 shapes, both
 sampling modes): **~1.2x - 1.5x real, ~1.15x - 1.7x complex

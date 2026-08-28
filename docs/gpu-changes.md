@@ -807,7 +807,14 @@ Coverage note: the local `tests/Synthetic` v2d files are scaled down to
 the ragged tail block, so `usb` was also run end-to-end at the committed
 `nChan=4096` (PASS, both pipeline modes) before this was called done.
 
-Still to do: the same A/B on the A100. The design argument for
+**The A100 leg is done (2026-08-28) and the tiling wins there by more.**
+Kernel-level sweep on an A100-SXM4-80GB: 1.07-1.20x at 1-8 bands, **1.48x** at
+the benchmark's 16 x 256, **2.1-2.2x at 32-128 bands**, nothing slower, output
+bit-identical in both sampling modes. The gain grows with band count because the
+untiled lane mapping (`band + nbands*channel`) scatters a warp's stores across
+more bands the more there are. So the gate stays on by default everywhere; the
+wall-clock A/B that suggested otherwise is written up in `BENCHMARKS.md` as the
+measurement error it was. The design argument for
 architecture-independence (fewer excessive sectors, more resident blocks - both
 properties of NVIDIA memory hierarchies, not of Turing) is an argument, not a
 measurement, which is what the env gate is for.

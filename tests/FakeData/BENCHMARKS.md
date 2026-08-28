@@ -104,6 +104,53 @@ still conservative. Refreshing it needs one
 `sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch` at the current
 commit.
 
+## A100 kernel-level sweep, 2026-08-28 (jobs 16004857 / 16004871) - RESOLVED
+
+`fringetile-sweep.sh 2500 30` on an A100-SXM4-80GB (sm_80), one GPU, no MPI, so
+neither node sharing nor srun overhead can reach it. This is the measurement the
+wall-clock A/B below could not make.
+
+| bands x chan | untiled us | tiled us | real | complex |
+|---|---|---|---|---|
+| 1 x 4096 | 147.5 | 124.9 | 1.18x | 1.18x |
+| 1 x 16384 | 565.2 | 470.0 | 1.20x | 1.14x |
+| 2 x 2048 | 150.5 | 138.2 | 1.09x | 1.02x |
+| 3 x 1024 | 139.3 | 91.1 | **1.53x** | 1.40x |
+| 4 x 512 | 78.8 | 73.7 | 1.07x | 1.02x |
+| 6 x 512 | 147.5 | 102.4 | 1.44x | 1.32x |
+| 8 x 256 | 85.0 | 74.8 | 1.14x | 1.10x |
+| **16 x 256** (the benchmark shape) | 212.0 | 143.4 | **1.48x** | 1.38x |
+| 16 x 128 | 107.5 | 69.6 | 1.54x | 1.42x |
+| 32 x 256 | 616.4 | 287.7 | **2.14x** | 1.95x |
+| 64 x 128 | 620.5 | 283.6 | **2.19x** | 1.92x |
+| 128 x 128 | 1281.0 | 588.8 | **2.18x** | 1.92x |
+| 16 x 4096 | 3413.0 | 2367.5 | 1.44x | 1.38x |
+| 1 x 64 | 9.2 | 9.2 | 1.00x | 1.00x |
+| 16 x 64 | 47.1 | 35.8 | 1.32x | 1.27x |
+
+**No shape slower, and `dest` bit-identical at all 15 shapes in both sampling
+modes** - which also re-verifies the kernel on a second architecture.
+
+**The A100 gains more than the 2070, and the gain grows with band count.**
+1.07-1.20x at 1-8 bands, 1.48x at the benchmark's 16, and **2.1-2.2x at 32-128
+bands** (against 1.2-1.4x for the same shapes on the 2070). That is consistent
+with the mechanism: the untiled lane mapping is `band + nbands*channel`, so a
+warp's 32 lanes cover up to 32 *different* bands and the write scatters further
+the more bands there are - and the A100 executes everything else fast enough
+that the wasted sectors dominate more visibly. At 32 vs 64 bands the untiled
+times are equal (616 vs 620 us for the same 8192 elements/window), so this is a
+property of the access pattern, not of the work.
+
+**This resolves the inconclusive wall A/B below.** At the benchmark shape the
+kernel is 1.48x faster, and it is 24.1% of A100 kernel busy, so the expected
+wall effect is 0.241 x (1 - 1/1.48) = 7.8% of kernel busy ~ **5-6% of span** -
+which matches the ~5% the steady-state visibility dumps showed and contradicts
+the -3% the biased wall A/B reported. Two independent measurements agree; the
+wall A/B was the outlier, for the reasons in the next section.
+
+**Decision: `DIFX_GPU_FRINGE_TILE` stays on by default on both architectures.**
+The second acceptance condition (a win on more than one GPU) is met.
+
 ## A100 tiling A/B, 2026-08-28 (job 16004634) - INCONCLUSIVE, and why
 
 `benchprof-fringetile-ab.sbatch` on gina3, **shared node (12/64 cores = 18%)**,

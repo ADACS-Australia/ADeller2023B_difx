@@ -143,8 +143,10 @@ any remaining GPU-side optimisation.
    resident block per SM. Fixed with a shared-memory transpose and a
    256-thread block: 1.35x on the kernel, 7.3% on T5-T1, 1.30-1.54x across 13
    (bands, channels) shapes, gated by `DIFX_GPU_FRINGE_TILE`. See
-   gpu-changes.md §16 and gpu-fringetile-design.md; the A100 A/B is the open
-   half. **DONE so far (2026-07-23):**
+   gpu-changes.md §16 and gpu-fringetile-design.md. **A100 confirmed
+   2026-08-28** by the kernel-level sweep: 1.48x at the benchmark shape and
+   2.1-2.2x at 32-128 bands - a bigger win there than on the 2070 - so the gate
+   stays on by default everywhere. **DONE so far (2026-07-23):**
    the `<<<1,1>>>` `gpu_sum_weights` single-thread reduction (7.7% of A100
    GPU busy) was eliminated by folding its sum into `gpu_set_weights`
    (per-window atomicAdd) - see gpu-changes.md §13.
