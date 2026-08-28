@@ -69,7 +69,7 @@
 # benchprof.v2d, bd247c3.vex.obs and nsys-wrapper.sh) - see the two modes above:
 #     cd <checkout>/tests/FakeData && sbatch --cpus-per-task=5 benchprof-profile-nsys-5s.sbatch
 #
-# The report lands at $WORKDIR/nsys/benchprof-cluster-clean.nsys-rep - scp it
+# The report lands at $WORKDIR/nsys/benchprof-cluster-$PROFILE_TAG.nsys-rep - scp it
 # to the desktop for analysis (login-node nsys is too old to `nsys stats` it).
 
 set -e
@@ -77,7 +77,12 @@ set -e
 # --- config (edit WORKDIR if /fred/oz168/... isn't your scratch) -------------
 SETUP=/home/adeller/setup_gpudifx.claude                    # DiFX build under test
 SRCDIR="${SLURM_SUBMIT_DIR:-$PWD}"                           # holds v2d + vex + wrapper
-WORKDIR=/fred/oz168/adeller/claude/testing/benchprof        # scratch, shared filesystem
+# PROFILE_TAG keeps concurrently queued captures apart: the workdir is wiped at
+# the start of every run, so two legs of an A/B sharing it would delete each
+# other's work, and their reports would collide. Pass a different tag per leg:
+#   sbatch --cpus-per-task=5 --export=ALL,PROFILE_TAG=ac0,DIFX_GPU_XMAC_AUTOCORR=0 ...
+TAG="${PROFILE_TAG:-clean}"
+WORKDIR=/fred/oz168/adeller/claude/testing/benchprof-$TAG   # scratch, shared filesystem
 # -----------------------------------------------------------------------------
 
 . "$SETUP"
@@ -133,6 +138,10 @@ if [ "$nnodes" != 1 ]; then
          "Keep --nodes=1. ==="
 fi
 cores_alloc=$(( ${SLURM_CPUS_PER_TASK:-1} * ${SLURM_NTASKS:-1} ))
+# Say which gates this capture was taken with, so a report file cannot be
+# mistaken for the other leg of an A/B.
+echo "=== gates: DIFX_GPU_XMAC_AUTOCORR=${DIFX_GPU_XMAC_AUTOCORR:-unset}" \
+     "DIFX_GPU_FRINGE_TILE=${DIFX_GPU_FRINGE_TILE:-unset} PROFILE_TAG=$TAG ==="
 cores_node=$(nproc --all)
 pct=$(( 100 * cores_alloc / cores_node ))
 if [ "$pct" -ge 90 ]; then
@@ -157,10 +166,10 @@ difxlogpid=$!
 # One rank per core (--cpu-bind=cores); nsys wraps only the Core rank
 # (CORE_RANK = last rank). The wrapper's rank-0 also clears any stale output.
 CORE_RANK=$(( SLURM_NTASKS - 1 )) \
-NSYS_OUT="$WORKDIR/nsys/benchprof-cluster-clean" \
+NSYS_OUT="$WORKDIR/nsys/benchprof-cluster-$TAG" \
     srun --ntasks="$SLURM_NTASKS" --cpu-bind=cores \
          "$WORKDIR/nsys-wrapper.sh" benchprof_1.input --nocommandthread --usegpu
 
 kill "$difxlogpid" 2>/dev/null || true
 date
-echo "nsys report: $WORKDIR/nsys/benchprof-cluster-clean.nsys-rep"
+echo "nsys report: $WORKDIR/nsys/benchprof-cluster-$TAG.nsys-rep"
