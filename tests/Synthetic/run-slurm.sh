@@ -72,7 +72,7 @@ fi
 # scenario (5 stations) needs >= 7. prep_mode now enforces this per scenario
 # and refuses to queue a job whose configured ntasks is too small, so a
 # mis-sized slurm.conf fails immediately instead of after a queue wait.
-ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi)
+ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi dualpol)
 
 if [ "$#" -gt 0 ]; then
     SCENARIOS=("$@")

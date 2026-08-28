@@ -22,6 +22,20 @@ run-usb-dsb.sh			Real USB vs complex double sideband (USB)
 run-lsb-dsb.sh			Real USB vs complex double sideband (LSB)
 run-complex-complex.sh		Complex USB vs Complex USB (single sindeband)
 
+Two further scenarios exist for the CPU-vs-GPU harnesses (run-local.sh,
+run-slurm.sh) rather than run-all.sh:
+
+test-multi			5 stations x 4 subbands - the multi-datastream
+				and multi-band machinery
+test-dualpol			2 stations, 2 polarisations at the SAME sky
+				frequency, doPolar = True. The only scenario with
+				more than 2 pol products, so the ONLY one that
+				exercises the cross-polarisation autocorrelations
+				(on either the CPU or the GPU path). Added
+				2026-08-28; sized to run as committed (nChan=1024,
+				tInt=2, 60 s scan) rather than needing the manual
+				scale-down the older scenarios get.
+
 
 AUTOMATED REGRESSION ON A SLURM CLUSTER (run-slurm.sh)
 ------------------------------------------------------
@@ -42,7 +56,7 @@ Setup (once):
 
 Run:
 
-    ./run-slurm.sh            # all 7 scenarios
+    ./run-slurm.sh            # all scenarios
     ./run-slurm.sh usb lsb    # just the named scenarios
 
 It creates one self-contained job directory per scenario and mode under WORKDIR

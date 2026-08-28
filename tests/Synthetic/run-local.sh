@@ -45,7 +45,7 @@ state_has() { [ -f "$STATE/$1" ]; }
 
 ######## Scenarios and modes #################################################
 
-ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi)
+ALL_SCENARIOS=(usb lsb usb-complex lsb-complex usb-dsb lsb-dsb complex-complex multi dualpol)
 
 # Scenarios the GPU path rejects by design (lower sideband not implemented).
 GPU_UNSUPPORTED=(lsb lsb-complex usb-dsb lsb-dsb)
