@@ -73,9 +73,23 @@ keep `full` to 1-2 launches, it replays ~20 passes each. Results land in
 `ncu-<tag>.ncu-rep` / `ncu-<tag>.log`.
 
 ```sh
-./fringetile-sweep.sh 2500 30            # real sampling
-SWEEP_COMPLEX=1 ./fringetile-sweep.sh 2500 30   # complex twin
+./fringetile-sweep.sh 2500 30                    # real sampling
+SWEEP_COMPLEX=1 ./fringetile-sweep.sh 2500 30    # complex twin
+SWEEP_PCAL=1 ./fringetile-sweep.sh 2500 20       # + the DOPCAL path
+
+# on OzSTAR (needs a GPU, so under srun):
+srun --gres=gpu:1 --time=15 --mem=8000 --account=oz168 ./fringetile-sweep.sh 2500 30
 ```
+
+Machine-specific bits are env-overridable, and the defaults do the right thing on
+both machines: `SWEEP_SETUP` (the DiFX setup to source - `../../setup.bash` here,
+`$HOME/setup_gpudifx.claude` where `sbatch` exists), `SWEEP_NVCC` (default:
+whatever the setup puts on `PATH`; on OzSTAR that may need `module load cuda`),
+`SWEEP_OUTDIR` (default: this directory here, a scratch dir under `/fred` on the
+cluster, so a shared checkout is never written to) and `SWEEP_ARCH`. The `-arch`
+is taken from the **GPU it is about to run on** rather than from `NVCCFLAGS`: a
+cluster setup carrying the desktop's `-arch=sm_75` would otherwise build a cubin
+the A100 cannot launch.
 
 Sweeps the fused decode+fringe kernel over 13 (bands, channels) shapes, tiled
 (`DIFX_GPU_FRINGE_TILE=1`) versus untiled, and prints per-shape time plus an

@@ -8,24 +8,102 @@
 # times are the shape-independence check that gates landing the tiled path.
 #
 # Usage: ./fringetile-sweep.sh [nBufferedFFTs] [nreps]
+#
+# Runs on the desktop and on the cluster. Nothing here is machine-specific by
+# default - the three things that differ are env-overridable:
+#
+#   SWEEP_SETUP    DiFX setup script to source. Default: ../../setup.bash on a
+#                  machine with no SLURM, $HOME/setup_gpudifx.claude where sbatch
+#                  exists (the same path the sbatch scripts here use).
+#   SWEEP_NVCC     nvcc to build with. Default: whatever is on PATH after the
+#                  setup, else $CUDAROOT/bin/nvcc. On OzSTAR that means the
+#                  setup script (or `module load cuda`) has to put nvcc on PATH -
+#                  this script will say so rather than guessing a path.
+#   SWEEP_OUTDIR   where the binary, the two tables and the pcal dumps go.
+#                  Default: this directory on a desktop; on the cluster a scratch
+#                  dir under /fred, so a shared checkout is never written to.
+#
+# On OzSTAR it needs a GPU, so run it under srun:
+#   srun --gres=gpu:1 --time=15 --mem=8000 --account=oz168 ./fringetile-sweep.sh 2500 30
 set -u
-cd "$(dirname "$0")"
-set +u; source ../../setup.bash >/dev/null 2>&1; set -u
+SRCROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$SRCROOT"
 
-NVCC="${CUDAROOT:-/usr/local/cuda-13.2}/bin/nvcc"
-SRCDIR=../../mpifxcorr/src
-BIN=./fringetile-sweep
+# --- machine-specific bits, all overridable ---------------------------------
+ON_CLUSTER=0
+command -v sbatch >/dev/null 2>&1 && ON_CLUSTER=1
+
+if [ -n "${SWEEP_SETUP:-}" ]; then
+    SETUP="$SWEEP_SETUP"
+elif [ "$ON_CLUSTER" = 1 ]; then
+    SETUP="$HOME/setup_gpudifx.claude"
+else
+    SETUP="$SRCROOT/../../setup.bash"
+fi
+if [ -r "$SETUP" ]; then
+    set +u; . "$SETUP" >/dev/null 2>&1; set -u
+    echo "[fringetile-sweep] sourced $SETUP"
+else
+    echo "[fringetile-sweep] WARNING: no setup script at $SETUP (set SWEEP_SETUP); relying on the current environment"
+fi
+
+if [ -n "${SWEEP_OUTDIR:-}" ]; then
+    OUTDIR="$SWEEP_OUTDIR"
+elif [ "$ON_CLUSTER" = 1 ]; then
+    OUTDIR="/fred/oz168/$USER/claude/testing/fringetile-sweep"
+else
+    OUTDIR="$SRCROOT"
+fi
+mkdir -p "$OUTDIR" || { echo "[fringetile-sweep] cannot create $OUTDIR (set SWEEP_OUTDIR)"; exit 1; }
+
+NVCC="${SWEEP_NVCC:-$(command -v nvcc 2>/dev/null || true)}"
+[ -x "${NVCC:-}" ] || NVCC="${CUDAROOT:+$CUDAROOT/bin/nvcc}"
+if [ ! -x "${NVCC:-}" ]; then
+    echo "[fringetile-sweep] no nvcc found. Put it on PATH (on OzSTAR: module load cuda),"
+    echo "                   or set SWEEP_NVCC=/path/to/nvcc, or CUDAROOT." >&2
+    exit 1
+fi
+# -----------------------------------------------------------------------------
+
+SRCDIR="$SRCROOT/../../mpifxcorr/src"
+BIN="$OUTDIR/fringetile-sweep"
 NBUF="${1:-10}"
 NREPS="${2:-20}"
 
 # Same flags as the mpifxcorr build's .cu rule (see mpifxcorr/src/Makefile.am),
-# so what is measured here is what ships. NVCCFLAGS comes from setup.bash (it
-# carries the -arch for this machine); -arch=native covers a cluster setup
-# script that does not set it, so the same command works on the A100 nodes.
-INC="-I$SRCDIR -I${DIFXROOT}/include"
-ARCH="${NVCCFLAGS:--arch=native}"
-echo "[fringetile-sweep] building with $ARCH ..."
-"$NVCC" $ARCH -O2 $INC -o "$BIN" fringetile-sweep.cu || exit 1
+# so what is measured here is what ships.
+#
+# The -arch comes from the GPU this is about to run on, NOT from NVCCFLAGS: a
+# cluster setup script that inherited the desktop's `-arch=sm_75` would build a
+# cubin the A100 cannot launch ("no kernel image is available"), which is a
+# wasted allocation and a confusing error. Order: SWEEP_ARCH, then the device's
+# own compute capability, then NVCCFLAGS, then -arch=native.
+INC="-I$SRCDIR${DIFXROOT:+ -I$DIFXROOT/include}"
+if [ -n "${SWEEP_ARCH:-}" ]; then
+    ARCH="$SWEEP_ARCH"
+else
+    cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')
+    if [ -n "$cap" ]; then
+        ARCH="-arch=sm_$cap"
+        echo "[fringetile-sweep] this GPU is sm_$cap"
+    else
+        ARCH="${NVCCFLAGS:--arch=native}"
+        echo "[fringetile-sweep] no GPU visible (login node?); building with $ARCH - run under srun on a GPU node"
+    fi
+fi
+echo "[fringetile-sweep] building with $(basename "$NVCC") $ARCH -> $BIN"
+if ! "$NVCC" $ARCH -O2 $INC -o "$BIN" "$SRCROOT/fringetile-sweep.cu"; then
+    if [ "$ARCH" = "-arch=native" ]; then
+        echo "[fringetile-sweep] retrying with -arch=sm_80 (nvcc may predate -arch=native)"
+        "$NVCC" -arch=sm_80 -O2 $INC -o "$BIN" "$SRCROOT/fringetile-sweep.cu" || exit 1
+    else
+        exit 1
+    fi
+fi
+
+# Results (tables, pcal dumps) belong with the run, not in the checkout.
+cd "$OUTDIR"
+echo "[fringetile-sweep] results in $OUTDIR"
 
 # SWEEP_COMPLEX and SWEEP_PCAL are passed through, so the same script covers the
 # complex twin and the DOPCAL path.
