@@ -311,6 +311,15 @@ Two facts checked rather than assumed, because both would have sunk the plan:
 
 ### Increments
 
+**Increment 0 - a dual-polarisation synthetic scenario. DONE 2026-08-28**
+(`tests/Synthetic/test-dualpol.{vex,v2d}`, commit `5f6c3961d`): the usb scenario
+with a second channel at the same sky frequency in the opposite polarisation and
+`doPolar = True`. PASSes CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes and under
+`DIFX_GPU_WEIGHTS_HOST=1`, and the output records were parsed to confirm it
+exercises the path rather than merely running: ant1-ant1 and ant2-ant2 carry RL
+and LR records at rms |V| 3.37 against 5.71 for the parallel hands. The original
+reasoning follows.
+
 **Increment 0 - a dual-polarisation synthetic scenario. Do this first.**
 Every scenario in `tests/Synthetic` is single-pol (all Rcp), so
 `writecrossautocorrs && maxproducts > 2` is never true and **the cross-pol

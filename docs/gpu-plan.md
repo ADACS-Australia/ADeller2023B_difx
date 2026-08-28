@@ -60,7 +60,11 @@ artifact is still pre-§15 and conservative. That is the only open measurement.
 
 **Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
-1. **Autocorrelations into Core/XMAC.** Removes the atomics entirely rather than
+1. **Autocorrelations into Core/XMAC.** Implementation plan and increments are in
+   `gpu-autocorr-design.md`; **increment 0 (a dual-pol synthetic scenario, so the
+   cross-pol autocorrelations are tested at all) landed 2026-08-28**, and
+   increment 1 (per-(baseline, pol) output offsets) is next.
+   Removes the atomics entirely rather than
    reducing them, takes the cross-pol traffic with them, and deletes a whole
    host-tail data path (device→host copy, `vectorCopy_cf32` mirror,
    `averageFrequency`, the `vectorAdd_cf32_I` loop and `autocorrcopylock`).
