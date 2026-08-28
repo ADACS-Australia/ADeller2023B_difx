@@ -59,6 +59,51 @@ Rules:
 | 2026-08-27 | (tiled fused fringe) | gpu, single-thread VDIF | 6.5 | 16.6 | **10.1** | shared-memory transpose in the fused decode+fringe kernel so its band-major write coalesces (gpu-changes.md §16, design in gpu-fringetile-design.md). Same-session A/B against the same binary with `DIFX_GPU_FRINGE_TILE=0`: **10.9 -> 10.1 s (7.3%)**; the kernel itself 948 -> 703 us/call (1.35x) and it is 46.5% of 2070 kernel time. Shape sweep (`fringetile-sweep.sh`, 13 shapes from 1x4096 to 128x128 to 16x4096): **1.30-1.54x, no shape slower**, output bit-identical to the untiled path everywhere. A100 A/B still to run. |
 | 2026-08-27 | (tiled fused fringe) | gpu DIFX_GPU_FRINGE_TILE=0 | 6.8 | 17.7 | 10.9 | the untiled path in the same binary and the same session - the A/B baseline for the row above, and it reproduces the 2026-08-26 10.8 s row, so there is no session drift in the comparison. |
 
+## A100 kernel profile at `edad94b34` (landed 2026-08-28, job 15956983)
+
+The profile that had been queued since 2026-08-26, finally through the queue.
+`benchprof-profile-nsys-5s.sbatch`, gina6, `--cpus-per-task=5` (60/64 cores,
+ledger-quality), 5 s window = 492 subints, single-thread VDIF. Capture and
+analysis kept in `tests/benchprof-28082026/`. **This is the UNTILED build** -
+the kernel is `gpu_fused_fringe`, not `_tiled` - so it is the A100 baseline for
+the tiling work, not an A/B of it.
+
+| quantity | value |
+|---|---|
+| kernel span | 5440 ms |
+| kernel busy | 3924 ms (72.1% of span) |
+| GPU busy (union with memcpy) | **4975 ms = 91.4%** |
+| GPU idle | 466 ms = 8.6% |
+| idle in gaps > 500 us | **0 ms (zero such gaps)** |
+| idle in gaps < 20 us | 452 ms = 97% of idle |
+
+| kernel | us/call | share | us/call before §15 |
+|---|---|---|---|
+| `gpu_resultsrotatorMultiply` | 277.9 | 34.9% | 396.5 (**−30%**) |
+| `gpu_fuse_xmac_and_average` | 246.1 | 24.7% | 258 |
+| `gpu_fused_fringe` | 191.9 | 24.1% | 192 (untouched) |
+| `vector_fft` | 97.8 | 12.3% | 98 |
+
+Two things follow.
+
+**The conjugate-array deletion (§15) pays on the A100 as it did on the 2070:**
+−30% on `gpu_resultsrotatorMultiply` there against −26% here, and every other
+kernel is within a percent of its pre-§15 value, which is what makes the
+attribution safe.
+
+**The between-subints idle problem is finished.** The 2026-07-21 capture had
+35.3% idle with 85.6% of it in gaps > 500 us - a host/data-delivery stall. This
+one has 8.6% idle, **no gap over 500 us at all**, and 97% of what remains in
+sub-20 us inter-kernel gaps. By the heuristic in `gpu-profiling.md` that is
+launch-overhead bound, i.e. what is left for the host side is CUDA graphs, not
+more overlap work.
+
+**Still outstanding for the cost/benefit artifact:** this is a 5 s *profile*, not
+a 20 s wall time, so the `gina4 (A100) 24.5 s` row below is still pre-§15 and
+still conservative. Refreshing it needs one
+`sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch` at the current
+commit.
+
 ## CPU baselines (added 2026-08-27, for the cost/benefit costing)
 
 These exist so the GPU numbers can be compared against something, and because

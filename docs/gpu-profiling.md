@@ -133,6 +133,31 @@ FP64 is the *secondary* cost here (one DFMA per thread; ncu's roofline estimates
 ~19% from an FP32 conversion), which is consistent with the queued precision item
 being worth ~1% when tried on its own.
 
+## Reference numbers — A100-SXM4-80GB at `edad94b34` (2026-08-28)
+
+Job 15956983, gina6, `--cpus-per-task=5`, 5 s window (492 subints),
+single-thread VDIF; capture and sqlite in `tests/benchprof-28082026/`. Untiled
+build (`gpu_fused_fringe`, not `_tiled`).
+
+| quantity | value | 2026-07-21 capture |
+|---|---|---|
+| kernel span | 5440 ms | 8798 ms |
+| kernel busy | 3924 ms (72.1%) | 5088 ms (57.8%) |
+| GPU busy (union) | **4975 ms = 91.4%** | 5695 ms = 64.7% |
+| GPU idle | 466 ms = 8.6% | 3104 ms = 35.3% |
+| idle in gaps > 500 µs | **0 ms** | 2657 ms = 85.6% of idle |
+
+Per-call: `gpu_resultsrotatorMultiply` 277.9 µs (was 396.5 pre-§15, **−30%**),
+`gpu_fuse_xmac_and_average` 246.1, `gpu_fused_fringe` 191.9 (unchanged, as
+expected), `vector_fft` 97.8.
+
+**Read the gap histogram before concluding anything about the host.** By this
+doc's own heuristic the 2026-07 capture was host/data-delivery bound (few big
+gaps); this one is the other case entirely — many small gaps, none over 500 µs —
+so the remaining 8.6% is launch overhead and CUDA graphs is the lever that would
+touch it. The host-tail overlap and unpack-drain work that targeted the big gaps
+has done its job.
+
 ## Reference numbers — A100-SXM4-80GB, commit 7b8e31104 (host-tail overlap)
 
 400 subints, 10 stations. Pre-overlap reference (80f6e291a) in brackets.

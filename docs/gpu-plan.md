@@ -13,11 +13,16 @@ complex-complex, and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both
 to get there, and why, is in `gpu-changes.md` (§5-14, one section per change);
 the numbers are in `BENCHMARKS.md`. The queue below is only what remains.
 
-**Current A100 kernel mix** (5 s profile, 4500 ms kernel busy, before §15):
-`gpu_resultsrotatorMultiply` **42%**, `gpu_fuse_xmac_and_average` 23%,
-`gpu_fused_fringe` 21%, `vector_fft` 11%, everything else <2%. GPU busy-union
-is ~90% of span; residual idle is mostly sub-20 µs inter-kernel gaps. FP64 is
-cheap on the A100, so precision work leans on the 2070.
+**Current A100 kernel mix** (5 s profile at `edad94b34`, 3924 ms kernel busy,
+landed 2026-08-28 - job 15956983, capture in `tests/benchprof-28082026/`):
+`gpu_resultsrotatorMultiply` **34.9%** (277.9 µs/call), `gpu_fuse_xmac_and_average`
+24.7%, `gpu_fused_fringe` 24.1% (191.9 µs/call), `vector_fft` 12.3%, everything
+else <2%. GPU busy-union is **91.4%** of span; the residual 8.6% idle has **no
+gap over 500 µs at all** and 97% of it in sub-20 µs inter-kernel gaps, so the
+host/data-delivery stall that dominated the 2026-07 captures is gone and what is
+left on the host side is launch overhead (CUDA graphs). FP64 is cheap on the
+A100, so precision work leans on the 2070. Note this capture is the **untiled**
+build, so it is the baseline for the tiling A/B, not a measurement of it.
 
 **What actually limits `gpu_resultsrotatorMultiply`** — measured, not assumed
 (`tests/frac-probes/RESULTS.md`, four env-gated timing probes on the A100):
@@ -40,10 +45,13 @@ design.md` holds the resulting three-step plan; §15 was step one.
   stalls the input copies and costs ~10% of wall, invisibly. Each run prints a
   `node ownership:` verdict.
 
-**PENDING:** an A100 profile of `edad94b34` is queued on the cluster.
-When it lands, add the `BENCHMARKS.md` ledger row and refresh `gpu-payback.pdf`
-and its artifact, whose GPU columns are conservative by ~8% because the A100
-figure predates that commit (the conjugate-array deletion).
+**PENDING (narrowed 2026-08-28):** the queued A100 profile of `edad94b34`
+landed and is written up in `BENCHMARKS.md` - it confirms §15 is worth −30% on
+`gpu_resultsrotatorMultiply` there. What it does *not* give is a wall time: it is
+a 5 s nsys profile, so the `gina4 (A100) 24.5 s` figure behind `gpu-payback.pdf`
+and its artifact is still pre-§15 and still conservative. Refreshing that needs
+one `sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch` at the current
+commit, and the tiling A/B (`benchprof-fringetile-ab.sbatch`) is still to run.
 
 **Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
