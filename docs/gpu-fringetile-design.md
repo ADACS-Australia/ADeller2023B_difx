@@ -170,6 +170,17 @@ achieved occupancy, shared bank conflicts.
 cluster sbatch on tooarrana, `--cpus-per-task=5 --nodes=1` per the standing
 rules. Until it reports, the change is 2070-verified only.
 
+**Attempt 1 (2026-08-28, job 16004634) was inconclusive** - written up in
+`BENCHMARKS.md`. On a shared node the per-leg srun launch and teardown cost
+2-3.5 s of a ~24 s leg, and the script's fixed 1,0,1,0 ordering charged that to
+the tiled path every pair, producing a spurious "0.971x". The correlation phase
+alone favoured tiled by ~1 s per leg in both reps, but at the difxlog's
+1-second resolution that is 5% +/- 5%. The script now uses ABBA ordering and a
+discarded warm-up leg. **The measurement that actually settles this is the
+kernel-level sweep on an A100 node** (`fringetile-sweep.sh 2500 30`, ~2 minutes,
+one GPU): it times the kernel rather than a correlation, so neither node sharing
+nor launch overhead can reach it.
+
 ## Risks
 
 | risk | handling |

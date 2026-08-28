@@ -111,21 +111,49 @@ run_leg() { # run_leg <tile 0|1> <rep>
     echo "$wall"
 }
 
-# Interleave the legs (1,0,1,0,...) so any slow drift in the node hits both.
-echo "=== A/B: $REPEATS interleaved pairs, ~20 s data window each leg ==="
+# A discarded warm-up leg first: the first srun of a job pays GPU context init,
+# Lustre metadata and page-cache costs that have nothing to do with the kernel -
+# measured at 2-3.5 s of the ~24 s wall on a shared node, which is several times
+# the effect being measured.
+echo "=== warm-up leg (discarded) ==="
+warm=$(run_leg 1 warmup); echo "  warm-up: ${warm}s (not counted)"
+
+# ABBA ordering: tiled-first on odd reps, untiled-first on even ones. A fixed
+# (1,0,1,0) order is NOT balanced - it charges the first-of-pair penalty to the
+# same path every time, and on the 2026-08-28 A100 run that alone accounted for
+# the whole "tiled is 3% slower" verdict (walls said 0.971x while the
+# correlation phase itself, from the difxlog, favoured tiled).
+echo "=== A/B: $REPEATS ABBA pairs, ~20 s data window each leg ==="
 tiled=""; untiled=""
 for rep in $(seq 1 "$REPEATS"); do
-    w1=$(run_leg 1 "$rep"); echo "  rep $rep tiled   : ${w1}s"
-    w0=$(run_leg 0 "$rep"); echo "  rep $rep untiled : ${w0}s"
+    if [ $(( rep % 2 )) -eq 1 ]; then
+        w1=$(run_leg 1 "$rep"); echo "  rep $rep tiled   : ${w1}s  (first in pair)"
+        w0=$(run_leg 0 "$rep"); echo "  rep $rep untiled : ${w0}s"
+    else
+        w0=$(run_leg 0 "$rep"); echo "  rep $rep untiled : ${w0}s  (first in pair)"
+        w1=$(run_leg 1 "$rep"); echo "  rep $rep tiled   : ${w1}s"
+    fi
     tiled="$tiled $w1"; untiled="$untiled $w0"
 done
 
 echo "=== result ==="
 echo "$tiled|$untiled" | awk -F'|' '{
     n=split($1,a," "); m=split($2,b," ");
-    bt=1e9; for(i=1;i<=n;i++) if(a[i]<bt) bt=a[i];
-    bu=1e9; for(i=1;i<=m;i++) if(b[i]<bu) bu=b[i];
-    printf "best tiled   : %.1fs\nbest untiled : %.1fs\nspeedup      : %.3fx\n", bt, bu, bu/bt;
-    if (bu/bt < 1.0) print "NOTE: tiled is SLOWER here - keep DIFX_GPU_FRINGE_TILE=0 for this architecture and say so in BENCHMARKS.md.";
+    bt=1e9; st=0; for(i=1;i<=n;i++){ if(a[i]<bt) bt=a[i]; st+=a[i] }
+    bu=1e9; su=0; for(i=1;i<=m;i++){ if(b[i]<bu) bu=b[i]; su+=b[i] }
+    printf "tiled   best %.1fs  mean %.1fs  (of %d)\n", bt, st/n, n;
+    printf "untiled best %.1fs  mean %.1fs  (of %d)\n", bu, su/m, m;
+    printf "speedup (best/best) : %.3fx\n", bu/bt;
+    spread = (bt>0) ? 100*(st/n - bt)/bt : 0;
+    if (spread > 2) printf "CAUTION: %.0f%% spread within a path - larger than the effect being measured. Treat this ratio as inconclusive and use the kernel-level measurement instead.\n", spread;
 }'
-echo "Add the numbers to tests/FakeData/BENCHMARKS.md and gpu-fringetile-design.md."
+cat <<'NOTE'
+These walls include per-leg srun launch and teardown, which on a shared node ran
+2-3.5 s of a ~24 s leg - several times the effect being measured. If the ratio
+here is within a few percent of 1.0, it has NOT resolved anything. The
+kernel-level measurement is the one that answers the question, is immune to node
+sharing, and takes ~2 minutes:
+    srun --gres=gpu:1 --time=15 --mem=8000 ./fringetile-sweep.sh 2500 30
+Record whichever you trust in tests/FakeData/BENCHMARKS.md, with the node
+ownership line above.
+NOTE

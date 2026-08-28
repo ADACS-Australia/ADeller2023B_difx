@@ -104,6 +104,45 @@ still conservative. Refreshing it needs one
 `sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch` at the current
 commit.
 
+## A100 tiling A/B, 2026-08-28 (job 16004634) - INCONCLUSIVE, and why
+
+`benchprof-fringetile-ab.sbatch` on gina3, **shared node (12/64 cores = 18%)**,
+2 pairs, ~20 s window per leg. Do not quote the ratio: the run is recorded
+because its failure mode is instructive.
+
+| leg | script wall | correlation phase (difxlog) | outside the correlation |
+|---|---|---|---|
+| tiled rep1 (first in pair) | 25.5 s | 22 s | **3.5 s** |
+| untiled rep1 | 23.3 s | 23 s | 0.3 s |
+| tiled rep2 (first in pair) | 24.0 s | 22 s | **2.0 s** |
+| untiled rep2 | 23.4 s | 22 s | 1.4 s |
+
+The script reported **0.971x - "tiled is slower"** - and that verdict is an
+artifact of two things, neither of which is the kernel:
+
+1. **The A/B ordering was biased.** The script ran the legs 1,0,1,0, so the
+   tiled leg was *always first in its pair* and always paid the first-of-pair
+   cost (srun launch, GPU context init, Lustre metadata). That cost measured
+   2-3.5 s of a ~24 s leg on a shared node - several times the ~5% effect being
+   measured. Fixed: ABBA ordering plus a discarded warm-up leg.
+2. **The correlation phase says the opposite.** Steady-state visibility dumps
+   (20 per leg, from the difxlog) show tiled completing 19 intervals in 19 s in
+   both reps, untiled taking 20 s in both - i.e. tiled ahead by exactly one
+   second of drift, reproducibly. But difxlog timestamps are 1-second resolution,
+   so that is ~5% +/- 5%.
+
+So the two measurements in this run disagree within their uncertainties, and
+neither has the resolution for a few-percent effect on an 18%-owned node.
+
+**What to run instead**: the kernel-level sweep, which times the kernel directly,
+is immune to node sharing and launch overhead, and takes ~2 minutes:
+`srun --gres=gpu:1 --time=15 --mem=8000 ./fringetile-sweep.sh 2500 30`. A wall
+A/B at this effect size needs the fixed script *and* `--cpus-per-task=5`.
+
+`DIFX_GPU_FRINGE_TILE` stays **on** by default on the strength of the 2070
+evidence (1.2-1.5x at every shape, T5-T1 7.3%); the A100 remains unresolved and
+`=0` reverts it per-site with no rebuild.
+
 ## CPU baselines (added 2026-08-27, for the cost/benefit costing)
 
 These exist so the GPU numbers can be compared against something, and because
