@@ -1,0 +1,589 @@
+<title>DiFX GPU Benchmarking Runbook</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+
+<style>
+  :root {
+    --ground:       #F4F6F8;
+    --surface:      #FFFFFF;
+    --surface-sunk: #ECEFF3;
+    --ink:          #121A24;
+    --ink-soft:     #45525F;
+    --ink-faint:    #6E7C8A;
+    --rule:         #D7DDE4;
+    --rule-soft:    #E6EAEF;
+    --accent:       #A85D00;
+    --accent-soft:  #F3E7D5;
+    --good:         #2C6E49;
+    --warn:         #8A6100;
+    --crit:         #A8322A;
+    --code-ink:     #1B2430;
+    --code-ground:  #EDF0F4;
+
+    --f-display: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --f-body:    "Source Serif 4", Georgia, "Times New Roman", serif;
+    --f-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+    --measure: 68ch;
+    --wide:    1040px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:       #10161E;
+      --surface:      #161E28;
+      --surface-sunk: #1C2733;
+      --ink:          #E6EBF1;
+      --ink-soft:     #AEBCC9;
+      --ink-faint:    #7E8D9C;
+      --rule:         #2B3744;
+      --rule-soft:    #232E3A;
+      --accent:       #E8A33D;
+      --accent-soft:  #352A18;
+      --good:         #6BBF8E;
+      --warn:         #D9A63C;
+      --crit:         #E2796F;
+      --code-ink:     #D7E0EA;
+      --code-ground:  #1A232E;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:       #10161E;
+    --surface:      #161E28;
+    --surface-sunk: #1C2733;
+    --ink:          #E6EBF1;
+    --ink-soft:     #AEBCC9;
+    --ink-faint:    #7E8D9C;
+    --rule:         #2B3744;
+    --rule-soft:    #232E3A;
+    --accent:       #E8A33D;
+    --accent-soft:  #352A18;
+    --good:         #6BBF8E;
+    --warn:         #D9A63C;
+    --crit:         #E2796F;
+    --code-ink:     #D7E0EA;
+    --code-ground:  #1A232E;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 17px;
+    line-height: 1.62;
+    margin: 0;
+    padding: 0 24px 96px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: var(--wide); margin: 0 auto; }
+  .col  { max-width: var(--measure); }
+
+  /* ---- masthead ---- */
+  .masthead {
+    padding: 56px 0 28px;
+    border-bottom: 2px solid var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0;
+  }
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: clamp(32px, 5.2vw, 46px);
+    line-height: 1.08;
+    letter-spacing: -0.021em;
+    text-wrap: balance;
+    margin: 0;
+  }
+  .standfirst {
+    font-size: 19px;
+    color: var(--ink-soft);
+    max-width: var(--measure);
+    margin: 0;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 28px;
+    font-family: var(--f-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    margin-top: 6px;
+  }
+  .meta b { color: var(--ink-soft); font-weight: 500; }
+
+  /* ---- sections ---- */
+  section { padding-top: 52px; }
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 26px;
+    letter-spacing: -0.012em;
+    line-height: 1.2;
+    text-wrap: balance;
+    margin: 0 0 6px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--rule);
+  }
+  h3 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 17px;
+    letter-spacing: -0.004em;
+    margin: 30px 0 8px;
+  }
+  p { margin: 0 0 14px; max-width: var(--measure); }
+  .lede { color: var(--ink-soft); margin-top: 14px; }
+  ul, ol { max-width: var(--measure); padding-left: 1.15em; margin: 0 0 14px; }
+  li { margin-bottom: 7px; }
+  strong { font-weight: 600; }
+  em { font-style: italic; }
+
+  code {
+    font-family: var(--f-mono);
+    font-size: 0.855em;
+    background: var(--code-ground);
+    color: var(--code-ink);
+    padding: 0.1em 0.36em;
+    border-radius: 3px;
+  }
+
+  pre {
+    font-family: var(--f-mono);
+    font-size: 13.2px;
+    line-height: 1.65;
+    background: var(--code-ground);
+    color: var(--code-ink);
+    border: 1px solid var(--rule-soft);
+    border-radius: 4px;
+    padding: 15px 18px;
+    margin: 0 0 16px;
+    overflow-x: auto;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+  pre .c { color: var(--ink-faint); }
+  pre .k { color: var(--accent); font-weight: 500; }
+
+  /* ---- numbered setup steps: honest sequence ---- */
+  .steps { list-style: none; padding: 0; margin: 20px 0 0; max-width: var(--wide); counter-reset: step; }
+  .steps > li {
+    counter-increment: step;
+    display: grid;
+    grid-template-columns: 34px 1fr;
+    gap: 0 16px;
+    padding-bottom: 26px;
+    margin: 0;
+  }
+  .steps > li::before {
+    content: counter(step);
+    font-family: var(--f-mono);
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--accent);
+    border: 1px solid var(--rule);
+    border-radius: 50%;
+    width: 28px; height: 28px;
+    display: grid; place-items: center;
+    margin-top: 2px;
+  }
+  .steps h3 { margin: 2px 0 8px; }
+  .steps > li > div { min-width: 0; }
+
+  /* ---- tables ---- */
+  .tablewrap { overflow-x: auto; margin: 0 0 18px; max-width: var(--wide); }
+  table { border-collapse: collapse; width: 100%; font-size: 14.5px; }
+  caption {
+    text-align: left;
+    font-family: var(--f-mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-bottom: 9px;
+  }
+  th, td {
+    text-align: left;
+    padding: 9px 16px 9px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 12.5px;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  td.num { font-family: var(--f-mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td code { white-space: nowrap; }
+
+  /* ---- callouts ---- */
+  .note {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 16px 20px;
+    margin: 0 0 18px;
+    max-width: var(--wide);
+  }
+  .note p:last-child { margin-bottom: 0; }
+  .note .label {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    display: block;
+    margin-bottom: 7px;
+  }
+  .note.warn  { background: var(--accent-soft); border-color: var(--accent); }
+  .note.warn  .label { color: var(--accent); }
+  .note.plain .label { color: var(--ink-faint); }
+
+  .tag {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .tag.pass { color: var(--good); background: color-mix(in srgb, var(--good) 13%, transparent); }
+  .tag.open { color: var(--warn); background: color-mix(in srgb, var(--warn) 15%, transparent); }
+  .tag.off  { color: var(--ink-faint); background: var(--surface-sunk); }
+
+  footer {
+    margin-top: 60px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--f-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    max-width: var(--wide);
+  }
+
+  @media (max-width: 640px) {
+    body { font-size: 16px; padding: 0 18px 64px; }
+    .steps > li { grid-template-columns: 1fr; gap: 0; }
+    .steps > li::before { margin-bottom: 10px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<div class="wrap">
+
+  <header class="masthead">
+    <p class="eyebrow">DiFX GPU correlator · ADeller2023B_difx</p>
+    <h1>DiFX GPU Benchmarking Runbook</h1>
+    <p class="standfirst">How to measure the GPU correlator — on a desktop with one card, and on the OzSTAR A100 nodes. Every command here runs from a clean checkout of the <code>adam-performance-gains</code> branch.</p>
+    <div class="meta">
+      <span><b>Branch</b> adam-performance-gains</span>
+      <span><b>Verified at</b> 5ba5d045c</span>
+      <span><b>Updated</b> 2026-10-12</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>The two harnesses, and which question each answers</h2>
+    <p class="lede">They are not interchangeable, and using the wrong one is how this project has produced its wrong conclusions.</p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>What to reach for</caption>
+        <thead>
+          <tr><th>Harness</th><th>Answers</th><th>Does not answer</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>tests/Synthetic</code></td>
+            <td><strong>Is the GPU path still correct?</strong> Correlates each scenario on CPU and GPU and diffs the visibilities.</td>
+            <td>Anything about speed — the scenarios are tiny.</td>
+          </tr>
+          <tr>
+            <td><code>tests/FakeData</code></td>
+            <td><strong>Is it faster?</strong> A 10-station, 16 × 32 MHz, 2 Gbps/station job using <code>source = fake</code>, so no baseband data is needed.</td>
+            <td>Correctness. The fake streams are pathological by design — never gate on them.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note warn">
+      <span class="label">The rule that costs the most when ignored</span>
+      <p><strong>If the effect you are chasing is a few percent of one kernel, measure the kernel — not a correlation.</strong> A wall-clock A/B on a shared cluster node once returned the wrong <em>sign</em> on a 5% kernel win, because per-run launch and teardown cost 2–3.5 s of a 24 s leg. The kernel-level sweep settled the same question in two minutes and is immune to co-tenants.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>One-time setup</h2>
+
+    <ol class="steps">
+      <li>
+        <div>
+          <h3>Get the branch</h3>
+<pre><code>git clone git@github.com:ADACS-Australia/ADeller2023B_difx.git
+cd ADeller2023B_difx
+git checkout adam-performance-gains</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Point <code>setup.bash</code> at your machine</h3>
+          <p>Copy the repo-root <code>setup.bash</code> and edit <code>DIFXROOT</code>, <code>IPPROOT</code>, <code>MPICXX</code>, <code>CUDAROOT</code> and <code>NVCCFLAGS</code> (<code>-arch=</code> for <em>your</em> card: <code>sm_75</code> Turing, <code>sm_80</code> A100, <code>sm_89</code> Ada). Source it in every shell that runs DiFX.</p>
+<pre><code>source setup.bash</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Build with CUDA</h3>
+<pre><code>./install-difx --withcuda --makeflags='-j 8'</code></pre>
+          <p>For later rebuilds of just the correlator, <code>./rebuild-mpifxcorr.sh 8</code> does clean → make → <strong>make install</strong> in one step. The <code>make install</code> is not optional: a stale installed binary masquerading as a new build has cost this project entire sessions.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Verify you are running what you think you are</h3>
+<pre><code>ls -l $(which mpifxcorr)                              <span class="c"># newer than your last edit?</span>
+strings $(which mpifxcorr) | grep DIFX_GPU_FRINGE_TILE <span class="c"># gate present = new code</span></code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Generate the synthetic test data</h3>
+          <p>Only <code>tests/Synthetic</code> needs real files; FakeData fabricates its own. This writes ~2 GB of VDIF and takes a few minutes.</p>
+<pre><code>cd tests/Synthetic &amp;&amp; ./createData.sh</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <h3>Pre-generate the 2-station profiling job</h3>
+          <p><code>run-bench.sh</code> builds its own jobs, but the two profiling harnesses expect <code>benchprof2_1.input</code> to exist already. Do this once:</p>
+<pre><code>cd tests/FakeData
+vex2difx benchprof2.v2d &amp;&amp; difxcalc benchprof2_1.calc</code></pre>
+        </div>
+      </li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Running locally</h2>
+    <p class="lede">All four of these run on a single desktop GPU. Start with correctness; a performance number from an incorrect build is worth nothing.</p>
+
+    <h3>Correctness — CPU vs GPU, every scenario</h3>
+<pre><code>cd tests/Synthetic
+./run-local.sh                      <span class="c"># all scenarios</span>
+./run-local.sh usb dualpol          <span class="c"># just these two</span></code></pre>
+    <p>Each scenario is correlated three times — CPU, GPU with <code>DIFX_GPU_PIPELINE=0</code>, GPU with <code>=1</code> — and the raw visibilities are diffed. <strong>Both GPU columns must read PASS.</strong> The LSB scenarios report SKIP: the GPU path declines lower sideband by design.</p>
+    <p>Expect ~10 minutes for the full set. Diff logs land under <code>local-runs/&lt;scenario&gt;/diff/</code>.</p>
+
+    <div class="note plain">
+      <span class="label">A trap in the tooling</span>
+      <p><code>diffDiFX.py</code> <strong>always exits 0</strong>. It signals problems only by printing <code>THRESHOLD EXCEEDED!</code> or header-disagreement lines, which the harness parses for you. Never gate a script on its exit code.</p>
+    </div>
+
+    <h3>Throughput — the ledger metric</h3>
+<pre><code>cd tests/FakeData
+./run-bench.sh 3                    <span class="c"># 3 repeats, best-of-3 reported</span>
+USEGPU=0 ./run-bench.sh 3           <span class="c"># CPU path for comparison</span>
+EXTRA_ENV="DIFX_GPU_FRINGE_TILE=0" ./run-bench.sh 3</code></pre>
+    <p>The metric is <strong>T5 − T1</strong>: wall time of a 5 s correlation minus a 1 s one, which cancels the large constant start-up and shutdown costs and leaves the steady-state rate. It prints a ready-made row for <code>BENCHMARKS.md</code>.</p>
+    <p>It defaults to rewriting the job to <strong>single-thread VDIF</strong>, bypassing the DataStream interlaced-VDIF corner-turn. That is deliberate: the corner-turn is CPU-bound at ~1.7 Gbps/core and starves the GPU, so leaving it in measures the demultiplexer rather than the correlator. Set <code>SINGLE_THREAD_VDIF=0</code> only when the demux is what you are studying.</p>
+
+    <h3>Per-kernel A/B across many data shapes</h3>
+<pre><code>cd tests/FakeData
+./fringetile-sweep.sh 2500 30                  <span class="c"># real sampling</span>
+SWEEP_COMPLEX=1 ./fringetile-sweep.sh 2500 30  <span class="c"># complex twin</span>
+SWEEP_PCAL=1    ./fringetile-sweep.sh 2500 20  <span class="c"># + the phase-cal path</span></code></pre>
+    <p>This drives the <em>shipped</em> fused decode+fringe launcher over 15 (bands, channels) shapes from 1×64 to 128×128, on both the tiled and untiled paths, and prints per-shape speedup plus an output hash. Because both paths do identical arithmetic in identical order, <strong>equal hashes are an exact correctness check</strong> — covering odd band counts and partial tiles no DiFX scenario exercises.</p>
+    <p>Pass <code>2500 30</code>, not the defaults. At the default 10 windows the launch is latency-dominated and every shape reads ~1.0×; below ~30 repeats the largest shape swings 18% on warm-up alone.</p>
+
+    <h3>Profiles — what a kernel is bound by</h3>
+<pre><code>cd tests/FakeData
+./nsys-frac.sh &lt;tag&gt;                       <span class="c"># timeline + kernel mix</span>
+./ncu-frac.sh  &lt;tag&gt; metrics               <span class="c"># cheap fixed metric list</span>
+./ncu-frac.sh  &lt;tag&gt; full 'gpu_fused_fringe'  <span class="c"># + warp-stall reasons</span></code></pre>
+    <p><code>ncu</code> needs unrestricted GPU performance counters, or it fails with <code>ERR_NVGPUCTRPERM</code>. Check with <code>grep RmProfilingAdminOnly /proc/driver/nvidia/params</code> — you want <code>0</code>. If it reads <code>1</code>, add <code>options nvidia NVreg_RestrictProfilingToAdminUsers=0</code> to <code>/etc/modprobe.d/</code> and reboot.</p>
+    <p>Keep <code>full</code> to one or two launches: it replays each roughly twenty times.</p>
+  </section>
+
+  <section>
+    <h2>Running on OzSTAR</h2>
+    <p class="lede">Every script below has an editable config block in its first ~20 lines — <code>SETUP</code>, <code>SRCDIR</code>, <code>WORKDIR</code>. Point <code>SETUP</code> at your own DiFX setup script and <code>WORKDIR</code> at your own scratch under <code>/fred</code> before the first submission.</p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Submit from tests/FakeData</caption>
+        <thead>
+          <tr><th>Script</th><th>Gives</th><th>Needs the node?</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>benchprof-profile-nsys-5s.sbatch</code></td>
+            <td>A 5 s Nsight Systems capture — kernel mix, µs/call, GPU busy/idle, NVTX phases.</td>
+            <td>No — per-kernel figures shrug off co-tenants.</td>
+          </tr>
+          <tr>
+            <td><code>benchprof-profile-nonsys-20s.sbatch</code></td>
+            <td>A 20 s bare run. Its whole output is an absolute wall time.</td>
+            <td><strong>Yes.</strong></td>
+          </tr>
+          <tr>
+            <td><code>benchprof-fringetile-ab.sbatch</code></td>
+            <td>An interleaved A/B of two gate states in one allocation.</td>
+            <td>Preferably — but read the caution below.</td>
+          </tr>
+          <tr>
+            <td><code>benchprof-cpu-20s.sbatch</code></td>
+            <td>The CPU-only baseline. Sweep threads with <code>--export=ALL,NTHREAD=40</code>.</td>
+            <td>Yes, for a quotable number.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Reserving the node</h3>
+<pre><code>sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch   <span class="c"># ledger-quality</span>
+sbatch                   benchprof-profile-nonsys-20s.sbatch   <span class="c"># quick look only</span></code></pre>
+    <p>OzSTAR rejects <code>--exclusive</code>, so isolation comes from reserving most of the node: <code>--cpus-per-task=5</code> × 12 tasks = 60 of gina's 64 cores. It does <strong>not</strong> start more MPI ranks — that is <code>--ntasks</code>; the extra cores are simply held. A co-tenant job stalls the input copies and costs ~10% of wall with no other symptom, so every script prints a <code>node ownership: N/M cores</code> verdict. Read it before quoting any wall time.</p>
+
+    <div class="note warn">
+      <span class="label">Keep --nodes=1</span>
+      <p>Without it, SLURM satisfies a wide <code>--cpus-per-task</code> by splitting the twelve ranks across two nodes. <code>--gres</code> is a <em>per-node</em> request, so that reserves a GPU on each and uses one, and DataStream→Core traffic leaves intra-node shared memory for the fabric. All the scripts pin it and warn if it is overridden.</p>
+    </div>
+
+    <h3>Two captures at once</h3>
+<pre><code>sbatch --cpus-per-task=5 --export=ALL,PROFILE_TAG=ac0,DIFX_GPU_XMAC_AUTOCORR=0 benchprof-profile-nsys-5s.sbatch
+sbatch --cpus-per-task=5 --export=ALL,PROFILE_TAG=ac1,DIFX_GPU_XMAC_AUTOCORR=1 benchprof-profile-nsys-5s.sbatch</code></pre>
+    <p><code>PROFILE_TAG</code> keeps the two legs in separate workdirs and report names — without it they share a scratch directory that each wipes on startup. Each run echoes its gate settings into the mpilog, so a report can never be mistaken for the other leg.</p>
+
+    <h3>Getting the numbers out</h3>
+    <p>The login node's <code>nsys</code> is older than the captures and cannot export them. Copy the <code>.nsys-rep</code> to a machine with a current toolkit and run the repo's own analyser, which prints every summary in one pass:</p>
+<pre><code>tests/FakeData/nsys-analyze.py &lt;capture&gt;.nsys-rep</code></pre>
+    <p>The kernel-level sweep also runs on OzSTAR, needing only one GPU and a couple of cores — usually a near-instant allocation:</p>
+<pre><code>srun --gres=gpu:1 --time=15 --mem=8000 --account=oz168 ./fringetile-sweep.sh 2500 30</code></pre>
+  </section>
+
+  <section>
+    <h2>Runtime gates</h2>
+    <p class="lede">All read from the environment at startup, so A/B pairs need no rebuild. Pass them through <code>EXTRA_ENV=</code> to <code>run-bench.sh</code>, or <code>--export=ALL,VAR=value</code> to <code>sbatch</code>.</p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>mpifxcorr GPU environment variables</caption>
+        <thead>
+          <tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>DIFX_GPU_PIPELINE</code></td>
+            <td class="num">1</td>
+            <td>Intra-subint host-tail overlap. <code>0</code> is the synchronous path. Both must pass correctness.</td>
+          </tr>
+          <tr>
+            <td><code>DIFX_GPU_FRINGE_TILE</code></td>
+            <td class="num">on</td>
+            <td>Shared-memory transpose in the fused decode+fringe kernel. <span class="tag pass">1.2–2.2×</span> on both cards tested; <code>0</code> restores the old kernel.</td>
+          </tr>
+          <tr>
+            <td><code>DIFX_GPU_XMAC_AUTOCORR</code></td>
+            <td class="num">off</td>
+            <td>Autocorrelations computed in the XMAC as ordinary baselines. <span class="tag off">7% slower on a 2070</span> — the A100 verdict is still open.</td>
+          </tr>
+          <tr>
+            <td><code>DIFX_GPU_WEIGHTS_HOST</code></td>
+            <td class="num">off</td>
+            <td>Falls back to host-side weight accumulation. A correctness cross-check, not a performance option.</td>
+          </tr>
+          <tr>
+            <td><code>DIFX_GPU_PIN_INPUT</code></td>
+            <td class="num">on</td>
+            <td>Page-locked Core receive buffers, so input DMAs skip a host staging copy.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p><strong>Harness-side knobs:</strong> <code>SINGLE_THREAD_VDIF=0</code> keeps the interlaced demux; <code>USEGPU=0</code> benchmarks the CPU path; <code>SWEEP_COMPLEX</code> / <code>SWEEP_PCAL</code> select the sweep's sampling mode and phase-cal leg; <code>SWEEP_SETUP</code>, <code>SWEEP_NVCC</code>, <code>SWEEP_OUTDIR</code> and <code>SWEEP_ARCH</code> override the sweep's machine detection.</p>
+  </section>
+
+  <section>
+    <h2>Three findings that shape how you measure</h2>
+    <p class="lede">Each of these was learned by reaching a wrong conclusion first.</p>
+
+    <h3>The two cards disagree, and the answer does not transfer</h3>
+    <p>The kernel mix on an RTX 2070 is nothing like an A100's — <code>gpu_fused_fringe</code> is 46.5% of kernel time on one and ~21% on the other. Atomics in the fractional-rotation kernel measured 24% of it on the A100 and <strong>0.0%</strong> on the 2070. A "what is this bound by" answer is a property of the card, so measure on the card you care about, and say which card any number came from.</p>
+
+    <h3>Benchmark single-threaded, then remember you did</h3>
+    <p>The interlaced-VDIF corner-turn runs at ~1.7 Gbps per core, so a VGOS-rate 4 × 16 Gbps observation would need ~38 cores doing nothing but demultiplexing — more silicon than the correlation. Bypassing it is right for measuring the correlator and <em>misleading</em> for specifying hardware.</p>
+
+    <h3>Stale baselines produce confident nonsense</h3>
+    <p>The autocorrelation work was planned from probe numbers taken before an earlier change had already removed what made that work expensive. The plan predicted a 12–15% win; the measurement showed a 7% loss. Before sizing anything from a recorded number, check what landed after it.</p>
+  </section>
+
+  <section>
+    <h2>Open measurements</h2>
+    <p class="lede">Two cluster runs would each settle a question that is currently blocked. Neither had reported as of 2026-10-12.</p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th>Run</th><th>Settles</th><th>Status</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Autocorrelation A/B on the A100 — the two <code>PROFILE_TAG=ac0/ac1</code> captures above</td>
+            <td>Whether <code>DIFX_GPU_XMAC_AUTOCORR</code> is worth keeping. Compare <code>gpu_resultsrotatorMultiply</code> µs/call (what autocorrelations cost today) against <code>gpu_fuse_xmac_and_average</code> µs/call (what moving them costs), plus NVTX <code>host_finalize</code>.</td>
+            <td><span class="tag open">open</span></td>
+          </tr>
+          <tr>
+            <td>20 s wall run at the current commit</td>
+            <td>Refreshes the A100 figure behind the cost/benefit write-up, which still predates both the conjugate-array removal and the tiling, and so understates the GPU.</td>
+            <td><span class="tag open">open</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Where things are written down</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>File</th><th>Holds</th></tr></thead>
+        <tbody>
+          <tr><td><code>docs/gpu-plan.md</code></td><td>The living plan — where the work stands, what is queued, what was rejected. Canonical, ahead of anything remembered.</td></tr>
+          <tr><td><code>docs/gpu-changes.md</code></td><td>Prose record, one section per substantive change (settled sections in <code>gpu-changes-archive.md</code>).</td></tr>
+          <tr><td><code>tests/FakeData/BENCHMARKS.md</code></td><td>The numbers ledger, plus the protocol for producing a quotable one.</td></tr>
+          <tr><td><code>docs/gpu-profiling.md</code></td><td>How to profile, reference captures, and the measurement pitfalls.</td></tr>
+          <tr><td><code>tests/Synthetic/README</code>, <code>tests/FakeData/README.md</code></td><td>Per-harness detail, including every scenario and what it covers.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Every landed change gets a <code>run-bench.sh</code> row in <code>BENCHMARKS.md</code> and a section in <code>gpu-changes.md</code>, written at the time of the change. A measurement that is not written down did not happen.</p>
+  </section>
+
+  <footer>
+    DiFX GPU correlator · ADACS-Australia/ADeller2023B_difx · branch adam-performance-gains · verified at commit 5ba5d045c
+  </footer>
+
+</div>

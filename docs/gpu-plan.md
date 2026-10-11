@@ -6,6 +6,11 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 
 ## Where we are
 
+**New here?** `docs/difx-gpu-benchmarking.pdf` (source:
+`difx-gpu-benchmarking.html`) is the standalone runbook for running the
+benchmarks locally and on OzSTAR — setup, every harness, the runtime gates, and
+the measurement pitfalls. Written to be handed to a collaborator on its own.
+
 ### Last session (2026-08-27/28) in brief
 
 `ncu` became usable on ar313, and using it immediately paid: it found
