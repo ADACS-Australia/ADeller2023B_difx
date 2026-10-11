@@ -35,6 +35,7 @@ are the ones that still bear on current work.
 - **§14. Input-transfer speed: contention, not NUMA placement (2026-08-26)** — input-transfer speed: contention, not NUMA placement - **source of the standing benchmark rules**
 - **§15. The materialised conjugate array is gone (2026-08-26)** — the materialised conjugate array deleted
 - **§16. Tiled fused fringe: a shared-memory transpose for the write (2026-08-27)** — tiled fused fringe: a shared-memory transpose for the write
+- **§17. Autocorrelations as XMAC baselines: built, measured, not landed (2026-08-28)** — correct, gated off, and a 7% loss on the 2070; the A100 decides
 
 ## 10. The real bottleneck: DataStream interlaced-VDIF corner-turn (2026-07-22)
 
@@ -465,3 +466,60 @@ measurement error it was. The design argument for
 architecture-independence (fewer excessive sectors, more resident blocks - both
 properties of NVIDIA memory hierarchies, not of Turing) is an argument, not a
 measurement, which is what the env gate is for.
+
+## 17. Autocorrelations as XMAC baselines: built, measured, not landed (2026-08-28)
+
+An autocorrelation is a baseline whose two antennas are the same, so it can be
+handed to `gpu_fuse_xmac_and_average` as an ordinary baseline and written
+straight into the results buffer - deleting the Mode-side accumulation, its
+per-subint device buffer and D2H, the host mirror copies, `averageFrequency`,
+and the `autocorrcopylock` fold in `Core::processdata`. The prize named in
+`gpu-autocorr-design.md` was the A100's atomics (24% of its largest kernel) plus
+that whole host tail.
+
+It is implemented and correct, behind **`DIFX_GPU_XMAC_AUTOCORR`** (default
+**off**). With the gate on, `GPUCore` adds one autocorrelation baseline per
+(datastream, frequency) carrying that frequency's polarisation products, and
+`gpu_resultsrotatorMultiply` - templated on `DOAUTOCORR` - compiles out its
+atomics and its entire cross-pol pass. All GPU-eligible Synthetic scenarios PASS
+CPU-vs-GPU in both `DIFX_GPU_PIPELINE` modes, gate on **and** off, and under
+`DIFX_GPU_WEIGHTS_HOST=1`.
+
+**But on the 2070 it is a 7% loss, and the reason is the interesting part.**
+10-station `benchsimreal`, gate off -> on: `gpu_fuse_xmac_and_average`
+1826.9 -> 2334.8 us/call (**+27.8%, +508 ms**) while `gpu_resultsrotatorMultiply`
+gives back **12 ms** (767.5 -> 755.7). Kernel busy +8.7%; T5-T1 10.1 -> 10.8 s.
+
+The plan was sized from the 2026-08-26 probes (atomics 24% of the rotator,
+cross-pol traffic 25%), and **those were taken before §15 deleted the
+materialised conjugate array**. §15 cut that kernel 26-30%, and what it removed
+*was* the cross-pol phase's expensive part - the phase used to read an 82 MB/mode
+array and now re-reads `gpufftd` from cache. So on the 2070 the autocorrelation
+work in the rotator is already nearly free, and moving it trades something free
+for something that costs 27.8% of another kernel. **Pre-§15 probe numbers must
+not be used to size any further autocorrelation work.**
+
+Two things were got wrong on the way and are worth remembering. The first plan
+emitted one baseline *per output run* and put every one in *every* frequency's
+plan - 365 baselines x 4 products with 85% of block-columns idle - and the
+extrapolation that "justified" abandoning the design compared self runs *in
+total* against cross runs *per frequency*. Like for like it is +22%, i.e. the
+45 -> 55 the design said all along. Second, the results buffer is **not**
+`[xcorrs][autocorrs]`: it is `[visibilities][baseline weights][shift decorr]
+[autocorrs][ac weights][pcals]`, so a single straight-through staging copy zeroed
+the baseline weights and made `Visibility` drop every cross-correlation record.
+The staged copy now carries two disjoint ranges from one transfer.
+
+**Open:** the A100 is the deciding measurement - it is the only card where the
+atomics are exposed (24% there pre-§15, 0.0% on the bandwidth-different 2070).
+Two captures settle it; the recipe is in `BENCHMARKS.md`. If the A100 also says
+no, the cheap variant is to fold the *parallel* autocorrelations into the
+existing cross-baseline blocks, where `v1` and `v2` are already in registers and
+cost an FMA and no extra reads, leaving the cross-pol pass in the rotator where
+§15 already made it cheap.
+
+**STA casualty:** with device autocorrelations there is nothing for a Short Term
+Accumulate dump to read, so it is declined with a one-time warning rather than
+multicasting stale spectra. `DIFX_GPU_XMAC_AUTOCORR=0` restores both the Mode
+path and STA.
+

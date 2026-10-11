@@ -6,6 +6,36 @@ Living plan for the GPU work on `adam-performance-gains`. Companion to
 
 ## Where we are
 
+### Last session (2026-08-27/28) in brief
+
+`ncu` became usable on ar313, and using it immediately paid: it found
+`gpu_fused_fringe` - 46.5% of 2070 kernel time, never examined because it is
+only ~21% on the A100 - latency-bound on an uncoalesced band-major write with a
+1024-thread block that left one resident block per SM. The **tiled fused fringe**
+(§16) fixes it with a shared-memory transpose: 1.35x on the 2070, **1.48x at the
+benchmark shape and 2.1-2.2x at 32-128 bands on the A100**, no shape slower
+across 15 (bands, channels) shapes in both sampling modes, **T5-T1 10.9 -> 10.1 s**.
+Landed and on by default.
+
+Then **autocorrelations as XMAC baselines** (§17): built, correct, gated off,
+and a 7% *loss* on the 2070 because §15 had already made the rotator's
+autocorrelation work nearly free. The A100 is the deciding measurement and has
+not been run.
+
+Also: a **dual-polarisation synthetic scenario** (`test-dualpol`), because every
+other scenario was single-pol and the cross-pol autocorrelations had no test
+coverage on either path; the queued **A100 profile of `edad94b34`** landed and
+confirmed §15 is worth −30% there, with the between-subints idle problem now
+finished (busy-union 91.4%, no gap over 500 µs); and the docs were split into
+live + archive files.
+
+**Two measurement lessons from the session, both of which cost a wrong
+conclusion:** a shared-node wall-clock A/B cannot see a 5% kernel effect - measure
+the kernel (`gpu-profiling.md`, "Measurement pitfall"); and **pre-§15 probe
+numbers must not be used to size autocorrelation work**, since §15 removed what
+made that work expensive.
+
+
 **Correctness: done** for the USB scenarios (usb, usb-complex, complex-complex
 and the 5-station/4-subband `multi` PASS CPU-vs-GPU in both `DIFX_GPU_PIPELINE`
 modes; LSB deliberately unimplemented). We are in the **performance** phase:
@@ -53,10 +83,26 @@ the kernel, not a correlation.** A shared-node wall-clock A/B of the tiling
 returned the wrong sign; the 2-minute kernel sweep settled it. See
 `gpu-profiling.md`, "Measurement pitfall".
 
-**PENDING:** a 20 s wall run at the current commit
-(`sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch`, queued
-2026-08-28) — the `gina4 (A100) 24.5 s` figure behind `gpu-payback.pdf` and its
-artifact is still pre-§15 and conservative. That is the only open measurement.
+**PENDING — two cluster runs, neither of which has reported** (checked
+2026-10-12: no new captures have been copied back):
+
+1. **The autocorrelation A/B on the A100** — the deciding measurement for §17,
+   and the thing blocking the item below. Two captures:
+   ```
+   sbatch --cpus-per-task=5 --export=ALL,PROFILE_TAG=ac0,DIFX_GPU_XMAC_AUTOCORR=0 benchprof-profile-nsys-5s.sbatch
+   sbatch --cpus-per-task=5 --export=ALL,PROFILE_TAG=ac1,DIFX_GPU_XMAC_AUTOCORR=1 benchprof-profile-nsys-5s.sbatch
+   ```
+   Compare `gpu_resultsrotatorMultiply` µs/call (ac0−ac1 = what autocorrelations
+   cost in the *old* path there; 11.8 µs, 1.5%, on the 2070),
+   `gpu_fuse_xmac_and_average` µs/call (ac1−ac0 = what moving them costs; +508 µs,
+   +27.8%, on the 2070), and NVTX `host_finalize` for the tail saving. Kernel
+   µs/call is insensitive to co-tenants, so a plain `sbatch` will do if the queue
+   is bad.
+2. **A 20 s wall run at the current commit**
+   (`sbatch --cpus-per-task=5 benchprof-profile-nonsys-20s.sbatch`) — the
+   `gina4 (A100) 24.5 s` figure behind `gpu-payback.pdf` is still pre-§15 and
+   pre-tiling, so conservative. This one *does* need the node, since its whole
+   output is an absolute wall time.
 
 **Agreed order from here** (2026-08-27; design in `gpu-autocorr-design.md`):
 
