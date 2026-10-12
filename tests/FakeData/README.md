@@ -10,6 +10,11 @@ the antenna-window, threads-file, VDIF-format and subintNS choices.
 
 ## Run
 
+> A standalone runbook covering both this directory and `tests/Synthetic`, local
+> and on OzSTAR — including the runtime gates and the measurement pitfalls — is
+> `docs/difx-gpu-benchmarking.pdf`.
+
+
 ```sh
 source ../../setup.bash
 vex2difx benchsimreal.v2d && difxcalc benchsimreal_1.calc
