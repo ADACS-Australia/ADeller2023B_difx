@@ -364,7 +364,14 @@ git checkout adam-performance-gains</code></pre>
         <div>
           <h3>Verify you are running what you think you are</h3>
 <pre><code>ls -l $(which mpifxcorr)                              <span class="c"># newer than your last edit?</span>
-strings $(which mpifxcorr) | grep DIFX_GPU_FRINGE_TILE <span class="c"># gate present = new code</span></code></pre>
+strings $(which mpifxcorr) | grep DIFX_GPU_FRINGE_TILE <span class="c"># gate present = new code</span>
+
+which diffDiFX.py                                     <span class="c"># must be $DIFXROOT/bin, not an older DiFX</span>
+diffDiFX.py --help | grep diagnose                    <span class="c"># present = vis2screen is installed</span></code></pre>
+          <div class="note plain">
+            <span class="label">Check the Python utilities too</span>
+            <p>The correctness harness calls <code>diffDiFX.py --diagnose</code>, which ships in the <strong>vis2screen</strong> component — a different build target from the correlator. If that check prints <code>no such option: --diagnose</code>, you are running an older DiFX's copy: either vis2screen did not install (<code>./install-difx --doonly='vis2screen'</code>), or another DiFX sits ahead of <code>$DIFXROOT/bin</code> on <code>PATH</code>. <code>ls -l $DIFXROOT/bin/diffDiFX.py</code> tells you which.</p>
+          </div>
         </div>
       </li>
       <li>
