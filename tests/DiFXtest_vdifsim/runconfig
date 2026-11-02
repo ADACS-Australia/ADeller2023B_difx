@@ -1,0 +1,93 @@
+cmd=(python3-conda config.py)
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in 
+        -v|--verbose)
+            cmd+=(-v)
+            shift
+            ;;
+        --ver|--version)
+            cmd+=(--ver)
+            shift
+            ;;
+        --debug)
+            cmd+=(--debug)
+            shift 
+            ;;
+        -e|--exp-root)
+            cmd+=(-e "$2")
+            shift 2
+            ;;
+        -r|--reset)
+            cmd+=(-r)
+            shift
+            ;;
+        -d|--dry-run)
+            cmd+=(-d)
+            shift
+            ;;
+        -f|--force)
+            cmd+=(-f)
+            shift
+            ;;
+        --rem|--remove)
+            shift  # Move past --rem / --remove
+
+            # argparse nargs='+' requires at least one directory argument
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: --rem/--remove requires at least one directory."
+                exit 1
+            fi
+
+            cmd+=(--rem)
+
+            # Collect directory names until the next option is reached
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                cmd+=("$1")
+                shift
+            done
+            ;;
+        --add|--add-dirs)
+            shift  # Move past --rem / --remove
+
+            # argparse nargs='+' requires at least one directory argument
+            if [[ $# -eq 0 || "$1" == -* ]]; then
+                echo "Error: --add/--add-dirs requires at least one directory."
+                exit 1
+            fi
+
+            cmd+=(--add)
+
+            # Collect directory names until the next option is reached
+            while [[ $# -gt 0 && "$1" != -* ]]; do
+                cmd+=("$1")
+                shift
+            done
+            ;;
+        -h|--help)
+            echo
+            echo "Usage: $0 [OPTIONS]"
+            echo
+            echo "Options"
+            echo " -v, --verbose        Print additional config.py output information"
+            echo " --debug              Print config.py debugging output information, as well as verbose output"
+            echo " -e, --exp-root       Store the location of the root directory housing all available experiments"
+            echo " -r, --reset-ini      Create new default initialization files for each test directory. Will overwrite and existing .ini files and their contents"
+            echo " -d, --dry-run        Show intended manifests without creating any new files"
+            echo " -f, --force          Overwrite existing .ini files"
+            echo " --rem, --remove      Store a list of directories to be removed from the running experimnents list"
+            echo " --add, --add_dirs      Store a list of directories to be addedd individually to the running experiments list"
+            echo " -h, --help           Display this help message"
+            echo
+            exit 0
+            ;;
+        *)
+            echo "Bash: Unknown argument $1"
+            exit 1
+            ;;
+    esac
+done 
+
+"${cmd[@]}"
+
+        

@@ -1,0 +1,88 @@
+cmd=(python3-conda DiFXtest.py)
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in 
+        -v|--verbose)
+            cmd+=(-v)
+            shift
+            ;;
+        --debug)
+            cmd+=(--debug)
+            shift
+            ;;
+        -t|--test-gpu)
+            cmd+=(-t)
+            shift
+            ;;
+        -i|--usebenchmarkfile)
+            cmd+=(-i)
+            shift
+            ;;
+        -c|--cores)
+            cmd+=(-c "$2")
+            shift
+            ;;
+        -n|--numthreads)
+            cmd+=(-n "$2")
+            shift
+            ;;
+        -f|--filterautocorrs)
+            cmd+=(-f)
+            shift
+            ;;
+        -m|--manifest)
+            cmd+=(-m "$2")
+            shift
+            ;;
+        -e|--exp-root)
+            cmd+=(-e "$2")
+            shift
+            ;;
+        -a|--abstol)
+            cmd+=(-a "$2")
+            shift
+            ;;
+        -r|--reltol)
+            cmd+=(-r "$2")
+            shift
+            ;;
+        -u|--updatetest)
+            cmd+=(-u)
+            shift
+            ;;
+        -g|--generateVDIF)
+            cmd+=(-g)
+            shift
+            ;;
+        -h|--help)
+            echo
+            echo "Usage: $0 [OPTIONS]"
+            echo
+            echo "Options"
+            echo " -v, --verbose            Enable verbose output"
+            echo " --debug                  Display extra debugging information"
+            echo " -t, --test-gpu           Run GPU tests"
+            echo " -u, --updatetest         Update the default test results and reset manifest files"
+            echo " -g, --generateVDIF       Reset and generate VDIF data"
+            echo " -c, --cores              Comma delimited list of the processing cores used for data simulation and correlation (default = localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost)",default="localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost,localhost"
+            echo " -n, --numthreads         Integer number of threads per processing core. More than one thread will speed runtime but reduce accuracy. (default=1"
+            echo " -f, --filterautocorrs    Filter autocorrelations prior to FITS file comparison"
+            echo " -m, --manifest           File containing experiment execution control parameters (default: manifest.ini)"
+            echo " -e, --exp-root           Basename of the directory housing all available experiments (default: experiments)"
+            echo " -d, --download           Download and run DiFX on real VLBI data"
+            echo " -i, --usebenchmarkfile   Use the benchmark .im file from a previous run rather than running difxcalc"
+            echo " -a, --abstol             Absolute tolerance for FITS file comparison (default = 1e-6)"
+            echo " -r, --reltol             Relative tolerance for FITS file comparison (default = 0.0)"
+            echo " -h, --help               Display this help message"  
+            echo             
+            echo
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument $1"
+            exit 1
+            ;;
+    esac
+done
+
+"${cmd[@]}"

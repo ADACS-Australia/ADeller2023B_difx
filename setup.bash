@@ -1,11 +1,11 @@
 ####### DIFX VERSION ########################
-export DIFX_VERSION=adam_performance_gains
+export DIFX_VERSION=trunk
 
 ####### ROOT PATHS ##########################
-export DIFXROOT=/home/mike/adam_performance_gains_09_23_2026
+export DIFXROOT=/usr/local/difx
 export DIFX_PREFIX=$DIFXROOT
 export PGPLOTDIR=/usr/lib/ 
-export IPPROOT=/home/mike/intel/oneapi/ipp/2021.10
+export IPPROOT=/opt/intel/oneapi/ipp/2021.10
 
 ####### COMPILER ############################
 export DIFXMPIDIR=/usr

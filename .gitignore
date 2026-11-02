@@ -3,6 +3,8 @@
 Makefile.in
 *~
 
+# setup.bash.new
+setup.bash.new
 
 # /applications/gui/trunk/gui/
 /applications/gui/trunk/gui/build
@@ -359,8 +361,7 @@ dkms.conf
 *.out
 *.app
 
-
-
+# binaries
 
 
 
@@ -452,3 +453,12 @@ replay_pid*
 /tests/Synthetic/*.threads
 /tests/Synthetic/*.fits
 /tests/Synthetic/*.machines
+
+# tests/DiFXtest_vdifsim
+tests/DiFXtest_vdifsim/
+
+tests/DiFXtest_vdifsim_old/
+
+
+# .vscode config files
+.vscode/
